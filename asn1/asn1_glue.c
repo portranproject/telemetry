@@ -1,0 +1,2 @@
+unsigned long asn_portran_opentype_skipped;
+unsigned long asn_portran_enum_unknown;
