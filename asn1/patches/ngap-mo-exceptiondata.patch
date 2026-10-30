@@ -1,0 +1,23 @@
+# ============================================================================
+# ngap-mo-exceptiondata.patch
+#
+# 대상 : 문법 파일 ngap-15.8.0.asn1 수정 (생성 코드가 아니라 .asn1 입력).
+#   RRCEstablishmentCause 계열 ENUMERATED 에 'mo-ExceptionData' 한 줄 추가.
+#
+# 근거 : 이 NGAP 문법은 OAI vendored 추출본인데, Rel-16 에서 추가된 정식 값
+#   mo-ExceptionData 가 누락돼 있음(추출본 결함).
+#
+# 해결 : 공식 정의대로 한 줄 보충. 
+# ============================================================================
+--- a/ngap-15.8.0.asn1
++++ b/ngap-15.8.0.asn1
+@@ -5529,7 +5529,8 @@
+ 	mps-PriorityAccess,
+ 	mcs-PriorityAccess,
+ 	...,
+-	notAvailable
++	notAvailable,
++	mo-ExceptionData
+ }
+ 
+ RRCInactiveTransitionReportRequest ::= ENUMERATED {

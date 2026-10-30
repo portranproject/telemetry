@@ -1,0 +1,43 @@
+# ============================================================================
+# enum-unknown-tolerant.patch
+#
+# 대상 : asn1c 가 생성하는 skeleton 의 NativeEnumerated_aper.c 수정.
+#
+# 근거 : ENUMERATED 는 3GPP 가 릴리스마다 확장값을 덧붙임
+#   (예: NGAP Cause, RRC establishmentCause). 현재 문법이 모르는 확장값이 오면
+#   asn1c 기본 동작은 첫 번째 열거값으로 조용히 바꿈 — 모르는 값을 엉뚱한
+#   '첫 값' 으로 오보고함.
+#
+# 해결 : 모르는 확장값은 센티넬 -1 로 두고 asn_portran_enum_unknown 에 +1.
+#   상위 층이 -1 을 보고 UNKNOWN 으로 보고함 (3GPP ENUMERATED 엔 음수 nat_value 없음).
+# ============================================================================
+--- a/NativeEnumerated_aper.c
++++ b/NativeEnumerated_aper.c
+@@ -6,6 +6,9 @@
+ #include <asn_internal.h>
+ #include <NativeEnumerated.h>
+ 
++/* Defined in asn1/asn1_glue.c (count of unknown extension enum values). */
++extern unsigned long asn_portran_enum_unknown;
++
+ asn_dec_rval_t
+ NativeEnumerated_decode_aper(const asn_codec_ctx_t *opt_codec_ctx,
+                              const asn_TYPE_descriptor_t *td,
+@@ -71,8 +74,15 @@
+         //    ASN__DECODE_FAILED;
+         if(value >= specs->map_count) {
+             ASN_DEBUG("Decoded unknown index value %s = %ld", td->name, value);
+-            /* unknown index. Workaround => set the first enumeration value */
+-            *native = specs->value2enum[0].nat_value;
++            /* This is an extension enum value that
++             * the grammar version does not know. asn1c's default silently maps
++             * it to value2enum[0] (the first value), which would mis-report e.g.
++             * an NGAP Cause or RRCEstablishmentCause as its first enumerator.
++             * Instead set a sentinel (-1 -- no 3GPP ENUMERATED has a negative
++             * nat_value) and count it, so the decoder can report "unknown"
++             * rather than the first value (contract C4.16-9). */
++            asn_portran_enum_unknown++;
++            *native = -1;
+             return rval;
+         }
+     }
