@@ -46,24 +46,23 @@ extern "C"
         enum sctp_assoc_kind kind;
     };
 
-    // sctp_stats: 누적 통계. 버린 입력이 왜 버려졌는지 구분해 캡처 품질·이상 입력을 확인하려고 둔다.
-    //   모두 uint64_t 라 장시간 실행해도 넘치지 않는다.
+    // sctp_stats: 누적 통계. 버린 입력이 왜 버려졌는지 구분해 캡처 품질·이상 입력을 확인 용도
     struct sctp_stats
     {
         // 패킷
-        uint64_t packet_count;           // 받은 패킷(재생 PDU 포함)
-        uint64_t bad_header_count;       // 공통 헤더·청크 길이가 규격보다 짧아 해석을 멈춘 횟수
+        uint64_t packet_count;
+        uint64_t bad_header_count;
         uint64_t truncated_packet_count; // 캡처가 원래 길이보다 짧게 잘린 패킷
 
         // 청크
-        uint64_t chunk_count;       // 길이를 읽을 수 있었던 청크(종류 무관)
-        uint64_t data_chunk_count;  // DATA 청크 (RFC 9260 §3.3.1)
-        uint64_t idata_chunk_count; // I-DATA 청크 (RFC 8260 §2.1)
+        uint64_t chunk_count;
+        uint64_t data_chunk_count;
+        uint64_t idata_chunk_count;
 
-        // 버린 청크
+        // 버린 청
         uint64_t duplicate_chunk_count; // 이미 본 TSN(재전송)
-        uint64_t too_old_chunk_count;   // TSN 판정 창보다 오래되어 판정 불가
-        uint64_t partial_chunk_count;   // 캡처가 잘려 청크 끝까지 없음
+        uint64_t too_old_chunk_count;
+        uint64_t partial_chunk_count;
 
         // 단편
         uint64_t fragment_chunk_count;             // 메시지 일부만 담은 DATA 청크(B·E 중 하나 이상 꺼짐)
@@ -76,7 +75,7 @@ extern "C"
 
         // 연결·vtag
         uint64_t init_count;               // INIT·INIT-ACK
-        uint64_t abort_shutdown_count;     // ABORT·SHUTDOWN COMPLETE(vtag 검사 전에 센다)
+        uint64_t abort_shutdown_count;     // ABORT·SHUTDOWN COMPLETE(vtag 검사 전 카운트)
         uint64_t vtag_reset_count;         // INIT 없이 vtag 가 바뀌어 재시작으로 본 횟수
         uint64_t vtag_mismatch_drop_count; // vtag 가 기대값과 달라 버린 패킷
 
