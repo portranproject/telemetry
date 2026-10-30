@@ -31,6 +31,21 @@ extern "C"
         size_t len;          // 메시지(PDU) 바이트 수
     };
 
+    // sctp_assoc_kind: 연결 알림 종류. 0 은 비워 두어 초기화 안 된 값을 구분한다.
+    enum sctp_assoc_kind
+    {
+        SCTP_ASSOC_START = 1, // INIT 또는 INIT 없이 vtag 가 바뀐 재시작
+        SCTP_ASSOC_END = 2,   // ABORT 또는 SHUTDOWN COMPLETE
+    };
+
+    // sctp_assoc_event: 연결 시작·끝 알림 하나.
+    struct sctp_assoc_event
+    {
+        const struct cap_record *record; // 알림을 일으킨 패킷
+        uint32_t assoc_id;               // sctp_message.assoc_id 와 같은 번호
+        enum sctp_assoc_kind kind;
+    };
+
 #ifdef __cplusplus
 }
 #endif
