@@ -70,7 +70,7 @@ static inline uint32_t read_be32(const uint8_t *ptr) {
 // fragment: 아직 메시지를 완성하지 못한 DATA 조각 하나(SCTP 메시지 단편).
 // 패킷 버퍼는 sctp_input 이 끝나면 사라지므로 바이트 복사
 struct fragment {
-    struct fragment *next;     // 목록의 다음 조각. 새 조각을 맨 앞에 넣으므로 TSN·도착 순서와 무관
+    struct fragment *next;     // 목록의 다음 조각. 목록은 TSN 이 작은 것부터 순서대로라, 같은 메시지의 조각이 나란히 있다
     uint64_t received_time_ns; // 오래 못 채운 조각을 버리는 기준
     uint32_t tsn;              // 연속 판정
     uint32_t ppid;             // 첫 조각(B)의 값을 메시지 PPID 로 쓴다
@@ -338,33 +338,18 @@ static enum tsn_result tsn_mark(struct sctp_ctx *ctx, struct tsn_space *space, u
     return TSN_NEW;
 }
 
-/* fragment_find: 조각 목록에서 TSN 이 tsn 인 조각을 찾는다.
- *   반환: 그 조각(목록 안을 가리킴, 목록에서 빠지면 무효). 없으면 NULL.
- */
-static struct fragment *fragment_find(const struct reassembly_queue *queue, uint32_t tsn) {
-    for (struct fragment *fragment = queue->head; fragment; fragment = fragment->next) {
-        if (fragment->tsn == tsn)
-            return fragment;
-    }
-    return NULL;
-}
-
-/* fragment_remove: 조각 하나를 목록에서 떼어 내고 해제한다.
+/* fragment_remove: link 가 가리키는 조각 하나를 목록에서 떼어 내고 해제한다.
  *   이유: 조립에 쓴 조각과 버리는 조각을 같은 방법으로 반납해, 목록의 바이트·개수 합계가 실제와 어긋나지 않게 한다.
- *   fragment 는 queue 안에 있어야 한다. 돌아온 뒤에는 fragment 를 쓰면 안 된다.
+ *   link 는 "그 조각을 가리키는 포인터"의 주소다(맨 앞이면 &queue->head, 아니면 앞 조각의 &next).
+ *   목록을 다시 훑지 않고 바로 뗀다. 돌아오면 *link 는 떼어 낸 조각의 다음 조각을 가리킨다.
  *   함께 바뀌는 것: queue 의 head·total_bytes·fragment_count.
  */
-static void fragment_remove(struct reassembly_queue *queue, struct fragment *fragment) {
-    // link 는 "fragment 를 가리키는 포인터"의 주소다. 맨 앞이면 &queue->head, 아니면 앞 조각의 &next
-    for (struct fragment **link = &queue->head; *link; link = &(*link)->next) {
-        if (*link == fragment) {
-            *link = fragment->next; // 앞쪽이 fragment 를 건너뛰고 그다음을 가리키게 한다
-            queue->total_bytes -= fragment->len;
-            queue->fragment_count--;
-            free(fragment);
-            return;
-        }
-    }
+static void fragment_remove(struct reassembly_queue *queue, struct fragment **link) {
+    struct fragment *fragment = *link;
+    *link = fragment->next; // 앞쪽이 fragment 를 건너뛰고 그다음을 가리키게 한다
+    queue->total_bytes -= fragment->len;
+    queue->fragment_count--;
+    free(fragment);
 }
 
 /* fragment_evict: 조각 목록에서 너무 오래 기다린 조각과, 상한을 넘게 하는 조각을 버린다.
@@ -372,20 +357,21 @@ static void fragment_remove(struct reassembly_queue *queue, struct fragment *fra
  *   1) 받은 지 FRAGMENT_TIMEOUT_NS 를 넘긴 조각을 버린다. now_ns 는 벽시계라 뒤로 갈 수 있으므로,
  *      조각 시각보다 이르면 지난 시간을 0 으로 보고 버리지 않는다.
  *   2) 새 조각(incoming_bytes)을 넣으면 개수·바이트 상한을 넘는 동안, 받은 시각이 가장 이른 조각부터 버린다.
- *      시각이 같으면 목록 앞쪽(나중에 넣은 것)을 버린다.
+ *      시각이 같으면 목록 앞쪽(TSN 이 작은 것, 먼저 보낸 것)을 버린다.
  *   함께 바뀌는 것: queue, ctx 의 fragment_evicted_count.
  */
 static void fragment_evict(struct sctp_ctx *ctx, struct reassembly_queue *queue, uint64_t now_ns, size_t incoming_bytes) {
-    struct fragment *fragment = queue->head;
-    while (fragment) {
-        struct fragment *next = fragment->next; // 아래에서 fragment 를 해제할 수 있으므로 먼저 꺼내 둔다
+    struct fragment **link = &queue->head;
+    while (*link) {
+        struct fragment *fragment = *link;
         bool is_expired = now_ns > fragment->received_time_ns
                        && now_ns - fragment->received_time_ns > FRAGMENT_TIMEOUT_NS;
         if (is_expired) {
-            fragment_remove(queue, fragment);
+            fragment_remove(queue, link); // 떼고 나면 *link 가 다음 조각이므로 link 는 그대로 둔다
             ctx->stats.fragment_evicted_count++;
+        } else {
+            link = &fragment->next;
         }
-        fragment = next;
     }
 
     while (queue->head) {
@@ -394,12 +380,12 @@ static void fragment_evict(struct sctp_ctx *ctx, struct reassembly_queue *queue,
         if (!is_over_limit)
             break;
 
-        struct fragment *oldest = queue->head;
-        for (struct fragment *candidate = queue->head->next; candidate; candidate = candidate->next) {
-            if (candidate->received_time_ns < oldest->received_time_ns)
-                oldest = candidate;
+        struct fragment **oldest_link = &queue->head;
+        for (struct fragment **candidate_link = &queue->head->next; *candidate_link; candidate_link = &(*candidate_link)->next) {
+            if ((*candidate_link)->received_time_ns < (*oldest_link)->received_time_ns)
+                oldest_link = candidate_link;
         }
-        fragment_remove(queue, oldest);
+        fragment_remove(queue, oldest_link);
         ctx->stats.fragment_evicted_count++;
     }
 }
@@ -407,11 +393,13 @@ static void fragment_evict(struct sctp_ctx *ctx, struct reassembly_queue *queue,
 /* fragment_add: 메시지 일부만 담은 DATA 청크(조각)를 보관하고, 그 조각으로 메시지가 다 모였으면 이어 붙여 전달한다.
  *   이유: 패킷 하나에 안 들어가는 큰 메시지는 여러 DATA 청크로 나뉘어 오고, 순서가 섞이거나 사이에 다른 메시지가 끼기도 한다.
  *   같은 메시지의 조각 = TSN 이 1 씩 이어지고, 스트림이 같고, 순서를 지키는 메시지(U 없음)면 SSN 도 같다 (RFC 9260 §3.3.1).
- *   1) 상한을 지키도록 정리한 뒤 조각을 복사해 목록 맨 앞에 넣는다(패킷 버퍼는 sctp_input 이 끝나면 사라진다).
- *   2) 새 조각에서 TSN 을 거꾸로 따라가 첫 조각(B)을 찾는다.
- *   3) 첫 조각에서 앞으로 따라가 마지막 조각(E)까지 빠짐없이 있는지 보며 길이·조각 수를 센다.
- *   4) 다 있으면 TSN 순서로 reassembly_buf 에 이어 붙이고 조각을 해제한 뒤, 메시지로 전달한다.
- *   2)·3)에서 끊기면 아무것도 하지 않는다. 나머지 조각이 오면 그때 다시 본다.
+ *   1) 상한을 지키도록 정리한 뒤 조각을 복사해, TSN 이 작은 것부터인 목록의 제자리에 끼운다
+ *      (패킷 버퍼는 sctp_input 이 끝나면 사라진다).
+ *   2) 목록을 앞에서부터 한 번 훑어, 새 조각이 들어간 "이어진 구간"(같은 메시지일 수 있는 연속 조각)을 찾는다.
+ *   3) 구간의 첫 조각이 B, 마지막 조각이 E 면 메시지가 다 모인 것이다.
+ *   4) 구간을 앞에서부터 reassembly_buf 에 이어 붙이며 해제한 뒤, 메시지로 전달한다.
+ *   3)에서 다 모이지 않았으면 아무것도 하지 않는다. 나머지 조각이 오면 그때 다시 본다.
+ *   목록을 TSN 순으로 두는 이유: 같은 메시지의 조각이 나란히 있어, 조각마다 목록 전체를 다시 훑지 않아도 된다.
  *   chunk 와 record 는 호출한 쪽 소유. 전달하는 메시지의 data 는 reassembly_buf 를 가리키며 콜백 안에서만 유효하다.
  *   함께 바뀌는 것: queue, ctx 의 reassembly_buf·통계(fragment_evicted_count, reassembled_count), on_message 호출.
  */
@@ -427,7 +415,6 @@ static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, c
     struct fragment *added = malloc(sizeof(*added) + chunk->len);
     if (!added)
         return; // 메모리 부족. 이 조각을 버리므로 그 메시지는 조립되지 않는다
-    added->next = queue->head;
     added->received_time_ns = record->capture_time_ns;
     added->tsn = chunk->tsn;
     added->ppid = chunk->ppid;
@@ -436,41 +423,59 @@ static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, c
     added->flags = chunk->flags;
     added->len = chunk->len;
     memcpy(added->data, chunk->data, chunk->len);
-    queue->head = added;
+
+    // 1) 제자리에 끼우기: 나보다 앞 TSN 인 조각을 지나, 처음 만난 뒤 TSN 조각 앞에 넣는다.
+    //    TSN 은 2^32 다음에 0 으로 돌아오므로 뺄셈 결과의 부호로 앞뒤를 정한다(직렬번호 산술, RFC 9260 §1.6).
+    //    같은 TSN 은 tsn_mark 가 먼저 걸러 목록에 두 번 들어오지 않는다
+    struct fragment **insert_link = &queue->head;
+    while (*insert_link) {
+        bool is_earlier = (int32_t)((*insert_link)->tsn - added->tsn) < 0;
+        if (!is_earlier)
+            break;
+        insert_link = &(*insert_link)->next;
+    }
+    added->next = *insert_link;
+    *insert_link = added;
     queue->total_bytes += chunk->len;
     queue->fragment_count++;
 
     bool is_ordered = !(added->flags & DATA_FLAG_UNORDERED); // 순서를 지키는 메시지만 SSN 으로 같은 메시지인지 가린다
 
-    // 2) 첫 조각(B) 찾기
-    struct fragment *first = added;
-    while (!(first->flags & DATA_FLAG_BEGIN)) {
-        struct fragment *previous = fragment_find(queue, first->tsn - 1);
-        bool is_previous_piece = previous
-                              && previous->stream_id == added->stream_id
-                              && !(previous->flags & DATA_FLAG_END) // E 면 앞 메시지의 끝이다
-                              && (!is_ordered || previous->ssn == added->ssn);
-        if (!is_previous_piece)
-            return;
-        first = previous;
+    // 2) 새 조각이 든 이어진 구간 찾기. 앞 조각(segment_last)과 이어지면 같은 구간, 아니면 새 구간이 시작된다.
+    //    조각 수는 목록 길이(FRAGMENT_MAX_COUNT) 이하라 uint16_t 에 들어간다
+    struct fragment **segment_link = &queue->head; // 구간 첫 조각을 가리키는 포인터의 주소. 구간을 뗄 때 쓴다
+    struct fragment *segment_first = NULL;
+    struct fragment *segment_last = NULL;
+    size_t message_len = 0;
+    uint16_t piece_count = 0;
+    bool has_added = false;
+    for (struct fragment **link = &queue->head; *link; link = &(*link)->next) {
+        struct fragment *piece = *link;
+        bool continues_segment = segment_last
+                              && piece->tsn == segment_last->tsn + 1
+                              && piece->stream_id == segment_last->stream_id
+                              && !(segment_last->flags & DATA_FLAG_END) // 앞 조각이 E 면 앞 메시지가 끝났다
+                              && !(piece->flags & DATA_FLAG_BEGIN)      // 이 조각이 B 면 새 메시지가 시작된다
+                              && (!is_ordered || piece->ssn == segment_last->ssn);
+        if (!continues_segment) {
+            if (has_added)
+                break; // 새 조각이 든 구간이 앞 조각에서 끝났다
+            segment_link = link;
+            segment_first = piece;
+            message_len = 0;
+            piece_count = 0;
+        }
+        segment_last = piece;
+        message_len += piece->len;
+        piece_count++;
+        if (piece == added)
+            has_added = true;
     }
 
-    // 3) 마지막 조각(E)까지 이어지는지 확인. 조각 수는 FRAGMENT_MAX_COUNT 이하라 uint16_t 에 들어간다
-    struct fragment *last = first;
-    size_t message_len = first->len;
-    uint16_t piece_count = 1;
-    while (!(last->flags & DATA_FLAG_END)) {
-        struct fragment *next = fragment_find(queue, last->tsn + 1);
-        bool is_next_piece = next
-                          && next->stream_id == added->stream_id
-                          && !(next->flags & DATA_FLAG_BEGIN) // B 면 다음 메시지의 시작이다
-                          && (!is_ordered || next->ssn == added->ssn);
-        if (!is_next_piece)
-            return;
-        last = next;
-        message_len += next->len;
-        piece_count++;
-    }
+    // 3) 다 모였는지. 새 조각이 목록에 있으므로 segment_first·segment_last 는 NULL 이 아니다
+    bool is_complete = (segment_first->flags & DATA_FLAG_BEGIN) && (segment_last->flags & DATA_FLAG_END);
+    if (!is_complete)
+        return;
 
     // 4) 이어 붙이기. message_len 은 보관 합계 이하라 FRAGMENT_MAX_BYTES 를 넘지 않는다
     if (message_len > ctx->reassembly_buf_bytes) {
@@ -481,19 +486,19 @@ static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, c
         ctx->reassembly_buf_bytes = message_len;
     }
 
-    // first 는 아래에서 해제되므로 메시지에 쓸 값을 먼저 꺼내 둔다. PPID 는 첫 조각의 값을 쓴다
-    uint32_t first_tsn = first->tsn;
-    uint32_t first_ppid = first->ppid;
-    uint16_t stream_id = first->stream_id;
+    // 첫 조각은 아래에서 해제되므로 메시지에 쓸 값을 먼저 꺼내 둔다. PPID 는 첫 조각(B)의 값을 쓴다
+    uint32_t first_tsn = segment_first->tsn;
+    uint32_t first_ppid = segment_first->ppid;
+    uint16_t stream_id = segment_first->stream_id;
 
+    // 구간은 TSN 순서로 나란히 있다. 맨 앞 조각을 떼면 다음 조각이 *segment_link 자리로 오므로 같은 자리에서 차례로 뗀다
     size_t copied_bytes = 0;
     for (uint16_t i = 0; i < piece_count; i++) {
-        // 3)에서 first_tsn 부터 piece_count 개가 모두 있음을 확인했다. 그 뒤 목록에서 빠진 것은 이미 복사한 앞 조각뿐이다
-        struct fragment *piece = fragment_find(queue, first_tsn + i);
+        struct fragment *piece = *segment_link;
         if (piece->len > 0)
             memcpy(ctx->reassembly_buf + copied_bytes, piece->data, piece->len); // 길이가 0 이면 버퍼가 아직 NULL 일 수 있다
         copied_bytes += piece->len;
-        fragment_remove(queue, piece);
+        fragment_remove(queue, segment_link);
     }
     ctx->stats.reassembled_count++;
 
