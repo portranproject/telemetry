@@ -1,6 +1,5 @@
 /* libsctp/sctp.c — 와이어의 SCTP 패킷 → 완성된 사용자 메시지(F1AP/NGAP PDU)  (RFC 9260)
  *
- * [신입 가이드]
  *   입력: 캡처 모듈이 준 패킷 하나(struct cap_record). sctp_input 으로 들어온다.
  *   출력: 완성된 메시지(struct sctp_message)와 연결 시작·끝(struct sctp_assoc_event). 콜백으로 나간다.
  *   패킷 1개 ≠ 메시지 1개다. 한 패킷에 메시지 여러 개(번들링), 한 메시지가 여러 패킷(단편화),
@@ -26,7 +25,7 @@
 #define TSN_WINDOW_BITS 4096
 
 // fragment: 아직 메시지를 완성하지 못한 DATA 조각 하나(SCTP 메시지 단편).
-//   패킷 버퍼는 sctp_input 이 끝나면 사라지므로 바이트 복사
+// 패킷 버퍼는 sctp_input 이 끝나면 사라지므로 바이트 복사
 struct fragment
 {
     struct fragment *next;     // 목록의 다음 조각. 새 조각을 맨 앞에 넣으므로 TSN·도착 순서와 무관
@@ -93,7 +92,7 @@ struct sctp_assoc_record
 };
 
 // sctp_ctx: libsctp 전체 상태(sctp.h 에서는 이름만 공개). sctp_new 가 만들고 sctp_free 가 해제한다.
-//   방향·연결 표는 상한만큼 sctp_new 에서 한 번에 할당한다. 표가 자라며 옮겨지지 않으므로 레코드 포인터가 바뀌지 않는다.
+// 방향, 연결 표는 상한만큼 sctp_new 에서 한 번에 할당한다. 표가 자라며 옮겨지지 않으므로 레코드 포인터가 바뀌지 않는다.
 struct sctp_ctx
 {
     sctp_message_callback on_message; // 완성된 메시지를 넘길 함수(NULL 이면 넘기지 않음)
