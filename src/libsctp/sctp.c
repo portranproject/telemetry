@@ -19,6 +19,13 @@
 // 연결 표 칸 수.
 #define ASSOC_MAX_COUNT 2048
 
+// 한 방향에 보관하는 미완성 조각의 바이트 합 상한(1 MiB). B 조각만 계속 보내는 입력이 메모리를 끝없이 잡지 않도록
+#define FRAGMENT_MAX_BYTES (1024u * 1024u)
+// 한 방향에 보관하는 미완성 조각의 개수 상한. 아주 작은 조각을 많이 보내 목록 탐색이 길어지지 않도록
+#define FRAGMENT_MAX_COUNT 1024
+// 조각을 기다리는 최대 시간(5초). 유실된 조각(캡처 누락 포함)을 무한정 기다리며 메모리를 잡지 않도록
+#define FRAGMENT_TIMEOUT_NS (5ull * 1000000000ull)
+
 // SCTP 공통 헤더 길이(포트·vtag·체크섬), 첫 청크는 이 뒤에서 시작
 #define SCTP_COMMON_HEADER_BYTES 12
 
@@ -31,6 +38,8 @@
 #define DATA_CHUNK_HEADER_BYTES 16
 #define DATA_FLAG_END 0x01   // DATA 청크 E 비트: 메시지의 마지막 조각
 #define DATA_FLAG_BEGIN 0x02 // DATA 청크 B 비트: 메시지의 첫 조각
+// DATA 청크 U 비트: 순서 무관 메시지. 이때 SSN 은 의미가 없어 같은 메시지의 조각인지 가를 때 비교하지 않는다 (RFC 9260 §3.3.1)
+#define DATA_FLAG_UNORDERED 0x04
 
 // sctp_chunk_type: 청크 헤더 첫 바이트의 청크 종류 번호 (RFC 9260 §3.2, I-DATA 는 RFC 8260 §2.1).
 //   libsctp 가 처리하는 종류만 둔다. 여기 없는 번호(SACK, HEARTBEAT, COOKIE 등)는 무시한다.
@@ -119,7 +128,7 @@ struct sctp_assoc_record {
     uint32_t assoc_id; // 0 = 아직 번호 없음. INIT·재시작마다 새 번호
 };
 
-// data_chunk: DATA 청크 하나에서 읽은 값 (RFC 9260 §3.3.1). 청크를 읽는 곳과 쓰는 곳 사이에 하나의 개념으로 넘기기 위함
+// data_chunk: DATA 청크 하나에서 읽은 값 청크를 읽는 곳과 쓰는 곳 사이에 하나의 개념으로 넘기기 위함
 struct data_chunk {
     uint32_t tsn;
     uint32_t ppid;
@@ -298,7 +307,7 @@ enum tsn_result {
  *   이유: 수동 관측자는 재전송된 DATA 도 그대로 보므로, 중복을 걸러야 같은 메시지를 상위로 두 번 넘기지 않는다.
  *   TSN 은 2^32 다음에 0 으로 돌아온다. 그래서 뺄셈 결과를 부호 있는 값으로 보고 앞뒤를 정한다(직렬번호 산술, RFC 9260 §1.6).
  *   반환: TSN_NEW / TSN_DUPLICATE / TSN_TOO_OLD.
- *   함께 바뀌는 것: space 의 창·base_tsn. ctx 는 유실 추정(F10)에서 통계를 쓰려고 미리 받는다.
+ *   함께 바뀌는 것: space 의 창·base_tsn. ctx 는 아직 쓰지 않고, 유실 추정 통계(tsn_gap_count)를 올릴 때 쓰려고 미리 받는다.
  */
 static enum tsn_result tsn_mark(struct sctp_ctx *ctx, struct tsn_space *space, uint32_t tsn) {
     if (!space->has_base) {
@@ -329,12 +338,188 @@ static enum tsn_result tsn_mark(struct sctp_ctx *ctx, struct tsn_space *space, u
     return TSN_NEW;
 }
 
+/* fragment_find: 조각 목록에서 TSN 이 tsn 인 조각을 찾는다.
+ *   반환: 그 조각(목록 안을 가리킴, 목록에서 빠지면 무효). 없으면 NULL.
+ */
+static struct fragment *fragment_find(const struct reassembly_queue *queue, uint32_t tsn) {
+    for (struct fragment *fragment = queue->head; fragment; fragment = fragment->next) {
+        if (fragment->tsn == tsn)
+            return fragment;
+    }
+    return NULL;
+}
+
+/* fragment_remove: 조각 하나를 목록에서 떼어 내고 해제한다.
+ *   이유: 조립에 쓴 조각과 버리는 조각을 같은 방법으로 반납해, 목록의 바이트·개수 합계가 실제와 어긋나지 않게 한다.
+ *   fragment 는 queue 안에 있어야 한다. 돌아온 뒤에는 fragment 를 쓰면 안 된다.
+ *   함께 바뀌는 것: queue 의 head·total_bytes·fragment_count.
+ */
+static void fragment_remove(struct reassembly_queue *queue, struct fragment *fragment) {
+    // link 는 "fragment 를 가리키는 포인터"의 주소다. 맨 앞이면 &queue->head, 아니면 앞 조각의 &next
+    for (struct fragment **link = &queue->head; *link; link = &(*link)->next) {
+        if (*link == fragment) {
+            *link = fragment->next; // 앞쪽이 fragment 를 건너뛰고 그다음을 가리키게 한다
+            queue->total_bytes -= fragment->len;
+            queue->fragment_count--;
+            free(fragment);
+            return;
+        }
+    }
+}
+
+/* fragment_evict: 조각 목록에서 너무 오래 기다린 조각과, 상한을 넘게 하는 조각을 버린다.
+ *   이유: 유실된 조각은 끝내 오지 않고, 공격자는 B 조각만 계속 보낼 수 있다. 정리하지 않으면 메모리가 끝없이 찬다.
+ *   1) 받은 지 FRAGMENT_TIMEOUT_NS 를 넘긴 조각을 버린다. now_ns 는 벽시계라 뒤로 갈 수 있으므로,
+ *      조각 시각보다 이르면 지난 시간을 0 으로 보고 버리지 않는다.
+ *   2) 새 조각(incoming_bytes)을 넣으면 개수·바이트 상한을 넘는 동안, 받은 시각이 가장 이른 조각부터 버린다.
+ *      시각이 같으면 목록 앞쪽(나중에 넣은 것)을 버린다.
+ *   함께 바뀌는 것: queue, ctx 의 fragment_evicted_count.
+ */
+static void fragment_evict(struct sctp_ctx *ctx, struct reassembly_queue *queue, uint64_t now_ns, size_t incoming_bytes) {
+    struct fragment *fragment = queue->head;
+    while (fragment) {
+        struct fragment *next = fragment->next; // 아래에서 fragment 를 해제할 수 있으므로 먼저 꺼내 둔다
+        bool is_expired = now_ns > fragment->received_time_ns
+                       && now_ns - fragment->received_time_ns > FRAGMENT_TIMEOUT_NS;
+        if (is_expired) {
+            fragment_remove(queue, fragment);
+            ctx->stats.fragment_evicted_count++;
+        }
+        fragment = next;
+    }
+
+    while (queue->head) {
+        bool is_over_limit = queue->fragment_count >= FRAGMENT_MAX_COUNT
+                          || queue->total_bytes + incoming_bytes > FRAGMENT_MAX_BYTES;
+        if (!is_over_limit)
+            break;
+
+        struct fragment *oldest = queue->head;
+        for (struct fragment *candidate = queue->head->next; candidate; candidate = candidate->next) {
+            if (candidate->received_time_ns < oldest->received_time_ns)
+                oldest = candidate;
+        }
+        fragment_remove(queue, oldest);
+        ctx->stats.fragment_evicted_count++;
+    }
+}
+
+/* fragment_add: 메시지 일부만 담은 DATA 청크(조각)를 보관하고, 그 조각으로 메시지가 다 모였으면 이어 붙여 전달한다.
+ *   이유: 패킷 하나에 안 들어가는 큰 메시지는 여러 DATA 청크로 나뉘어 오고, 순서가 섞이거나 사이에 다른 메시지가 끼기도 한다.
+ *   같은 메시지의 조각 = TSN 이 1 씩 이어지고, 스트림이 같고, 순서를 지키는 메시지(U 없음)면 SSN 도 같다 (RFC 9260 §3.3.1).
+ *   1) 상한을 지키도록 정리한 뒤 조각을 복사해 목록 맨 앞에 넣는다(패킷 버퍼는 sctp_input 이 끝나면 사라진다).
+ *   2) 새 조각에서 TSN 을 거꾸로 따라가 첫 조각(B)을 찾는다.
+ *   3) 첫 조각에서 앞으로 따라가 마지막 조각(E)까지 빠짐없이 있는지 보며 길이·조각 수를 센다.
+ *   4) 다 있으면 TSN 순서로 reassembly_buf 에 이어 붙이고 조각을 해제한 뒤, 메시지로 전달한다.
+ *   2)·3)에서 끊기면 아무것도 하지 않는다. 나머지 조각이 오면 그때 다시 본다.
+ *   chunk 와 record 는 호출한 쪽 소유. 전달하는 메시지의 data 는 reassembly_buf 를 가리키며 콜백 안에서만 유효하다.
+ *   함께 바뀌는 것: queue, ctx 의 reassembly_buf·통계(fragment_evicted_count, reassembled_count), on_message 호출.
+ */
+static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, const struct cap_record *record,
+                         uint32_t assoc_id, const struct data_chunk *chunk) {
+    // DATA 청크 하나는 64 KiB 를 넘지 못해 지금 상한에선 걸리지 않지만, 상한을 줄여도 보관 합계가 상한을 넘지 않게 지킨다
+    if (chunk->len > FRAGMENT_MAX_BYTES) {
+        ctx->stats.fragment_evicted_count++;
+        return;
+    }
+    fragment_evict(ctx, queue, record->capture_time_ns, chunk->len);
+
+    struct fragment *added = malloc(sizeof(*added) + chunk->len);
+    if (!added)
+        return; // 메모리 부족. 이 조각을 버리므로 그 메시지는 조립되지 않는다
+    added->next = queue->head;
+    added->received_time_ns = record->capture_time_ns;
+    added->tsn = chunk->tsn;
+    added->ppid = chunk->ppid;
+    added->stream_id = chunk->stream_id;
+    added->ssn = chunk->ssn;
+    added->flags = chunk->flags;
+    added->len = chunk->len;
+    memcpy(added->data, chunk->data, chunk->len);
+    queue->head = added;
+    queue->total_bytes += chunk->len;
+    queue->fragment_count++;
+
+    bool is_ordered = !(added->flags & DATA_FLAG_UNORDERED); // 순서를 지키는 메시지만 SSN 으로 같은 메시지인지 가린다
+
+    // 2) 첫 조각(B) 찾기
+    struct fragment *first = added;
+    while (!(first->flags & DATA_FLAG_BEGIN)) {
+        struct fragment *previous = fragment_find(queue, first->tsn - 1);
+        bool is_previous_piece = previous
+                              && previous->stream_id == added->stream_id
+                              && !(previous->flags & DATA_FLAG_END) // E 면 앞 메시지의 끝이다
+                              && (!is_ordered || previous->ssn == added->ssn);
+        if (!is_previous_piece)
+            return;
+        first = previous;
+    }
+
+    // 3) 마지막 조각(E)까지 이어지는지 확인. 조각 수는 FRAGMENT_MAX_COUNT 이하라 uint16_t 에 들어간다
+    struct fragment *last = first;
+    size_t message_len = first->len;
+    uint16_t piece_count = 1;
+    while (!(last->flags & DATA_FLAG_END)) {
+        struct fragment *next = fragment_find(queue, last->tsn + 1);
+        bool is_next_piece = next
+                          && next->stream_id == added->stream_id
+                          && !(next->flags & DATA_FLAG_BEGIN) // B 면 다음 메시지의 시작이다
+                          && (!is_ordered || next->ssn == added->ssn);
+        if (!is_next_piece)
+            return;
+        last = next;
+        message_len += next->len;
+        piece_count++;
+    }
+
+    // 4) 이어 붙이기. message_len 은 보관 합계 이하라 FRAGMENT_MAX_BYTES 를 넘지 않는다
+    if (message_len > ctx->reassembly_buf_bytes) {
+        uint8_t *grown = realloc(ctx->reassembly_buf, message_len);
+        if (!grown)
+            return; // 메모리 부족. 조각은 남겨 두므로 시간 초과·상한 정리로 반납된다
+        ctx->reassembly_buf = grown;
+        ctx->reassembly_buf_bytes = message_len;
+    }
+
+    // first 는 아래에서 해제되므로 메시지에 쓸 값을 먼저 꺼내 둔다. PPID 는 첫 조각의 값을 쓴다
+    uint32_t first_tsn = first->tsn;
+    uint32_t first_ppid = first->ppid;
+    uint16_t stream_id = first->stream_id;
+
+    size_t copied_bytes = 0;
+    for (uint16_t i = 0; i < piece_count; i++) {
+        // 3)에서 first_tsn 부터 piece_count 개가 모두 있음을 확인했다. 그 뒤 목록에서 빠진 것은 이미 복사한 앞 조각뿐이다
+        struct fragment *piece = fragment_find(queue, first_tsn + i);
+        if (piece->len > 0)
+            memcpy(ctx->reassembly_buf + copied_bytes, piece->data, piece->len); // 길이가 0 이면 버퍼가 아직 NULL 일 수 있다
+        copied_bytes += piece->len;
+        fragment_remove(queue, piece);
+    }
+    ctx->stats.reassembled_count++;
+
+    if (message_len == 0)
+        return; // 사용자 데이터가 없는 메시지는 넘길 내용이 없다
+
+    struct sctp_message message = {
+        .record = record,
+        .assoc_id = assoc_id,
+        .ppid = first_ppid,
+        .stream_id = stream_id,
+        .tsn = first_tsn,
+        .fragment_count = piece_count,
+        .data = ctx->reassembly_buf,
+        .len = message_len,
+    };
+    deliver_message(ctx, &message);
+}
+
 /* sctp_input: 캡처한 패킷 하나를 처리한다.
  *   1) 패킷 수를 세고, 공통 헤더가 없는 패킷은 버리고, 캡처가 잘린 패킷은 표시한다.
  *   2) 패킷 방향의 레코드를 찾는다(없으면 만든다). 방향 표가 꽉 차면 이 패킷은 처리하지 않는다.
  *   3) 공통 헤더 뒤의 청크를 하나씩 읽는다(번들링). DATA 청크는 먼저 TSN 을 판정해, 이미 본 것(재전송)이나
  *      창보다 오래된 것은 세고 버린다. 완성된 메시지를 담은 DATA 청크는 바로 전달한다.
- *      메시지 일부만 담은 DATA 청크는 세기만 한다. 그 밖의 청크 종류는 무시한다.
+ *      메시지 일부만 담은 DATA 청크(조각)는 보관했다가, 같은 메시지의 조각이 다 모이면 이어 붙여 전달한다.
+ *      그 밖의 청크 종류는 무시한다.
  *   이유: 패킷 바이트는 공격자가 보낸 입력일 수 있으므로, 모든 읽기 전에 캡처된 길이 안인지 확인한다.
  *   record 는 호출한 쪽 소유다. 이 함수가 돌아온 뒤에는 쓰지 않는다.
  *   함께 바뀌는 것: ctx 의 통계, on_message 호출.
@@ -351,7 +536,7 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
     if (record->captured_len < record->packet_len)
         ctx->stats.truncated_packet_count++;
 
-    // 이 패킷 방향의 상태(TSN 창·조각·vtag)를 담을 레코드. 지금은 TSN 창만 쓴다
+    // 이 패킷 방향의 상태(TSN 창·조각·vtag)를 담을 레코드. 지금은 TSN 창과 조각 목록을 쓴다
     struct sctp_direction *direction = direction_get(ctx, record);
     if (!direction)
         return; // 방향 표가 꽉 차 상태를 둘 곳이 없다
@@ -410,7 +595,8 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
 
             bool is_whole_message = (chunk.flags & DATA_FLAG_BEGIN) && (chunk.flags & DATA_FLAG_END);
             if (!is_whole_message) {
-                ctx->stats.fragment_chunk_count++; // 메시지 일부만 담은 조각. 아직 조립하지 않고 세기만 한다
+                ctx->stats.fragment_chunk_count++;
+                fragment_add(ctx, &direction->fragments, record, 0, &chunk); // 연결 번호는 아직 매기지 않으므로 0
                 break;
             }
 
