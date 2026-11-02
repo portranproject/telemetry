@@ -16,8 +16,7 @@ struct cap_record; // TODO: libcap/cap.h include 시 제거. cap.h 에 정의, �
 #define SCTP_PPID_F1AP 62
 
 // sctp_message: 완성된 사용자 메시지 하나(F1AP/NGAP PDU 한 개).
-struct sctp_message
-{
+struct sctp_message {
     const struct cap_record *record;
     uint32_t assoc_id;
     uint32_t ppid; // 수신 쪽 F1AP·NGAP 디코더 분기
@@ -29,23 +28,20 @@ struct sctp_message
 };
 
 // sctp_assoc_kind: 연결 알림 종류. 0 은 비워 두어 초기화 안 된 값을 구분한다.
-enum sctp_assoc_kind
-{
+enum sctp_assoc_kind {
     SCTP_ASSOC_START = 1, // INIT 또는 INIT 없이 vtag 가 바뀐 재시작
     SCTP_ASSOC_END = 2,   // ABORT 또는 SHUTDOWN COMPLETE
 };
 
 // sctp_assoc_event: 연결 시작·끝 알림 하나.
-struct sctp_assoc_event
-{
+struct sctp_assoc_event {
     const struct cap_record *record; // 알림을 일으킨 패킷
     uint32_t assoc_id;               // sctp_message.assoc_id 와 같은 번호
     enum sctp_assoc_kind kind;
 };
 
 // sctp_stats: 누적 통계. 버린 입력이 왜 버려졌는지 구분해 캡처 품질·이상 입력을 확인 용도
-struct sctp_stats
-{
+struct sctp_stats {
     // 패킷
     uint64_t packet_count;
     uint64_t bad_header_count;
