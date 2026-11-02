@@ -13,6 +13,8 @@
  *   tsn_space         — 한 방향의 TSN 중복 판정 창 + 유실 추정 범위
  *   vtag_state        — 한 방향의 vtag 검사 상태
  *   sctp_direction    — 한 방향(보내는 끝 → 받는 끝). 위 셋을 품는다
+ *   sctp_assoc_record — 한 연결(양방향 공통)과 그 연결 번호
+ *   sctp_ctx          — libsctp 전체 상태. 방향 표·연결 표·재조립 버퍼·콜백·통계
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -76,4 +78,38 @@ struct sctp_direction
     struct tsn_space tsn;
     struct reassembly_queue fragments;
     struct vtag_state vtag;
+};
+
+// sctp_assoc_record: 한 연결(양방향 공통). 두 방향의 메시지에 같은 연결 번호를 붙이기 위함
+//   두 끝을 (주소, 포트) 사전순으로 정렬해 저장하므로 A→B 와 B→A 패킷이 같은 레코드를 찾는다.
+//   비교는 저장된 값 그대로 한다(바이트 순서와 무관하게 양방향에서 같은 결과만 나오면 된다).
+struct sctp_assoc_record
+{
+    uint32_t low_addr; // (주소, 포트)가 작은 쪽 끝
+    uint16_t low_port;
+    uint32_t high_addr; // (주소, 포트)가 큰 쪽 끝
+    uint16_t high_port;
+    uint32_t assoc_id; // 0 = 아직 번호 없음. INIT·재시작마다 새 번호
+};
+
+// sctp_ctx: libsctp 전체 상태(sctp.h 에서는 이름만 공개). sctp_new 가 만들고 sctp_free 가 해제한다.
+//   방향·연결 표는 상한만큼 sctp_new 에서 한 번에 할당한다. 표가 자라며 옮겨지지 않으므로 레코드 포인터가 바뀌지 않는다.
+struct sctp_ctx
+{
+    sctp_message_callback on_message; // 완성된 메시지를 넘길 함수(NULL 이면 넘기지 않음)
+    sctp_assoc_callback on_assoc;     // 연결 시작·끝을 알릴 함수(NULL 이면 알리지 않음)
+    void *user;                       // 콜백 첫 인자로 그대로 돌려줄 포인터(호출한 쪽 소유)
+    struct sctp_stats stats;
+
+    struct sctp_direction *directions; // 방향 표
+    size_t direction_count;
+    size_t direction_clock; // 표가 꽉 찼을 때 다음에 밀어낼 칸.
+
+    uint8_t *reassembly_buf;     // 조각을 이어 붙일 버퍼. 메시지마다 할당하지 않으려고 재사용한다
+    size_t reassembly_buf_bytes; // reassembly_buf 에 할당된 크기
+
+    struct sctp_assoc_record *assocs; // 연결 표
+    size_t assoc_count;
+    size_t assoc_clock;     // 표가 꽉 찼을 때 다음에 밀어낼 칸
+    uint32_t next_assoc_id; // 다음에 매길 연결 번호. 0 은 '연결 없음' 이라 1부터
 };
