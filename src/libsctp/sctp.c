@@ -1,38 +1,18 @@
-/* libsctp/sctp.c — 와이어의 SCTP 패킷 → 완성된 사용자 메시지(F1AP/NGAP PDU)  (RFC 9260)
- *
- *   입력: 캡처 모듈이 준 패킷 하나(struct cap_record). sctp_input 으로 들어온다.
- *   출력: 완성된 메시지(struct sctp_message)와 연결 시작·끝(struct sctp_assoc_event). 콜백으로 나간다.
- *   패킷 1개 ≠ 메시지 1개다. 한 패킷에 메시지 여러 개(번들링), 한 메시지가 여러 패킷(단편화),
- *   재전송 중복, 캡처 잘림이 섞여 온다. 이것을 정리해 완성된 메시지만 넘기는 것이 이 파일의 일이다.
- *   수동 관측자라 재전송을 요청할 수 없으므로, 끝내 못 본 TSN 은 유실 추정(tsn_gap_count)으로만 센다.
- *
- * 핵심 자료구조(안쪽 → 바깥쪽):
- *   fragment          — 아직 메시지를 완성하지 못한 DATA 조각 하나(힙)
- *   reassembly_queue  — 한 방향의 미완성 조각 목록
- *   tsn_space         — 한 방향의 TSN 중복 판정 창 + 유실 추정 범위
- *   vtag_state        — 한 방향의 vtag 검사 상태
- *   sctp_direction    — 한 방향(보내는 끝 → 받는 끝). 위 셋을 품는다
- *   sctp_assoc_record — 한 연결(양방향 공통)과 그 연결 번호
- *   data_chunk        — DATA 청크 하나에서 읽은 값(패킷 버퍼를 가리킴, 처리 중에만 씀)
- *   sctp_ctx          — libsctp 전체 상태. 방향 표·연결 표·재조립 버퍼·콜백·통계
- *
- * 주요 함수:
- *   sctp_input                            — 패킷 하나 처리의 입구. 헤더 확인 → 청크를 하나씩 읽어 DATA 를 메시지로 전달
- *   deliver_message                       — 완성된 메시지 하나를 on_message 콜백으로 넘김
- *   sctp_new / sctp_free / sctp_get_stats — 상태 생성·해제, 누적 통계
- *   fragments_clear                       — 한 방향의 조각 목록 전체 해제
- *   read_be16 / read_be32                 — 패킷의 빅엔디안(네트워크 순서) 정수 읽기
- */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "libcap/cap.h"
 #include "sctp.h"
 
 // TSN 하나당 1비트. 재전송은 최근 TSN 에서 오므로 이 범위면 중복을 가려낸다. uint64_t 배열이라 64 의 배수여야 한다
 #define TSN_WINDOW_BITS 4096
+// window_bits 한 칸(uint64_t)의 비트 수. 창 안 위치를 (몇 번째 칸, 칸 안 몇 번째 비트)로 바꿀 때 쓴다
+#define TSN_WINDOW_WORD_BITS 64
+// 창을 밀 때 꼭 필요한 만큼에 더해 더 미는 비트 수(창의 1/4). 여유 없이 밀면 순서대로 오는 새 TSN 마다 창을 다시 민다
+#define TSN_SHIFT_SLACK_BITS (TSN_WINDOW_BITS / 4)
 
 // 방향 표 칸 수. 주소·포트를 바꿔 가며 주입해도 메모리·탐색 시간이 이 상한에 묶이도록. 정상 배치는 방향이 몇 개뿐이다
 #define DIRECTION_MAX_COUNT 2048
@@ -107,12 +87,12 @@ struct reassembly_queue
 // tsn_space: 한 방향의 TSN 중복 판정 창. 재전송된 DATA 를 걸러 같은 메시지를 두 번 넘기지 않기 위함
 struct tsn_space
 {
-    bool has_base;                              // false = 아직 이 방향의 TSN 을 본 적 없음(캡처 도중 합류 포함)
-    uint32_t base_tsn;                          // window_bits 의 비트 0 에 해당하는 TSN
-    uint64_t window_bits[TSN_WINDOW_BITS / 64]; // 본 TSN 이면 1
-    bool has_seen_range;                        // 아래 두 값이 유효한지
-    uint32_t lowest_seen_tsn;                   // 이 방향에서 본 가장 앞 TSN
-    uint32_t highest_seen_tsn;                  // 이 방향에서 본 가장 뒤 TSN
+    bool has_base;                                                // false = 아직 이 방향의 TSN 을 본 적 없음(캡처 도중 합류 포함)
+    uint32_t base_tsn;                                            // window_bits 의 비트 0 에 해당하는 TSN
+    uint64_t window_bits[TSN_WINDOW_BITS / TSN_WINDOW_WORD_BITS]; // 본 TSN 이면 1
+    bool has_seen_range;                                          // 아래 두 값이 유효한지
+    uint32_t lowest_seen_tsn;                                     // 이 방향에서 본 가장 앞 TSN
+    uint32_t highest_seen_tsn;                                    // 이 방향에서 본 가장 뒤 TSN
 };
 
 // vtag_state: 한 방향의 vtag 검사 상태. 다른 연결의 패킷이나 위조 패킷을 걸러내기 위함 (RFC 9260 §8.5)
@@ -227,7 +207,7 @@ struct sctp_ctx *sctp_new(sctp_message_callback on_message, sctp_assoc_callback 
     return ctx;
 }
 
-/* sctp_free: 모든 방향의 남은 조각, 방향·연결 표, 재조립 버퍼, 상태 자신을 해제한다.
+/* sctp_free: 모든 방향의 남은 조각, 방향·연결 표, 재조립 버퍼, 상태 자신을 해제
  *   ctx 가 NULL 이면 아무것도 하지 않는다.
  */
 void sctp_free(struct sctp_ctx *ctx)
@@ -261,9 +241,126 @@ static void deliver_message(struct sctp_ctx *ctx, const struct sctp_message *mes
         ctx->on_message(ctx->user, message);
 }
 
+/* direction_get: 패킷의 방향(출발 → 도착) 레코드를 방향 표에서 찾고, 없으면 새로 만든다.
+ *   이유: TSN 창·조각·vtag 는 방향마다 따로 흘러가므로, 패킷마다 자기 방향의 상태를 찾아 써야 한다.
+ *   키는 패킷의 (출발 주소, 도착 주소, 출발 포트, 도착 포트) 그대로다. 반대 방향은 다른 레코드다.
+ *   반환: 방향 레코드(표 안을 가리킴, sctp_free 전까지 주소가 바뀌지 않음). 표가 꽉 찼으면 NULL.
+ *   함께 바뀌는 것: 새로 만들면 ctx 의 direction_count.
+ */
+static struct sctp_direction *direction_get(struct sctp_ctx *ctx, const struct cap_record *record)
+{
+    for (size_t i = 0; i < ctx->direction_count; i++)
+    {
+        struct sctp_direction *direction = &ctx->directions[i];
+        bool is_same_direction = direction->src_addr == record->src_addr
+                              && direction->dst_addr == record->dst_addr
+                              && direction->src_port == record->src_port
+                              && direction->dst_port == record->dst_port;
+        if (is_same_direction)
+            return direction;
+    }
+
+    if (ctx->direction_count >= DIRECTION_MAX_COUNT)
+        return NULL; // 표가 꽉 참. 밀어낼 칸을 고르는 기능은 아직 없다
+
+    struct sctp_direction *direction = &ctx->directions[ctx->direction_count];
+    ctx->direction_count++;
+
+    // 키만 넣고 나머지(TSN 창·조각·vtag)는 0 으로 시작한다. 0 은 "아직 본 것 없음"을 뜻한다
+    *direction = (struct sctp_direction){
+        .src_addr = record->src_addr,
+        .dst_addr = record->dst_addr,
+        .src_port = record->src_port,
+        .dst_port = record->dst_port,
+    };
+    return direction;
+}
+
+/* tsn_window_shift: TSN 창을 shift_bits 비트만큼 앞으로 민다. 맨 앞(오래된 TSN)의 비트는 버리고, 뒤에 새로 생기는 비트는 0 이다.
+ *   이유: 창 끝보다 앞선 TSN 이 오면 창을 옮겨야 그 TSN 을 표시할 수 있다. base_tsn 은 호출한 쪽이 같이 옮긴다.
+ *   창 위치 k 의 비트는 window_bits[k / 64] 의 (k % 64)번 비트다. 밀고 나면 새 위치 k 의 비트 = 옛 위치 k + shift_bits 의 비트.
+ */
+static void tsn_window_shift(struct tsn_space *space, uint32_t shift_bits)
+{
+    if (shift_bits >= TSN_WINDOW_BITS)
+    {
+        memset(space->window_bits, 0, sizeof(space->window_bits)); // 옛 비트가 하나도 창에 남지 않는다
+        return;
+    }
+
+    size_t word_count = TSN_WINDOW_BITS / TSN_WINDOW_WORD_BITS;
+    size_t word_shift = shift_bits / TSN_WINDOW_WORD_BITS;  // 칸 단위로 옮길 수
+    unsigned bit_shift = shift_bits % TSN_WINDOW_WORD_BITS; // 칸 안에서 더 옮길 비트 수
+
+    // 앞 칸부터 채운다. 읽는 칸(i + word_shift 이상)은 아직 덮어쓰지 않은 칸이라 제자리에서 옮길 수 있다
+    for (size_t i = 0; i < word_count; i++)
+    {
+        // 새 칸 i = 옛 칸 i + word_shift 의 윗부분 + 그 다음 칸의 아랫부분. 창 밖의 옛 칸은 0 으로 본다
+        uint64_t low_word = 0;
+        uint64_t high_word = 0;
+        if (i + word_shift < word_count)
+            low_word = space->window_bits[i + word_shift];
+        if (i + word_shift + 1 < word_count)
+            high_word = space->window_bits[i + word_shift + 1];
+
+        if (bit_shift == 0)
+            space->window_bits[i] = low_word; // high_word << 64 는 C 에서 정의되지 않은 동작이라 따로 처리
+        else
+            space->window_bits[i] = (low_word >> bit_shift) | (high_word << (TSN_WINDOW_WORD_BITS - bit_shift));
+    }
+}
+
+// tsn_result: tsn_mark 의 판정 결과
+enum tsn_result
+{
+    TSN_NEW,       // 처음 본 TSN. 창에 표시했다
+    TSN_DUPLICATE, // 이미 본 TSN(재전송)
+    TSN_TOO_OLD,   // 창보다 오래되어 처음인지 알 수 없음
+};
+
+/* tsn_mark: 받은 DATA 청크의 TSN 을 처음 본 것인지 판정하고, 처음이면 창에 표시한다.
+ *   이유: 수동 관측자는 재전송된 DATA 도 그대로 보므로, 중복을 걸러야 같은 메시지를 상위로 두 번 넘기지 않는다.
+ *   TSN 은 2^32 다음에 0 으로 돌아온다. 그래서 뺄셈 결과를 부호 있는 값으로 보고 앞뒤를 정한다(직렬번호 산술, RFC 9260 §1.6).
+ *   반환: TSN_NEW / TSN_DUPLICATE / TSN_TOO_OLD.
+ *   함께 바뀌는 것: space 의 창·base_tsn. ctx 는 유실 추정(F10)에서 통계를 쓰려고 미리 받는다.
+ */
+static enum tsn_result tsn_mark(struct sctp_ctx *ctx, struct tsn_space *space, uint32_t tsn)
+{
+    if (!space->has_base)
+    {
+        // 이 방향의 첫 TSN(캡처 도중 합류 포함). 창 가운데에 두어, 이보다 앞선 TSN 이 늦게 와도 처음 본 것으로 받는다
+        space->has_base = true;
+        space->base_tsn = tsn - TSN_WINDOW_BITS / 2;
+        memset(space->window_bits, 0, sizeof(space->window_bits));
+    }
+
+    int32_t window_offset = (int32_t)(tsn - space->base_tsn); // 창 안 위치. 음수면 창 시작보다 앞
+    if (window_offset < 0)
+        return TSN_TOO_OLD;
+
+    if (window_offset >= TSN_WINDOW_BITS)
+    {
+        // tsn 이 창 마지막 비트에 오는 최소 이동(window_offset - TSN_WINDOW_BITS + 1)에 여유를 더한다
+        uint32_t shift_bits = (uint32_t)window_offset - TSN_WINDOW_BITS + 1 + TSN_SHIFT_SLACK_BITS;
+        tsn_window_shift(space, shift_bits);
+        space->base_tsn += shift_bits;
+        window_offset -= (int32_t)shift_bits;
+    }
+
+    size_t word_index = (size_t)window_offset / TSN_WINDOW_WORD_BITS;
+    uint64_t bit_mask = (uint64_t)1 << ((size_t)window_offset % TSN_WINDOW_WORD_BITS);
+    if (space->window_bits[word_index] & bit_mask)
+        return TSN_DUPLICATE;
+
+    space->window_bits[word_index] |= bit_mask;
+    return TSN_NEW;
+}
+
 /* sctp_input: 캡처한 패킷 하나를 처리한다.
  *   1) 패킷 수를 세고, 공통 헤더가 없는 패킷은 버리고, 캡처가 잘린 패킷은 표시한다.
- *   2) 공통 헤더 뒤의 청크를 하나씩 읽는다(번들링). 완성된 메시지를 담은 DATA 청크는 바로 전달한다.
+ *   2) 패킷 방향의 레코드를 찾는다(없으면 만든다). 방향 표가 꽉 차면 이 패킷은 처리하지 않는다.
+ *   3) 공통 헤더 뒤의 청크를 하나씩 읽는다(번들링). DATA 청크는 먼저 TSN 을 판정해, 이미 본 것(재전송)이나
+ *      창보다 오래된 것은 세고 버린다. 완성된 메시지를 담은 DATA 청크는 바로 전달한다.
  *      메시지 일부만 담은 DATA 청크는 세기만 한다. 그 밖의 청크 종류는 무시한다.
  *   이유: 패킷 바이트는 공격자가 보낸 입력일 수 있으므로, 모든 읽기 전에 캡처된 길이 안인지 확인한다.
  *   record 는 호출한 쪽 소유다. 이 함수가 돌아온 뒤에는 쓰지 않는다.
@@ -282,6 +379,11 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record)
     // 잘린 패킷도 앞쪽 청크는 온전할 수 있으므로 버리지 않고 표시
     if (record->captured_len < record->packet_len)
         ctx->stats.truncated_packet_count++;
+
+    // 이 패킷 방향의 상태(TSN 창·조각·vtag)를 담을 레코드. 지금은 TSN 창만 쓴다
+    struct sctp_direction *direction = direction_get(ctx, record);
+    if (!direction)
+        return; // 방향 표가 꽉 차 상태를 둘 곳이 없다
 
     const uint8_t *packet_bytes = record->sctp_packet;
     size_t captured_len = record->captured_len;
@@ -329,6 +431,20 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record)
                 .data = chunk_bytes + DATA_CHUNK_HEADER_BYTES,
                 .len = (size_t)chunk_len - DATA_CHUNK_HEADER_BYTES,
             };
+
+            // 조각 청크도 자기 TSN 이 있다. 완성 메시지인지 가르기 전에 판정해야 재전송된 조각도 걸러진다
+            enum tsn_result mark_result = tsn_mark(ctx, &direction->tsn, chunk.tsn);
+            if (mark_result == TSN_DUPLICATE)
+            {
+                ctx->stats.duplicate_chunk_count++; // 재전송. 처음 온 청크를 이미 처리했다
+                break;
+            }
+            if (mark_result == TSN_TOO_OLD)
+            {
+                ctx->stats.too_old_chunk_count++; // 중복인지 알 수 없다. 두 번 넘길 수 있으므로 넘기지 않는다
+                break;
+            }
+
             bool is_whole_message = (chunk.flags & DATA_FLAG_BEGIN) && (chunk.flags & DATA_FLAG_END);
             if (!is_whole_message)
             {
