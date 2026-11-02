@@ -14,15 +14,26 @@
  *   sctp_direction    — 한 방향(보내는 끝 → 받는 끝). 위 셋을 품는다
  *   sctp_assoc_record — 한 연결(양방향 공통)과 그 연결 번호
  *   sctp_ctx          — libsctp 전체 상태. 방향 표·연결 표·재조립 버퍼·콜백·통계
+ *
+ * 주요 함수:
+ *   sctp_new / sctp_free / sctp_get_stats — 상태 생성·해제, 누적 통계
+ *   fragments_clear                       — 한 방향의 조각 목록 전체 해제
  */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "sctp.h"
 
 // TSN 하나당 1비트. 재전송은 최근 TSN 에서 오므로 이 범위면 중복을 가려낸다. uint64_t 배열이라 64 의 배수여야 한다
 #define TSN_WINDOW_BITS 4096
+
+// 방향 표 칸 수. 주소·포트를 바꿔 가며 주입해도 메모리·탐색 시간이 이 상한에 묶이도록. 정상 배치는 방향이 몇 개뿐이다
+#define DIRECTION_MAX_COUNT 2048
+
+// 연결 표 칸 수. 방향 표와 같은 이유
+#define ASSOC_MAX_COUNT 2048
 
 // fragment: 아직 메시지를 완성하지 못한 DATA 조각 하나(SCTP 메시지 단편).
 // 패킷 버퍼는 sctp_input 이 끝나면 사라지므로 바이트 복사
@@ -112,3 +123,70 @@ struct sctp_ctx
     size_t assoc_clock;     // 표가 꽉 찼을 때 다음에 밀어낼 칸
     uint32_t next_assoc_id; // 다음에 매길 연결 번호. 0 은 '연결 없음' 이라 1부터
 };
+
+/* fragments_clear: 조각 목록의 조각을 모두 해제하고 목록을 비운다.
+ *   이유: 방향을 해제·초기화·재사용할 때 남은 조각을 한꺼번에 반납해야 누수가 없다.
+ */
+static void fragments_clear(struct reassembly_queue *queue)
+{
+    struct fragment *fragment = queue->head;
+    while (fragment)
+    {
+        struct fragment *next = fragment->next;
+        free(fragment);
+        fragment = next;
+    }
+    queue->head = NULL;
+    queue->total_bytes = 0;
+    queue->fragment_count = 0;
+}
+
+/* sctp_new: libsctp 상태를 만든다.
+ *   이유: 방향·연결 표를 상한만큼 여기서 한 번에 잡아, 처리 중에 표가 옮겨지거나 할당에 실패하는 일을 없앤다.
+ *   반환: 새 상태. 하나라도 할당에 실패하면 이미 잡은 것을 해제하고 NULL.
+ *   user 는 호출한 쪽 소유. 보관했다가 콜백 첫 인자로 넘기기만 한다.
+ */
+struct sctp_ctx *sctp_new(sctp_message_callback on_message, sctp_assoc_callback on_assoc, void *user)
+{
+    struct sctp_ctx *ctx = calloc(1, sizeof(*ctx)); // 통계 포함 전부 0
+    if (!ctx)
+        return NULL;
+
+    ctx->directions = calloc(DIRECTION_MAX_COUNT, sizeof(*ctx->directions));
+    ctx->assocs = calloc(ASSOC_MAX_COUNT, sizeof(*ctx->assocs));
+    if (!ctx->directions || !ctx->assocs)
+    {
+        free(ctx->directions); // 둘 중 하나는 NULL 일 수 있다. free(NULL) 은 아무것도 하지 않는다
+        free(ctx->assocs);
+        free(ctx);
+        return NULL;
+    }
+
+    ctx->on_message = on_message;
+    ctx->on_assoc = on_assoc;
+    ctx->user = user;
+    ctx->next_assoc_id = 1;
+    return ctx;
+}
+
+/* sctp_free: 모든 방향의 남은 조각, 방향·연결 표, 재조립 버퍼, 상태 자신을 해제한다.
+ *   ctx 가 NULL 이면 아무것도 하지 않는다.
+ */
+void sctp_free(struct sctp_ctx *ctx)
+{
+    if (!ctx)
+        return;
+
+    for (size_t i = 0; i < ctx->direction_count; i++)
+        fragments_clear(&ctx->directions[i].fragments);
+    free(ctx->directions);
+    free(ctx->assocs);
+    free(ctx->reassembly_buf);
+    free(ctx);
+}
+
+// sctp_get_stats: 누적 통계의 주소. ctx 가 해제되기 전까지 유효하다. ctx 는 NULL 이면 안 된다.
+const struct sctp_stats *sctp_get_stats(const struct sctp_ctx *ctx)
+{
+    return &ctx->stats;
+}
