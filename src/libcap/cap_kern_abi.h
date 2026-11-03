@@ -22,5 +22,19 @@
 // cap_event_hdr.flags (captured_len < packet_len)
 #define EVENT_TRUNCATED 0x1
 
+// +--------+------------+---------+---------------+--------+---------+---+---+---+---+
+// |CAPTURED|RINGBUF_FULL|TRUNCATED|IP_FRAG_SKIPPED|ESP_SEEN|SLOT_BUSY| 0 | 1 | 2 | 3 |
+// +--------+------------+---------+---------------+--------+---------+---+---+---+---+
+//                                                                    slot_index counter
+#define ST_CAPTURED 0
+// Ring Buffer 가 가득 찬 경우 + Slot 이 모두 사용 중인 경우
+#define ST_RINGBUF_FULL 1
+#define ST_TRUNCATED 2   
+#define ST_IP_FRAG_SKIPPED 3
+#define ST_ESP_SEEN 4 
+#define ST_SLOT_BUSY 5 
+#define ST_SLOT_USED_BASE 6
+#define ST_COUNT (ST_SLOT_USED_BASE + SLOT_MAX)   
+
 #endif // TELEMETRY_CAP_KERN_ABI_H
 
