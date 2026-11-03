@@ -265,6 +265,69 @@ static struct sctp_direction *direction_get(struct sctp_ctx *ctx, const struct c
     return direction;
 }
 
+// assoc_id_mode: assoc_id_assign 이 지금 번호를 쓸지, 새 번호를 매길지
+enum assoc_id_mode {
+    ASSOC_ID_CURRENT, // 이미 번호가 있으면 그 번호. 없으면 새로 매긴다
+    ASSOC_ID_NEW,     // 번호가 있어도 새로 매긴다. 같은 주소·포트로 연결이 새로 시작됐을 때(INIT, 재시작)
+};
+
+/* assoc_id_assign: 패킷이 속한 연결(양방향 공통)을 연결 표에서 찾거나 만들고, 그 연결 번호를 돌려준다.
+ *   이유: 탐지 쪽이 두 방향의 메시지를 같은 연결로 묶어 보려면, 메시지마다 연결 번호가 붙어야 한다.
+ *   두 끝을 (주소, 포트) 사전순으로 정렬해 작은 쪽을 low 로 두므로, A→B 와 B→A 패킷이 같은 레코드를 찾는다.
+ *   비교는 cap_record 의 값 그대로 한다(바이트 순서와 무관하게 양방향에서 같은 결과만 나오면 된다).
+ *   반환: 연결 번호(1 부터). 연결 표가 꽉 차 레코드를 만들 수 없으면 0(= 연결 번호 없음).
+ *   함께 바뀌는 것: 새로 만들면 ctx 의 assoc_count, 번호를 매기면 next_assoc_id.
+ */
+static uint32_t assoc_id_assign(struct sctp_ctx *ctx, const struct cap_record *record, enum assoc_id_mode mode) {
+    // 출발 끝을 low 로 두고, 도착 끝이 더 작으면 바꾼다
+    uint32_t low_addr = record->src_addr;
+    uint16_t low_port = record->src_port;
+    uint32_t high_addr = record->dst_addr;
+    uint16_t high_port = record->dst_port;
+    bool is_dst_lower = record->dst_addr < record->src_addr
+                     || (record->dst_addr == record->src_addr && record->dst_port < record->src_port);
+    if (is_dst_lower) {
+        low_addr = record->dst_addr;
+        low_port = record->dst_port;
+        high_addr = record->src_addr;
+        high_port = record->src_port;
+    }
+
+    struct sctp_assoc_record *assoc = NULL;
+    for (size_t i = 0; i < ctx->assoc_count; i++) {
+        struct sctp_assoc_record *candidate = &ctx->assocs[i];
+        bool is_same_assoc = candidate->low_addr == low_addr
+                          && candidate->low_port == low_port
+                          && candidate->high_addr == high_addr
+                          && candidate->high_port == high_port;
+        if (is_same_assoc) {
+            assoc = candidate;
+            break;
+        }
+    }
+
+    if (!assoc) {
+        if (ctx->assoc_count >= ASSOC_MAX_COUNT)
+            return 0; // 표가 꽉 참. 밀어낼 칸을 고르는 기능은 아직 없다
+        assoc = &ctx->assocs[ctx->assoc_count];
+        ctx->assoc_count++;
+        *assoc = (struct sctp_assoc_record){
+            .low_addr = low_addr,
+            .low_port = low_port,
+            .high_addr = high_addr,
+            .high_port = high_port,
+        }; // assoc_id 는 0(아직 번호 없음)으로 시작
+    }
+
+    if (assoc->assoc_id == 0 || mode == ASSOC_ID_NEW) {
+        assoc->assoc_id = ctx->next_assoc_id;
+        ctx->next_assoc_id++;
+        if (ctx->next_assoc_id == 0)
+            ctx->next_assoc_id = 1; // 2^32 번 매겨 0 으로 돌아오면 건너뛴다. 0 은 "연결 번호 없음"이다
+    }
+    return assoc->assoc_id;
+}
+
 /* tsn_window_shift: TSN 창을 shift_bits 비트만큼 앞으로 민다. 맨 앞(오래된 TSN)의 비트는 버리고, 뒤에 새로 생기는 비트는 0 이다.
  *   이유: 창 끝보다 앞선 TSN 이 오면 창을 옮겨야 그 TSN 을 표시할 수 있다. base_tsn 은 호출한 쪽이 같이 옮긴다.
  *   창 위치 k 의 비트는 window_bits[k / 64] 의 (k % 64)번 비트다. 밀고 나면 새 위치 k 의 비트 = 옛 위치 k + shift_bits 의 비트.
@@ -521,6 +584,7 @@ static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, c
 /* sctp_input: 캡처한 패킷 하나를 처리한다.
  *   1) 패킷 수를 세고, 공통 헤더가 없는 패킷은 버리고, 캡처가 잘린 패킷은 표시한다.
  *   2) 패킷 방향의 레코드를 찾는다(없으면 만든다). 방향 표가 꽉 차면 이 패킷은 처리하지 않는다.
+ *      패킷이 속한 연결의 번호를 정한다. 이 패킷에서 나오는 메시지에 이 번호를 붙인다.
  *   3) 공통 헤더 뒤의 청크를 하나씩 읽는다(번들링). DATA 청크는 먼저 TSN 을 판정해, 이미 본 것(재전송)이나
  *      창보다 오래된 것은 세고 버린다. 완성된 메시지를 담은 DATA 청크는 바로 전달한다.
  *      메시지 일부만 담은 DATA 청크(조각)는 보관했다가, 같은 메시지의 조각이 다 모이면 이어 붙여 전달한다.
@@ -545,6 +609,9 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
     struct sctp_direction *direction = direction_get(ctx, record);
     if (!direction)
         return; // 방향 표가 꽉 차 상태를 둘 곳이 없다
+
+    // 연결 표가 꽉 차면 0 이다. 메시지는 그대로 넘기되 연결 번호 없이 넘긴다
+    uint32_t assoc_id = assoc_id_assign(ctx, record, ASSOC_ID_CURRENT);
 
     const uint8_t *packet_bytes = record->sctp_packet;
     size_t captured_len = record->captured_len;
@@ -601,13 +668,13 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
             bool is_whole_message = (chunk.flags & DATA_FLAG_BEGIN) && (chunk.flags & DATA_FLAG_END);
             if (!is_whole_message) {
                 ctx->stats.fragment_chunk_count++;
-                fragment_add(ctx, &direction->fragments, record, 0, &chunk); // 연결 번호는 아직 매기지 않으므로 0
+                fragment_add(ctx, &direction->fragments, record, assoc_id, &chunk);
                 break;
             }
 
             struct sctp_message message = {
                 .record = record,
-                .assoc_id = 0, // 연결 번호는 아직 매기지 않는다
+                .assoc_id = assoc_id,
                 .ppid = chunk.ppid,
                 .stream_id = chunk.stream_id,
                 .tsn = chunk.tsn,
