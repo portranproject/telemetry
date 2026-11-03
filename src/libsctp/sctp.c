@@ -7,6 +7,8 @@
 #include "libcap/cap.h"
 #include "sctp.h"
 
+// MARK: - 상수
+
 // TSN 하나당 1비트. 재전송은 최근 TSN 에서 오므로 이 범위면 중복을 가려낸다. uint64_t 배열이라 64 의 배수여야 한다
 #define TSN_WINDOW_BITS 4096
 // window_bits 한 칸(uint64_t)의 비트 수. 창 안 위치를 (몇 번째 칸, 칸 안 몇 번째 비트)로 바꿀 때 쓴다
@@ -41,6 +43,8 @@
 // DATA 청크 U 비트: 순서 무관 메시지. 이때 SSN 은 의미가 없어 같은 메시지의 조각인지 가를 때 비교하지 않는다 (RFC 9260 §3.3.1)
 #define DATA_FLAG_UNORDERED 0x04
 
+// MARK: - 청크 종류·바이트 읽기
+
 // sctp_chunk_type: 청크 헤더 첫 바이트의 청크 종류 번호 (RFC 9260 §3.2, I-DATA 는 RFC 8260 §2.1).
 //   libsctp 가 처리하는 종류만 둔다. 여기 없는 번호(SACK, HEARTBEAT, COOKIE 등)는 무시한다.
 //   패킷에서 읽은 바이트에는 여기 없는 값도 들어오므로, 읽은 값은 uint8_t 로 두고 이 값들과 비교만 한다
@@ -66,6 +70,8 @@ static inline uint16_t read_be16(const uint8_t *ptr) {
 static inline uint32_t read_be32(const uint8_t *ptr) {
     return ((uint32_t)ptr[0] << 24) | ((uint32_t)ptr[1] << 16) | ((uint32_t)ptr[2] << 8) | (uint32_t)ptr[3];
 }
+
+// MARK: - 자료구조
 
 // fragment: 아직 메시지를 완성하지 못한 DATA 조각 하나(SCTP 메시지 단편).
 // 패킷 버퍼는 sctp_input 이 끝나면 사라지므로 바이트 복사
@@ -128,6 +134,15 @@ struct sctp_assoc_record {
     uint32_t assoc_id; // 0 = 아직 번호 없음. INIT·재시작마다 새 번호
 };
 
+// raw_chunk: 청크 하나의 헤더 값과 바이트(종류별로 해석하기 전). 청크 종류별 처리 함수에 하나의 개념으로 넘기기 위함
+struct raw_chunk {
+    const uint8_t *bytes; // 청크 헤더 첫 바이트. 패킷 버퍼 안을 가리킴(호출한 쪽 소유, 복사 아님)
+    uint8_t type;         // 청크 종류(enum sctp_chunk_type)
+    uint8_t flags;        // 뜻은 종류마다 다르다(DATA 는 B·E·U 비트)
+    uint16_t len;         // 청크 헤더를 포함한 길이, 패딩 제외. CHUNK_HEADER_BYTES 이상임을 확인한 값
+    bool is_partial;      // 청크 끝이 캡처 범위 밖. true 면 bytes 에서 len 만큼 읽으면 안 된다
+};
+
 // data_chunk: DATA 청크 하나에서 읽은 값 청크를 읽는 곳과 쓰는 곳 사이에 하나의 개념으로 넘기기 위함
 struct data_chunk {
     uint32_t tsn;
@@ -159,6 +174,8 @@ struct sctp_ctx {
     size_t assoc_clock;     // 표가 꽉 찼을 때 다음에 밀어낼 칸
     uint32_t next_assoc_id; // 다음에 매길 연결 번호. 0 은 '연결 없음' 이라 1부터
 };
+
+// MARK: - 생성·해제·통계
 
 /* fragments_clear: 조각 목록의 조각을 모두 해제하고 목록을 비운다.
  *   이유: 방향을 해제·초기화·재사용할 때 남은 조각을 한꺼번에 반납해야 누수가 없다.
@@ -221,6 +238,8 @@ const struct sctp_stats *sctp_get_stats(const struct sctp_ctx *ctx) {
     return &ctx->stats;
 }
 
+// MARK: - 콜백 전달
+
 /* deliver_message: 완성된 메시지 하나를 on_message 콜백으로 넘긴다.
  *   이유: 메시지를 내보내는 곳을 한 군데로 모아, 콜백이 없을 때의 처리와 메시지 수 세기를 한 번만 쓴다.
  *   콜백이 NULL 이어도 message_count 는 센다(통계가 콜백 등록 여부와 무관해야 비교할 수 있다).
@@ -231,6 +250,8 @@ static void deliver_message(struct sctp_ctx *ctx, const struct sctp_message *mes
     if (ctx->on_message)
         ctx->on_message(ctx->user, message);
 }
+
+// MARK: - 방향·연결 찾기
 
 /* direction_get: 패킷의 방향(출발 → 도착) 레코드를 방향 표에서 찾고, 없으면 새로 만든다.
  *   이유: TSN 창·조각·vtag 는 방향마다 따로 흘러가므로, 패킷마다 자기 방향의 상태를 찾아 써야 한다.
@@ -328,6 +349,8 @@ static uint32_t assoc_id_assign(struct sctp_ctx *ctx, const struct cap_record *r
     return assoc->assoc_id;
 }
 
+// MARK: - TSN 판정
+
 /* tsn_window_shift: TSN 창을 shift_bits 비트만큼 앞으로 민다. 맨 앞(오래된 TSN)의 비트는 버리고, 뒤에 새로 생기는 비트는 0 이다.
  *   이유: 창 끝보다 앞선 TSN 이 오면 창을 옮겨야 그 TSN 을 표시할 수 있다. base_tsn 은 호출한 쪽이 같이 옮긴다.
  *   창 위치 k 의 비트는 window_bits[k / 64] 의 (k % 64)번 비트다. 밀고 나면 새 위치 k 의 비트 = 옛 위치 k + shift_bits 의 비트.
@@ -400,6 +423,8 @@ static enum tsn_result tsn_mark(struct sctp_ctx *ctx, struct tsn_space *space, u
     space->window_bits[word_index] |= bit_mask;
     return TSN_NEW;
 }
+
+// MARK: - 조각 재조립
 
 /* fragment_remove: link 가 가리키는 조각 하나를 목록에서 떼어 내고 해제한다.
  *   이유: 조립에 쓴 조각과 버리는 조각을 같은 방법으로 반납해, 목록의 바이트·개수 합계가 실제와 어긋나지 않게 한다.
@@ -581,14 +606,76 @@ static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, c
     deliver_message(ctx, &message);
 }
 
+// MARK: - 청크 종류별 처리
+
+/* handle_data_chunk: DATA 청크 하나를 처리한다.
+ *   TSN 을 먼저 판정해, 이미 본 것(재전송)이나 창보다 오래된 것은 세고 버린다.
+ *   완성된 메시지를 담은 청크는 바로 전달하고, 메시지 일부만 담은 청크(조각)는 fragment_add 로 넘긴다.
+ *   이유: 청크 종류마다 처리가 길어, sctp_input 은 청크를 종류별로 나눠 주기만 하고 처리는 종류마다 따로 둔다.
+ *   raw_chunk 의 바이트는 잘리지 않았음을 확인한 뒤에만 읽는다.
+ *   함께 바뀌는 것: ctx 의 통계, direction 의 TSN 창·조각 목록, on_message 호출.
+ */
+static void handle_data_chunk(struct sctp_ctx *ctx, struct sctp_direction *direction, const struct cap_record *record,
+                              uint32_t assoc_id, const struct raw_chunk *raw_chunk) {
+    ctx->stats.data_chunk_count++;
+    if (raw_chunk->len < DATA_CHUNK_HEADER_BYTES) {
+        ctx->stats.bad_header_count++; // 이 청크만 건너뛰고 다음 청크로
+        return;
+    }
+    if (raw_chunk->is_partial) {
+        ctx->stats.partial_chunk_count++; // 잘린 청크는 읽지 않는다
+        return;
+    }
+
+    struct data_chunk chunk = {
+        .tsn = read_be32(raw_chunk->bytes + 4),
+        .stream_id = read_be16(raw_chunk->bytes + 8),
+        .ssn = read_be16(raw_chunk->bytes + 10),
+        .ppid = read_be32(raw_chunk->bytes + 12),
+        .flags = raw_chunk->flags,
+        .data = raw_chunk->bytes + DATA_CHUNK_HEADER_BYTES,
+        .len = (size_t)raw_chunk->len - DATA_CHUNK_HEADER_BYTES,
+    };
+
+    // 조각 청크도 자기 TSN 이 있다. 완성 메시지인지 가르기 전에 판정해야 재전송된 조각도 걸러진다
+    enum tsn_result mark_result = tsn_mark(ctx, &direction->tsn, chunk.tsn);
+    if (mark_result == TSN_DUPLICATE) {
+        ctx->stats.duplicate_chunk_count++; // 재전송. 처음 온 청크를 이미 처리했다
+        return;
+    }
+    if (mark_result == TSN_TOO_OLD) {
+        ctx->stats.too_old_chunk_count++; // 중복인지 알 수 없다. 두 번 넘길 수 있으므로 넘기지 않는다
+        return;
+    }
+
+    bool is_whole_message = (chunk.flags & DATA_FLAG_BEGIN) && (chunk.flags & DATA_FLAG_END);
+    if (!is_whole_message) {
+        ctx->stats.fragment_chunk_count++;
+        fragment_add(ctx, &direction->fragments, record, assoc_id, &chunk);
+        return;
+    }
+
+    struct sctp_message message = {
+        .record = record,
+        .assoc_id = assoc_id,
+        .ppid = chunk.ppid,
+        .stream_id = chunk.stream_id,
+        .tsn = chunk.tsn,
+        .fragment_count = 1,
+        .data = chunk.data,
+        .len = chunk.len,
+    };
+    deliver_message(ctx, &message);
+}
+
+// MARK: - 패킷 입력
+
 /* sctp_input: 캡처한 패킷 하나를 처리한다.
  *   1) 패킷 수를 세고, 공통 헤더가 없는 패킷은 버리고, 캡처가 잘린 패킷은 표시한다.
  *   2) 패킷 방향의 레코드를 찾는다(없으면 만든다). 방향 표가 꽉 차면 이 패킷은 처리하지 않는다.
  *      패킷이 속한 연결의 번호를 정한다. 이 패킷에서 나오는 메시지에 이 번호를 붙인다.
- *   3) 공통 헤더 뒤의 청크를 하나씩 읽는다(번들링). DATA 청크는 먼저 TSN 을 판정해, 이미 본 것(재전송)이나
- *      창보다 오래된 것은 세고 버린다. 완성된 메시지를 담은 DATA 청크는 바로 전달한다.
- *      메시지 일부만 담은 DATA 청크(조각)는 보관했다가, 같은 메시지의 조각이 다 모이면 이어 붙여 전달한다.
- *      그 밖의 청크 종류는 무시한다.
+ *   3) 공통 헤더 뒤의 청크를 하나씩 읽어(번들링) 종류별 처리 함수에 넘긴다.
+ *      DATA 청크는 handle_data_chunk 가 처리한다. 그 밖의 청크 종류는 무시한다.
  *   이유: 패킷 바이트는 공격자가 보낸 입력일 수 있으므로, 모든 읽기 전에 캡처된 길이 안인지 확인한다.
  *   record 는 호출한 쪽 소유다. 이 함수가 돌아온 뒤에는 쓰지 않는다.
  *   함께 바뀌는 것: ctx 의 통계, on_message 호출.
@@ -619,8 +706,6 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
 
     while (offset + CHUNK_HEADER_BYTES <= captured_len) {
         const uint8_t *chunk_bytes = packet_bytes + offset;
-        uint8_t chunk_type = chunk_bytes[0];
-        uint8_t chunk_flags = chunk_bytes[1];
         uint16_t chunk_len = read_be16(chunk_bytes + 2); // 청크 헤더를 포함한 길이, 패딩 제외
 
         if (chunk_len < CHUNK_HEADER_BYTES) {
@@ -629,67 +714,24 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
         }
         ctx->stats.chunk_count++;
 
-        bool is_partial = offset + chunk_len > captured_len; // 청크 끝이 캡처 범위 밖
+        struct raw_chunk chunk = {
+            .bytes = chunk_bytes,
+            .type = chunk_bytes[0],
+            .flags = chunk_bytes[1],
+            .len = chunk_len,
+            .is_partial = offset + chunk_len > captured_len, // 청크 끝이 캡처 범위 밖
+        };
 
-        // 청크 종류별 처리. 각 case 안의 break 는 그 청크 처리만 끝내고, 아래의 다음 청크 이동으로 간다
-        switch (chunk_type) {
-        case CHUNK_TYPE_DATA: {
-            ctx->stats.data_chunk_count++;
-            if (chunk_len < DATA_CHUNK_HEADER_BYTES) {
-                ctx->stats.bad_header_count++; // 이 청크만 건너뛰고 다음 청크로
-                break;
-            }
-            if (is_partial) {
-                ctx->stats.partial_chunk_count++; // 잘린 청크는 읽지 않는다
-                break;
-            }
-
-            struct data_chunk chunk = {
-                .tsn = read_be32(chunk_bytes + 4),
-                .stream_id = read_be16(chunk_bytes + 8),
-                .ssn = read_be16(chunk_bytes + 10),
-                .ppid = read_be32(chunk_bytes + 12),
-                .flags = chunk_flags,
-                .data = chunk_bytes + DATA_CHUNK_HEADER_BYTES,
-                .len = (size_t)chunk_len - DATA_CHUNK_HEADER_BYTES,
-            };
-
-            // 조각 청크도 자기 TSN 이 있다. 완성 메시지인지 가르기 전에 판정해야 재전송된 조각도 걸러진다
-            enum tsn_result mark_result = tsn_mark(ctx, &direction->tsn, chunk.tsn);
-            if (mark_result == TSN_DUPLICATE) {
-                ctx->stats.duplicate_chunk_count++; // 재전송. 처음 온 청크를 이미 처리했다
-                break;
-            }
-            if (mark_result == TSN_TOO_OLD) {
-                ctx->stats.too_old_chunk_count++; // 중복인지 알 수 없다. 두 번 넘길 수 있으므로 넘기지 않는다
-                break;
-            }
-
-            bool is_whole_message = (chunk.flags & DATA_FLAG_BEGIN) && (chunk.flags & DATA_FLAG_END);
-            if (!is_whole_message) {
-                ctx->stats.fragment_chunk_count++;
-                fragment_add(ctx, &direction->fragments, record, assoc_id, &chunk);
-                break;
-            }
-
-            struct sctp_message message = {
-                .record = record,
-                .assoc_id = assoc_id,
-                .ppid = chunk.ppid,
-                .stream_id = chunk.stream_id,
-                .tsn = chunk.tsn,
-                .fragment_count = 1,
-                .data = chunk.data,
-                .len = chunk.len,
-            };
-            deliver_message(ctx, &message);
+        // 청크 종류별 처리. 처리 함수는 그 청크만 다루고, 다음 청크로 넘어가는 일은 아래에서 한다
+        switch (chunk.type) {
+        case CHUNK_TYPE_DATA:
+            handle_data_chunk(ctx, direction, record, assoc_id, &chunk);
             break;
-        }
         default:
             break; // 처리하지 않는 청크(SACK, HEARTBEAT 등)는 메시지가 없으므로 무시한다
         }
 
-        if (is_partial)
+        if (chunk.is_partial)
             break; // 캡처가 이 청크 중간에서 끝났으니 뒤에 읽을 청크가 없음
 
         // 다음 청크는 이 청크를 CHUNK_ALIGN_BYTES 의 배수로 패딩한 뒤에서 시작
