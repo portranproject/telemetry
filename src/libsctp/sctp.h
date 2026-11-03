@@ -34,6 +34,8 @@ enum sctp_assoc_kind {
 };
 
 // sctp_assoc_event: 연결 시작·끝 알림 하나.
+//   캡처가 끝(ABORT·SHUTDOWN COMPLETE)을 놓치면, 옛 번호의 END 없이 같은 두 끝(주소·포트)의 START 가 올 수 있다.
+//   그때 옛 번호의 연결은 끝난 것으로 본다.
 struct sctp_assoc_event {
     const struct cap_record *record; // 알림을 일으킨 패킷
     uint32_t assoc_id;               // sctp_message.assoc_id 와 같은 번호

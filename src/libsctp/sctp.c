@@ -40,8 +40,17 @@
 #define DATA_CHUNK_HEADER_BYTES 16
 #define DATA_FLAG_END 0x01   // DATA 청크 E 비트: 메시지의 마지막 조각
 #define DATA_FLAG_BEGIN 0x02 // DATA 청크 B 비트: 메시지의 첫 조각
-// DATA 청크 U 비트: 순서 무관 메시지. 이때 SSN 은 의미가 없어 같은 메시지의 조각인지 가를 때 비교하지 않는다 (RFC 9260 §3.3.1)
+// DATA 청크 U 비트: 순서 무관 메시지. 이때 SSN 은 의미가 없어 같은 메시지의 조각인지 가를 때 비교하지 않는다
 #define DATA_FLAG_UNORDERED 0x04
+
+// INIT·INIT-ACK 청크의 고정 부분 길이: 청크 헤더 4 + Initiate Tag 4 + a_rwnd 4 + 스트림 수 2·2 + Initial TSN 4
+// 이보다 짧으면 Initial TSN 을 읽을 수 없다
+#define INIT_CHUNK_MIN_BYTES 20
+
+// ABORT·SHUTDOWN COMPLETE 청크 T 비트: vtag 가 보낸 쪽 자기 값이 아니라, 받은 패킷의 vtag 를 되돌려 쓴 값이라는 뜻
+#define ABORT_FLAG_T 0x01
+// 기대와 다른 같은 vtag 가 이만큼 이어지면 연결 재시작으로 받아들인다. 위조 패킷 하나로는 연결 상태가 바뀌지 않게 2
+#define VTAG_RESTART_CONFIRM_COUNT 2
 
 // MARK: - 청크 종류·바이트 읽기
 
@@ -251,21 +260,55 @@ static void deliver_message(struct sctp_ctx *ctx, const struct sctp_message *mes
         ctx->on_message(ctx->user, message);
 }
 
+/* notify_assoc: 연결 시작·끝을 on_assoc 콜백으로 알린다.
+ *   이유: 알림을 내보내는 곳을 한 군데로 모아, 콜백이 없을 때의 처리를 한 번만 쓴다.
+ *   콜백이 NULL 이면 아무것도 하지 않는다. 알림 구조체와 그 안의 포인터는 콜백이 돌아오면 무효다.
+ *   함께 바뀌는 것: on_assoc 호출.
+ */
+static void notify_assoc(struct sctp_ctx *ctx, const struct cap_record *record, uint32_t assoc_id, enum sctp_assoc_kind kind) {
+    if (!ctx->on_assoc)
+        return;
+
+    struct sctp_assoc_event event = {
+        .record = record,
+        .assoc_id = assoc_id,
+        .kind = kind,
+    };
+    ctx->on_assoc(ctx->user, &event);
+}
+
 // MARK: - 방향·연결 찾기
 
-/* direction_get: 패킷의 방향(출발 → 도착) 레코드를 방향 표에서 찾고, 없으면 새로 만든다.
+// direction_side: direction_get 이 패킷과 같은 방향을 찾을지, 반대 방향을 찾을지
+enum direction_side {
+    DIRECTION_FORWARD, // 패킷과 같은 방향(출발 → 도착)
+    DIRECTION_REVERSE, // 반대 방향(도착 → 출발). 연결이 새로 시작될 때 상대 쪽 방향의 상태도 비우려고
+};
+
+/* direction_get: 패킷의 방향(출발 → 도착) 레코드, 또는 그 반대 방향 레코드를 방향 표에서 찾고, 없으면 새로 만든다.
  *   이유: TSN 창·조각·vtag 는 방향마다 따로 흘러가므로, 패킷마다 자기 방향의 상태를 찾아 써야 한다.
- *   키는 패킷의 (출발 주소, 도착 주소, 출발 포트, 도착 포트) 그대로다. 반대 방향은 다른 레코드다.
+ *   키는 패킷의 (출발 주소, 도착 주소, 출발 포트, 도착 포트)다. DIRECTION_REVERSE 면 출발과 도착을 바꾼 키로 찾는다.
  *   반환: 방향 레코드(표 안을 가리킴, sctp_free 전까지 주소가 바뀌지 않음). 표가 꽉 찼으면 NULL.
  *   함께 바뀌는 것: 새로 만들면 ctx 의 direction_count.
  */
-static struct sctp_direction *direction_get(struct sctp_ctx *ctx, const struct cap_record *record) {
+static struct sctp_direction *direction_get(struct sctp_ctx *ctx, const struct cap_record *record, enum direction_side side) {
+    uint32_t src_addr = record->src_addr;
+    uint32_t dst_addr = record->dst_addr;
+    uint16_t src_port = record->src_port;
+    uint16_t dst_port = record->dst_port;
+    if (side == DIRECTION_REVERSE) {
+        src_addr = record->dst_addr;
+        dst_addr = record->src_addr;
+        src_port = record->dst_port;
+        dst_port = record->src_port;
+    }
+
     for (size_t i = 0; i < ctx->direction_count; i++) {
         struct sctp_direction *direction = &ctx->directions[i];
-        bool is_same_direction = direction->src_addr == record->src_addr
-                              && direction->dst_addr == record->dst_addr
-                              && direction->src_port == record->src_port
-                              && direction->dst_port == record->dst_port;
+        bool is_same_direction = direction->src_addr == src_addr
+                              && direction->dst_addr == dst_addr
+                              && direction->src_port == src_port
+                              && direction->dst_port == dst_port;
         if (is_same_direction)
             return direction;
     }
@@ -278,10 +321,10 @@ static struct sctp_direction *direction_get(struct sctp_ctx *ctx, const struct c
 
     // 키만 넣고 나머지(TSN 창·조각·vtag)는 0 으로 시작한다. 0 은 "아직 본 것 없음"을 뜻한다
     *direction = (struct sctp_direction){
-        .src_addr = record->src_addr,
-        .dst_addr = record->dst_addr,
-        .src_port = record->src_port,
-        .dst_port = record->dst_port,
+        .src_addr = src_addr,
+        .dst_addr = dst_addr,
+        .src_port = src_port,
+        .dst_port = dst_port,
     };
     return direction;
 }
@@ -422,6 +465,17 @@ static enum tsn_result tsn_mark(struct sctp_ctx *ctx, struct tsn_space *space, u
 
     space->window_bits[word_index] |= bit_mask;
     return TSN_NEW;
+}
+
+/* direction_reset: 한 방향의 TSN 창과 조각 목록을 비운다. 그 방향의 연결이 새로 시작될 때 쓴다.
+ *   이유: 새 연결의 TSN 은 옛 연결과 상관없는 값에서 시작한다. 옛 창이 남아 있으면 새 DATA 를 재전송이나
+ *   오래된 것으로 잘못 보고 버리고, 옛 연결의 조각이 새 메시지에 이어 붙을 수 있다.
+ *   vtag 상태는 건드리지 않는다(연결 시작을 처리하는 쪽이 따로 정한다).
+ *   함께 바뀌는 것: direction 의 TSN 창(기준 없음으로), 조각 해제.
+ */
+static void direction_reset(struct sctp_direction *direction) {
+    fragments_clear(&direction->fragments);
+    direction->tsn = (struct tsn_space){.has_base = false}; // 창·기준·유실 추정 범위 모두 0(아직 본 것 없음)
 }
 
 // MARK: - 조각 재조립
@@ -606,6 +660,65 @@ static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, c
     deliver_message(ctx, &message);
 }
 
+// MARK: - vtag 검사
+
+// vtag_result: vtag_check 의 판정 결과
+enum vtag_result {
+    VTAG_ACCEPT,  // 이 연결의 패킷이다(또는 검사하지 않는 패킷). 처리한다
+    VTAG_DROP,    // 기대와 다른 vtag. 이 패킷은 버린다
+    VTAG_RESTART, // 같은 새 vtag 가 이어졌다. 연결 재시작으로 받아들였고, 이 방향의 TSN 창·조각은 이미 비웠다
+};
+
+/* vtag_check: 패킷의 vtag 가 이 방향에서 기대하는 값인지 본다
+ *   이유: 다른 연결의 패킷이나 위조 패킷이 이 방향의 TSN 창·조각·연결 상태를 바꾸지 못하게, 받는 SCTP 스택처럼
+ *   기대 vtag 와 다른 패킷은 버린다. 다만 캡처가 INIT 을 놓친 채 연결이 다시 시작됐을 수 있으므로, 같은 새 vtag 가
+ *   VTAG_RESTART_CONFIRM_COUNT 번 이어지면 재시작으로 보고 받아들인다.
+ *   처음 보는 방향은 기대값이 없어 그 패킷의 vtag 를 기대값으로 삼는다(캡처 도중 합류).
+ *   검사도 갱신도 하지 않는 패킷: 첫 청크 종류를 읽을 수 없는 패킷, 첫 청크가 INIT·ABORT·SHUTDOWN COMPLETE 인 패킷.
+ *   INIT 은 vtag 가 0 이고, ABORT·SHUTDOWN COMPLETE 는 T 비트 규칙이 따로 있어 handle_end_chunk 가 본다.
+ *   반환: VTAG_ACCEPT / VTAG_DROP / VTAG_RESTART.
+ *   함께 바뀌는 것: direction 의 vtag 상태(재시작이면 TSN 창·조각도), ctx 의 통계.
+ */
+static enum vtag_result vtag_check(struct sctp_ctx *ctx, struct sctp_direction *direction, const struct cap_record *record) {
+    if (record->captured_len < SCTP_COMMON_HEADER_BYTES + CHUNK_HEADER_BYTES)
+        return VTAG_ACCEPT; // 첫 청크 종류를 못 읽어 예외 청크인지 알 수 없다
+
+    uint8_t first_chunk_type = record->sctp_packet[SCTP_COMMON_HEADER_BYTES];
+    bool is_exempt_chunk = first_chunk_type == CHUNK_TYPE_INIT
+                        || first_chunk_type == CHUNK_TYPE_ABORT
+                        || first_chunk_type == CHUNK_TYPE_SHUTDOWN_COMPLETE;
+    if (is_exempt_chunk)
+        return VTAG_ACCEPT;
+
+    struct vtag_state *state = &direction->vtag;
+    uint32_t vtag = read_be32(record->sctp_packet + 4); // 공통 헤더의 출발·도착 포트(2 + 2) 뒤
+    enum vtag_result result = VTAG_ACCEPT;
+    bool is_mismatch = state->has_expected && vtag != state->expected_vtag;
+    if (is_mismatch) {
+        bool is_same_candidate = state->pending_count > 0 && state->pending_vtag == vtag;
+        if (is_same_candidate) {
+            state->pending_count++;
+        } else {
+            state->pending_vtag = vtag;
+            state->pending_count = 1;
+        }
+        if (state->pending_count < VTAG_RESTART_CONFIRM_COUNT) {
+            ctx->stats.vtag_mismatch_drop_count++;
+            return VTAG_DROP; // 기대값은 그대로 둔다. 패킷 하나로는 바뀌지 않는다
+        }
+
+        // 같은 새 vtag 가 이어졌다. INIT 을 놓친 연결 재시작으로 보고 옛 연결의 TSN 창·조각을 버린다
+        direction_reset(direction);
+        ctx->stats.vtag_reset_count++;
+        result = VTAG_RESTART;
+    }
+
+    state->has_expected = true;
+    state->expected_vtag = vtag;
+    state->pending_count = 0;
+    return result;
+}
+
 // MARK: - 청크 종류별 처리
 
 /* handle_data_chunk: DATA 청크 하나를 처리한다.
@@ -668,17 +781,91 @@ static void handle_data_chunk(struct sctp_ctx *ctx, struct sctp_direction *direc
     deliver_message(ctx, &message);
 }
 
+/* handle_init_chunk: INIT·INIT-ACK 청크 하나를 처리한다. 보낸 쪽이 연결을 새로 시작한다는 뜻이다.
+ *   이 방향의 TSN 창과 조각을 비우고, 청크의 Initial TSN 이 창 가운데 오게 기준을 다시 잡는다. 반대 방향도 비운다
+ *   (그쪽 기준은 상대의 INIT·INIT-ACK 이나 첫 DATA 로 다시 정해진다).
+ *   청크의 Initiate Tag 는 상대가 이쪽으로 보낼 때 쓸 vtag 라, 반대 방향의 기대 vtag 로 적는다.
+ *   INIT 이면 같은 주소·포트라도 새 연결 번호를 매기고 연결 시작을 알린다. INIT-ACK 은 그 INIT 에 대한 응답이라
+ *   번호를 바꾸지 않는다.
+ *   이유: 같은 주소·포트로 연결이 다시 시작되면 TSN 이 옛 연결과 상관없는 값에서 다시 시작한다. 옛 창이 남아 있으면
+ *   새 연결의 DATA 를 재전송으로 잘못 보고 버린다. 새 번호는 위층이 옛 연결과 새 연결의 메시지를 섞지 않게 한다.
+ *   반환: 이 청크 뒤에 쓸 연결 번호(INIT 이면 새 번호, 아니면 assoc_id 그대로).
+ *   잘렸거나 Initial TSN 까지 들어 있지 않은 청크는 무시하고 assoc_id 를 그대로 돌려준다.
+ *   함께 바뀌는 것: ctx 의 통계·방향 표·연결 표, direction 과 반대 방향의 TSN 창·조각, 반대 방향의 기대 vtag, on_assoc 호출.
+ */
+static uint32_t handle_init_chunk(struct sctp_ctx *ctx, struct sctp_direction *direction, const struct cap_record *record,
+                                  uint32_t assoc_id, const struct raw_chunk *raw_chunk) {
+    bool has_initial_tsn = !raw_chunk->is_partial && raw_chunk->len >= INIT_CHUNK_MIN_BYTES;
+    if (!has_initial_tsn)
+        return assoc_id;
+
+    uint32_t initiate_tag = read_be32(raw_chunk->bytes + 4);
+    uint32_t initial_tsn = read_be32(raw_chunk->bytes + 16);
+
+    // 이 방향의 DATA 는 Initial TSN 부터 온다. tsn_mark 가 첫 TSN 을 볼 때와 같게 창 가운데에 둔다
+    direction_reset(direction);
+    direction->tsn.has_base = true;
+    direction->tsn.base_tsn = initial_tsn - TSN_WINDOW_BITS / 2;
+
+    // 방향 표가 꽉 차면 반대 방향은 NULL 이다. 표를 미리 잡아 두어 반대 방향을 만들어도 direction 은 그대로 유효하다
+    struct sctp_direction *reverse = direction_get(ctx, record, DIRECTION_REVERSE);
+    if (reverse) {
+        // 반대 방향 패킷은 이 Initiate Tag 를 vtag 로 단다. 옛 연결의 재시작 후보도 버린다(direction_reset 은 vtag 를 건드리지 않는다)
+        reverse->vtag.has_expected = true;
+        reverse->vtag.expected_vtag = initiate_tag;
+        reverse->vtag.pending_count = 0;
+        direction_reset(reverse);
+    }
+
+    ctx->stats.init_count++;
+    if (raw_chunk->type == CHUNK_TYPE_INIT) {
+        assoc_id = assoc_id_assign(ctx, record, ASSOC_ID_NEW); // 이 패킷의 뒤 청크와 이후 메시지가 새 번호를 받는다
+        notify_assoc(ctx, record, assoc_id, SCTP_ASSOC_START);
+    }
+    return assoc_id;
+}
+
+/* handle_end_chunk: ABORT·SHUTDOWN COMPLETE 청크 하나를 처리한다. 이 연결의 패킷이 맞으면 연결 끝을 알린다.
+ *   이유: 위층이 그 연결에 딸린 상태(UE 등)를 정리할 때를 알 수 있게 한다. 다른 연결이나 위조 패킷이 우연히
+ *   이 청크 종류를 담고 있어도 거짓 끝을 내지 않도록, vtag 가 맞을 때만 받아들임
+ *   vtag 가 이 방향의 기대값과 같으면 받아들인다. 아니어도 T 비트가 켜져 있으면, 받은 패킷의 vtag 를 되돌려 쓴 것이라
+ *   반대 방향의 기대값과 같을 때 받아들인다.
+ *   연결 번호는 바꾸지 않는다. 같은 주소·포트로 다시 시작하면 그 INIT 에서 새 번호를 매긴다.
+ *   함께 바뀌는 것: ctx 의 통계·방향 표(T 비트일 때 반대 방향 레코드를 만들 수 있음), on_assoc 호출.
+ */
+static void handle_end_chunk(struct sctp_ctx *ctx, struct sctp_direction *direction, const struct cap_record *record,
+                             uint32_t assoc_id, const struct raw_chunk *raw_chunk) {
+    ctx->stats.abort_shutdown_count++; // vtag 검사 전에 센다. 버린 것까지 세야 위조·이상 입력을 가늠할 수 있다
+
+    uint32_t vtag = read_be32(record->sctp_packet + 4); // 공통 헤더는 sctp_input 이 이미 확인했다
+    bool is_vtag_ok = direction->vtag.has_expected && vtag == direction->vtag.expected_vtag;
+    bool is_reflected = (raw_chunk->flags & ABORT_FLAG_T) != 0;
+    if (!is_vtag_ok && is_reflected) {
+        struct sctp_direction *reverse = direction_get(ctx, record, DIRECTION_REVERSE);
+        is_vtag_ok = reverse && reverse->vtag.has_expected && vtag == reverse->vtag.expected_vtag;
+    }
+    if (!is_vtag_ok) {
+        ctx->stats.vtag_mismatch_drop_count++;
+        return;
+    }
+
+    notify_assoc(ctx, record, assoc_id, SCTP_ASSOC_END);
+}
+
 // MARK: - 패킷 입력
 
 /* sctp_input: 캡처한 패킷 하나를 처리한다.
  *   1) 패킷 수를 세고, 공통 헤더가 없는 패킷은 버리고, 캡처가 잘린 패킷은 표시한다.
  *   2) 패킷 방향의 레코드를 찾는다(없으면 만든다). 방향 표가 꽉 차면 이 패킷은 처리하지 않는다.
  *      패킷이 속한 연결의 번호를 정한다. 이 패킷에서 나오는 메시지에 이 번호를 붙인다.
+ *      vtag 가 이 방향의 기대값과 다르면 패킷을 버린다. 같은 새 vtag 가 이어져 재시작으로 받아들이면 새 번호를 매기고
+ *      연결 시작을 알린다.
  *   3) 공통 헤더 뒤의 청크를 하나씩 읽어(번들링) 종류별 처리 함수에 넘긴다.
- *      DATA 청크는 handle_data_chunk 가 처리한다. 그 밖의 청크 종류는 무시한다.
+ *      DATA 는 handle_data_chunk(메시지), INIT·INIT-ACK 는 handle_init_chunk(연결 시작),
+ *      ABORT·SHUTDOWN COMPLETE 는 handle_end_chunk(연결 끝)가 처리한다. 그 밖의 청크 종류는 무시한다.
  *   이유: 패킷 바이트는 공격자가 보낸 입력일 수 있으므로, 모든 읽기 전에 캡처된 길이 안인지 확인한다.
  *   record 는 호출한 쪽 소유다. 이 함수가 돌아온 뒤에는 쓰지 않는다.
- *   함께 바뀌는 것: ctx 의 통계, on_message 호출.
+ *   함께 바뀌는 것: ctx 의 통계, on_message·on_assoc 호출.
  */
 void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
     ctx->stats.packet_count++; // 버리는 패킷까지 세야 다른 통계의 비율 확인 가능
@@ -692,13 +879,21 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
     if (record->captured_len < record->packet_len)
         ctx->stats.truncated_packet_count++;
 
-    // 이 패킷 방향의 상태(TSN 창·조각·vtag)를 담을 레코드. 지금은 TSN 창과 조각 목록을 쓴다
-    struct sctp_direction *direction = direction_get(ctx, record);
+    // 이 패킷 방향의 상태(TSN 창·조각·vtag)를 담을 레코드
+    struct sctp_direction *direction = direction_get(ctx, record, DIRECTION_FORWARD);
     if (!direction)
         return; // 방향 표가 꽉 차 상태를 둘 곳이 없다
 
     // 연결 표가 꽉 차면 0 이다. 메시지는 그대로 넘기되 연결 번호 없이 넘긴다
     uint32_t assoc_id = assoc_id_assign(ctx, record, ASSOC_ID_CURRENT);
+
+    enum vtag_result check_result = vtag_check(ctx, direction, record);
+    if (check_result == VTAG_DROP)
+        return; // 이 연결의 패킷이 아니다. 청크를 읽지 않는다
+    if (check_result == VTAG_RESTART) {
+        assoc_id = assoc_id_assign(ctx, record, ASSOC_ID_NEW); // INIT 없이 다시 시작한 연결. 이 패킷부터 새 번호
+        notify_assoc(ctx, record, assoc_id, SCTP_ASSOC_START);
+    }
 
     const uint8_t *packet_bytes = record->sctp_packet;
     size_t captured_len = record->captured_len;
@@ -726,6 +921,14 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
         switch (chunk.type) {
         case CHUNK_TYPE_DATA:
             handle_data_chunk(ctx, direction, record, assoc_id, &chunk);
+            break;
+        case CHUNK_TYPE_INIT:
+        case CHUNK_TYPE_INIT_ACK:
+            assoc_id = handle_init_chunk(ctx, direction, record, assoc_id, &chunk); // INIT 이면 뒤 청크는 새 번호
+            break;
+        case CHUNK_TYPE_ABORT:
+        case CHUNK_TYPE_SHUTDOWN_COMPLETE:
+            handle_end_chunk(ctx, direction, record, assoc_id, &chunk);
             break;
         default:
             break; // 처리하지 않는 청크(SACK, HEARTBEAT 등)는 메시지가 없으므로 무시한다
