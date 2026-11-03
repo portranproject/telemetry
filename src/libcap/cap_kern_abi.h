@@ -36,5 +36,32 @@
 #define ST_SLOT_USED_BASE 6
 #define ST_COUNT (ST_SLOT_USED_BASE + SLOT_MAX)   
 
+struct cap_event_hdr {
+	// bpf_ktime_get_tai_ns
+	__u64 capture_tai_ns;   
+	__u32 interface_index;
+        // addr : network order	
+	__u32 src_addr;
+	__u32 dst_addr;
+	// port : host order
+	__u16 src_port; 
+	__u16 dst_port;
+	__u8  capture_hook;
+	__u8  padding0;  
+	// EVENT_*
+	__u16 flags;  
+	__u32 packet_len;
+	__u32 captured_len;     
+	__u32 padding1;
+};
+
+// 커널(bpf)에서 조립한 레코드 (scratch map -> ring buffer)
+struct cap_event {
+	struct cap_event_hdr hdr;
+	// SCTP 공통 헤더(12B)부터 시작
+	__u8 sctp_packet[MAX_CAP_BYTES];      
+};
+
+
 #endif // TELEMETRY_CAP_KERN_ABI_H
 
