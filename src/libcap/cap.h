@@ -55,5 +55,16 @@ struct cap_stats {
 	uint64_t slot_used[CAP_SLOT_MAX];
 };
 
+struct cap;
+
+typedef void (*cap_record_cb)(void *user, const struct cap_record *record);
+
+int cap_open(const struct cap_interface *interfaces, int interface_count, struct cap **cap_out);
+int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *user);
+void cap_detach(struct cap *cap);
+int cap_get_stats(const struct cap *cap, struct cap_stats *stats_out);
+enum cap_interface_role cap_interface_role(const struct cap *cap, uint32_t interface_index);
+void cap_close(struct cap *cap);
+
 #endif // TELEMETRY_CAP_H
 
