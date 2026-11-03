@@ -52,7 +52,6 @@ struct sctp_stats {
     // 청크
     uint64_t chunk_count;
     uint64_t data_chunk_count;
-    uint64_t idata_chunk_count;
 
     // 버린 청크
     uint64_t duplicate_chunk_count; // 이미 본 TSN(재전송)
@@ -60,10 +59,9 @@ struct sctp_stats {
     uint64_t partial_chunk_count;
 
     // 단편
-    uint64_t fragment_chunk_count;             // 메시지 일부만 담은 DATA 청크(B·E 중 하나 이상 꺼짐)
-    uint64_t reassembled_count;                // 조각을 모아 완성한 메시지
-    uint64_t fragment_evicted_count;           // 유효 시간·메모리 상한 때문에 버린 조각
-    uint64_t idata_fragment_unsupported_count; // 단편화된 I-DATA(조립 미지원이라 버림)
+    uint64_t fragment_chunk_count;   // 메시지 일부만 담은 DATA 청크(B·E 중 하나 이상 꺼짐)
+    uint64_t reassembled_count;      // 조각을 모아 완성한 메시지
+    uint64_t fragment_evicted_count; // 유효 시간·메모리 상한 때문에 버린 조각
 
     // 전달
     uint64_t message_count; // 콜백으로 넘긴 메시지

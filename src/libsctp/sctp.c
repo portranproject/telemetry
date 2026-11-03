@@ -54,7 +54,7 @@
 
 // MARK: - 청크 종류·바이트 읽기
 
-// sctp_chunk_type: 청크 헤더 첫 바이트의 청크 종류 번호 (RFC 9260 §3.2, I-DATA 는 RFC 8260 §2.1).
+// sctp_chunk_type: 청크 헤더 첫 바이트의 청크 종류 번호 (RFC 9260 §3.2).
 //   libsctp 가 처리하는 종류만 둠. 여기 없는 번호(SACK, HEARTBEAT, COOKIE 등)는 무시.
 //   패킷에서 읽은 바이트에는 여기 없는 값도 들어오므로, 읽은 값은 uint8_t 로 두고 이 값들과 비교만 함
 enum sctp_chunk_type {
@@ -63,7 +63,6 @@ enum sctp_chunk_type {
     CHUNK_TYPE_INIT_ACK = 2,           // 연결 시작 응답. INIT 과 같은 값을 담음
     CHUNK_TYPE_ABORT = 6,              // 연결 강제 종료
     CHUNK_TYPE_SHUTDOWN_COMPLETE = 14, // 정상 종료 완료
-    CHUNK_TYPE_IDATA = 64,             // 인터리빙용 사용자 데이터 (협상된 연결에서만 쓰임)
 };
 
 /* read_be16: ptr 위치의 2바이트를 빅엔디안(네트워크 순서) 정수로
