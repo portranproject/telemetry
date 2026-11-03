@@ -268,3 +268,18 @@ static __always_inline void tap(struct __sk_buff *skb, const __u8 capture_hook, 
 	emit(skb, &slot->kern_event, &pkt);
 	slot_put(slot);
 }
+
+SEC("tcx/ingress")
+int capture_tc_ingress(struct __sk_buff *skb) {
+	tap(skb, HOOK_TC_INGRESS, skb->len, skb->ifindex);
+	return TCX_NEXT;
+}
+
+SEC("tcx/egress")
+int capture_tc_egress(struct __sk_buff *skb) {
+	tap(skb, HOOK_TC_EGRESS, skb->len, skb->ifindex);
+	return TCX_NEXT;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+
