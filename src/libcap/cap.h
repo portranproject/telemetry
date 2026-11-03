@@ -26,5 +26,16 @@ struct cap_record {
 	uint32_t packet_len;        
 };
 
+enum cap_interface_role {
+	CAP_ROLE_UNKNOWN = 0,
+	CAP_ROLE_F1 = 1,
+	CAP_ROLE_N2 = 2             
+};
+
+struct cap_interface {
+	const char *interface_name;
+	enum cap_interface_role role;
+};
+
 #endif // TELEMETRY_CAP_H
 
