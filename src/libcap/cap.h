@@ -37,5 +37,23 @@ struct cap_interface {
 	enum cap_interface_role role;
 };
 
+#define CAP_SLOT_MAX 4
+struct cap_stats {
+	uint64_t captured;          
+	uint64_t ringbuf_full;
+	uint64_t truncated;
+	uint64_t ip_frag_skipped;
+	// IPsec(ESP) 패킷	
+	uint64_t esp_seen;
+	
+	// slot_busy : PREEMPT_RT 재진입이 CAP_SLOT_MAX 보다 깊은 경우
+	// ringbuf_full - slot_busy : consumer 처리가 늦은 경우
+	uint64_t slot_busy;
+	
+	// slot_used[1~] != 0 : nesting 을 다른 slot 으로 해결한 것
+	// (단, slot 이 다 차면 slot_busy)
+	uint64_t slot_used[CAP_SLOT_MAX];
+};
+
 #endif // TELEMETRY_CAP_H
 
