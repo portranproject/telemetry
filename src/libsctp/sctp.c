@@ -288,10 +288,14 @@ enum direction_side {
 /* direction_get: 패킷의 방향(출발 → 도착) 레코드, 또는 그 반대 방향 레코드를 방향 표에서 찾고, 없으면 새로 만듦.
  *   이유: TSN 창·조각·vtag 는 방향마다 따로 흘러가므로, 패킷마다 자기 방향의 상태를 찾아 써야 함.
  *   키는 패킷의 (출발 주소, 도착 주소, 출발 포트, 도착 포트). DIRECTION_REVERSE 면 출발과 도착을 바꾼 키로 찾음.
- *   반환: 방향 레코드(표 안을 가리킴, sctp_free 전까지 주소가 바뀌지 않음). 표가 꽉 찼으면 NULL.
- *   함께 바뀌는 것: 새로 만들면 ctx 의 direction_count.
+ *   표가 꽉 차면 direction_clock 이 가리키는 칸을 비워 재사용하고 다음 칸으로 넘김. 끝난 연결의 칸은 지우지 않아
+ *   재연결이 쌓이면 표가 차는데, 그때도 새 연결을 처리하기 위함. 그 칸이 keep 이면 다음 칸을 씀(호출한 쪽이 지금 들고
+ *   있는 레코드를 지키려고. 지킬 것이 없으면 NULL).
+ *   반환: 방향 레코드(표 안을 가리킴, sctp_free 전까지 주소가 바뀌지 않음). NULL 은 돌려주지 않음.
+ *   함께 바뀌는 것: 새로 만들면 ctx 의 direction_count, 밀어내면 direction_clock·direction_evicted_count 와 밀려난 칸의 조각 해제.
  */
-static struct sctp_direction *direction_get(struct sctp_ctx *ctx, const struct cap_record *record, enum direction_side side) {
+static struct sctp_direction *direction_get(struct sctp_ctx *ctx, const struct cap_record *record, enum direction_side side,
+                                            const struct sctp_direction *keep) {
     uint32_t src_addr = record->src_addr;
     uint32_t dst_addr = record->dst_addr;
     uint16_t src_port = record->src_port;
@@ -313,11 +317,19 @@ static struct sctp_direction *direction_get(struct sctp_ctx *ctx, const struct c
             return direction;
     }
 
-    if (ctx->direction_count >= DIRECTION_MAX_COUNT)
-        return NULL; // 표가 꽉 참. 밀어낼 칸을 고르는 기능은 아직 없음
-
-    struct sctp_direction *direction = &ctx->directions[ctx->direction_count];
-    ctx->direction_count++;
+    struct sctp_direction *direction;
+    if (ctx->direction_count < DIRECTION_MAX_COUNT) {
+        direction = &ctx->directions[ctx->direction_count];
+        ctx->direction_count++;
+    } else {
+        bool is_keep_slot = &ctx->directions[ctx->direction_clock] == keep;
+        if (is_keep_slot)
+            ctx->direction_clock = (ctx->direction_clock + 1) % ctx->direction_count;
+        direction = &ctx->directions[ctx->direction_clock];
+        ctx->direction_clock = (ctx->direction_clock + 1) % ctx->direction_count;
+        fragments_clear(&direction->fragments); // 밀려난 방향의 조각 메모리 반납
+        ctx->stats.direction_evicted_count++;
+    }
 
     // 키만 넣고 나머지(TSN 창·조각·vtag)는 0 으로 시작함. 0 은 "아직 본 것 없음"을 뜻함
     *direction = (struct sctp_direction){
@@ -337,8 +349,10 @@ enum assoc_id_mode {
 
 /* assoc_id_assign: 패킷이 속한 연결(양방향 공통)을 연결 표에서 찾거나 만들고, 그 연결 번호를 돌려줌.
  *   이유: 탐지 쪽이 두 방향의 메시지를 같은 연결로 묶어 보려면, 메시지마다 연결 번호가 붙어야 함.
- *   반환: 연결 번호(1 부터). 연결 표가 꽉 차 레코드를 만들 수 없으면 0(= 연결 번호 없음).
- *   함께 바뀌는 것: 새로 만들면 ctx 의 assoc_count, 번호를 매기면 next_assoc_id.
+ *   표가 꽉 차면 assoc_clock 이 가리키는 칸을 비워 재사용하고 다음 칸으로 넘김(direction_get 과 같은 이유).
+ *   밀려난 연결의 패킷이 다시 오면 새 레코드에 새 번호를 받음. 연결 레코드는 포인터로 들고 있는 곳이 없어 keep 이 필요 없음.
+ *   반환: 연결 번호(1 부터). 0 은 돌려주지 않음.
+ *   함께 바뀌는 것: 새로 만들면 ctx 의 assoc_count, 밀어내면 assoc_clock·assoc_evicted_count, 번호를 매기면 next_assoc_id.
  */
 static uint32_t assoc_id_assign(struct sctp_ctx *ctx, const struct cap_record *record, enum assoc_id_mode mode) {
     // 출발 끝을 low 로 두고, 도착 끝이 더 작으면 바꿈
@@ -369,10 +383,14 @@ static uint32_t assoc_id_assign(struct sctp_ctx *ctx, const struct cap_record *r
     }
 
     if (!assoc) {
-        if (ctx->assoc_count >= ASSOC_MAX_COUNT)
-            return 0; // 표가 꽉 참. 밀어낼 칸을 고르는 기능은 아직 없음
-        assoc = &ctx->assocs[ctx->assoc_count];
-        ctx->assoc_count++;
+        if (ctx->assoc_count < ASSOC_MAX_COUNT) {
+            assoc = &ctx->assocs[ctx->assoc_count];
+            ctx->assoc_count++;
+        } else {
+            assoc = &ctx->assocs[ctx->assoc_clock];
+            ctx->assoc_clock = (ctx->assoc_clock + 1) % ctx->assoc_count;
+            ctx->stats.assoc_evicted_count++;
+        }
         *assoc = (struct sctp_assoc_record){
             .low_addr = low_addr,
             .low_port = low_port,
@@ -840,15 +858,14 @@ static uint32_t handle_init_chunk(struct sctp_ctx *ctx, struct sctp_direction *d
     direction->tsn.has_base = true;
     direction->tsn.base_tsn = initial_tsn - TSN_WINDOW_BITS / 2;
 
-    // 방향 표가 꽉 차면 반대 방향은 NULL. 표를 미리 잡아 두어 반대 방향을 만들어도 direction 은 그대로 유효
-    struct sctp_direction *reverse = direction_get(ctx, record, DIRECTION_REVERSE);
-    if (reverse) {
-        // 반대 방향 패킷의 vtag 는 이 Initiate Tag. 옛 연결의 재시작 후보도 버림(direction_reset 은 vtag 를 건드리지 않음)
-        reverse->vtag.has_expected = true;
-        reverse->vtag.expected_vtag = initiate_tag;
-        reverse->vtag.pending_count = 0;
-        direction_reset(reverse);
-    }
+    // 표가 꽉 차 반대 방향 칸을 밀어내서 만들어도 지금 방향은 밀어내지 않음(keep). 표를 미리 잡아 두어 direction 포인터도 그대로 유효
+    struct sctp_direction *reverse = direction_get(ctx, record, DIRECTION_REVERSE, direction);
+
+    // 반대 방향 패킷의 vtag 는 이 Initiate Tag. 옛 연결의 재시작 후보도 버림(direction_reset 은 vtag 를 건드리지 않음)
+    reverse->vtag.has_expected = true;
+    reverse->vtag.expected_vtag = initiate_tag;
+    reverse->vtag.pending_count = 0;
+    direction_reset(reverse);
 
     ctx->stats.init_count++;
     if (raw_chunk->type == CHUNK_TYPE_INIT) {
@@ -864,7 +881,7 @@ static uint32_t handle_init_chunk(struct sctp_ctx *ctx, struct sctp_direction *d
  *   vtag 가 이 방향의 기대값과 같으면 받아들임. 아니어도 T 비트가 켜져 있으면, 받은 패킷의 vtag 를 되돌려 쓴 것이라
  *   반대 방향의 기대값과 같을 때 받아들임.
  *   연결 번호는 바꾸지 않음. 같은 주소·포트로 다시 시작하면 그 INIT 에서 새 번호를 매김.
- *   함께 바뀌는 것: ctx 의 통계·방향 표(T 비트일 때 반대 방향 레코드를 만들 수 있음), on_assoc 호출.
+ *   함께 바뀌는 것: ctx 의 통계·방향 표(T 비트일 때 반대 방향 레코드를 만들거나, 표가 꽉 차면 다른 칸을 밀어낼 수 있음), on_assoc 호출.
  */
 static void handle_end_chunk(struct sctp_ctx *ctx, struct sctp_direction *direction, const struct cap_record *record,
                              uint32_t assoc_id, const struct raw_chunk *raw_chunk) {
@@ -874,8 +891,8 @@ static void handle_end_chunk(struct sctp_ctx *ctx, struct sctp_direction *direct
     bool is_vtag_ok = direction->vtag.has_expected && vtag == direction->vtag.expected_vtag;
     bool is_reflected = (raw_chunk->flags & ABORT_FLAG_T) != 0;
     if (!is_vtag_ok && is_reflected) {
-        struct sctp_direction *reverse = direction_get(ctx, record, DIRECTION_REVERSE);
-        is_vtag_ok = reverse && reverse->vtag.has_expected && vtag == reverse->vtag.expected_vtag;
+        struct sctp_direction *reverse = direction_get(ctx, record, DIRECTION_REVERSE, direction);
+        is_vtag_ok = reverse->vtag.has_expected && vtag == reverse->vtag.expected_vtag;
     }
     if (!is_vtag_ok) {
         ctx->stats.vtag_mismatch_drop_count++;
@@ -889,7 +906,7 @@ static void handle_end_chunk(struct sctp_ctx *ctx, struct sctp_direction *direct
 
 /* sctp_input: 캡처한 패킷 하나를 처리.
  *   1) 패킷 수를 세고, 공통 헤더가 없는 패킷은 버리고, 캡처가 잘린 패킷은 표시.
- *   2) 패킷 방향의 레코드를 찾음(없으면 만듦). 방향 표가 꽉 차면 이 패킷은 처리하지 않음.
+ *   2) 패킷 방향의 레코드를 찾음(없으면 만듦. 방향 표가 꽉 차면 옛 칸을 밀어내고 만듦).
  *      패킷이 속한 연결의 번호를 정함. 이 패킷에서 나오는 메시지에 이 번호를 붙임.
  *      vtag 가 이 방향의 기대값과 다르면 패킷을 버림. 같은 새 vtag 가 이어져 재시작으로 받아들이면 새 번호를 매기고
  *      연결 시작을 알림.
@@ -912,11 +929,7 @@ void sctp_input(struct sctp_ctx *ctx, const struct cap_record *record) {
     if (record->captured_len < record->packet_len)
         ctx->stats.truncated_packet_count++;
 
-    struct sctp_direction *direction = direction_get(ctx, record, DIRECTION_FORWARD);
-    if (!direction)
-        return; // 방향 표가 꽉 차 상태를 둘 곳이 없음
-
-    // 연결 표가 꽉 차면 0. 메시지는 그대로 넘기되 연결 번호 없이 넘김
+    struct sctp_direction *direction = direction_get(ctx, record, DIRECTION_FORWARD, NULL);
     uint32_t assoc_id = assoc_id_assign(ctx, record, ASSOC_ID_CURRENT);
 
     enum vtag_result check_result = vtag_check(ctx, direction, record);

@@ -18,7 +18,7 @@ struct cap_record; // TODO: libcap/cap.h include 시 제거. cap.h 에 정의, �
 // sctp_message: 완성된 사용자 메시지 하나(F1AP/NGAP PDU 한 개).
 struct sctp_message {
     const struct cap_record *record;
-    uint32_t assoc_id; // 같은 연결의 두 방향 메시지를 묶는 번호. 1부터, 0 = 번호 없음(연결 표가 꽉 참)
+    uint32_t assoc_id; // 같은 연결의 두 방향 메시지를 묶는 번호. 1부터(0 은 쓰지 않음). 연결 표가 꽉 차 밀려난 연결은 다시 올 때 START 없이 새 번호를 받음
     uint32_t ppid;     // 수신 쪽 F1AP·NGAP 디코더 분기
     uint16_t stream_id;
     uint32_t tsn;
