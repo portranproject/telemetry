@@ -4,6 +4,7 @@
  */
 #include <ctype.h>
 #include <errno.h>
+#include <sched.h>
 #include <stdbool.h> 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,7 @@
 #include <sys/timex.h>
 #include <sys/utsname.h>
 
+#include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "cap.h"
 #include "cap_kern_abi.h"
@@ -286,7 +288,6 @@ int cap_open(const struct cap_interface *interfaces, int interface_count, struct
 	if (error)
 		goto fail;
 
-	// 인터페이스마다 tcx 에 부착
 	LIBBPF_OPTS(bpf_tcx_opts, tcx_attach_options, .flags = BPF_F_BEFORE);
 	for (int i = 0; i < interface_count; i++) {
 		struct cap_attached_interface *attached_interface = &cap->attached_interfaces[i];
@@ -320,6 +321,82 @@ int cap_open(const struct cap_interface *interfaces, int interface_count, struct
 fail:
 	cap_close(cap);
 	return error;
+}
+
+// 부착 하나가 아직 인터페이스에 붙어 있는지 확인
+static bool attach_alive(struct bpf_link *attach) {
+	if (!attach)
+		return true; 
+	struct bpf_link_info link_info;
+	__u32 link_info_len = sizeof(link_info);
+	memset(&link_info, 0, sizeof(link_info));
+	if (bpf_link_get_info_by_fd(bpf_link__fd(attach), &link_info, &link_info_len))
+		return true;  
+	return link_info.tcx.ifindex != 0;
+}
+
+// 붙여 둔 인터페이스가 하나라도 사라졌는지 확인
+static bool interfaces_lost(struct cap *cap) {
+	int64_t now_ns = monotonic_ns();
+	if (now_ns < cap->next_interface_check_ns)
+		return false;
+	cap->next_interface_check_ns = now_ns + INTERFACE_CHECK_NS;
+	for (int i = 0; i < cap->interface_count; i++)
+		if (!attach_alive(cap->attached_interfaces[i].ingress_attach) || !attach_alive(cap->attached_interfaces[i].egress_attach))
+			return true;
+	return false;
+}
+
+int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *user_ctx) {
+	if (!cap || !cap->ringbuf || !record_cb) 
+		return -EINVAL;
+	if (cap->poll.record_cb)
+		return -EBUSY;
+	if (interfaces_lost(cap))
+		return -ENODEV;
+
+	cap->poll.record_cb = record_cb;
+	cap->poll.user_ctx = user_ctx;
+	cap->poll.delivered_count = 0;
+
+     	// ring_buffer__consume/poll 반환: ≥0 = 꺼낸 레코드 수, <0 = errno (libbpf 규약)
+	int poll_result;
+
+	if (timeout_ms == 0) {
+		// no wait: epoll 을 거치지 않고 링 버퍼의 쓰기 및 읽기 위치를 직접 비교해 있는 만큼가져옴.
+		poll_result = ring_buffer__consume(cap->ringbuf);
+	} else {
+		// wait: 인터페이스 확인 시점(1초 간격)을 넘겨 한 번에 잠들지 않게 잘게 나눠 기다림
+		// 	-> timeout_ms 가 -1(끝없이)이어도 인터페이스가 사라지면 1초 안에 -ENODEV 로 알림
+		int64_t deadline_ns = timeout_ms > 0 ? monotonic_ns() + (int64_t)timeout_ms * 1000000LL : INT64_MAX;
+		for (;;) {
+			int64_t now_ns = monotonic_ns();
+			int64_t until_ns = cap->next_interface_check_ns < deadline_ns ? cap->next_interface_check_ns : deadline_ns;
+			int wait_ms = until_ns > now_ns ? (int)((until_ns - now_ns + 999999) / 1000000) : 0;
+		   	// epoll 로 기다렸다가 쌓인 레코드마다 on_ringbuf_record 호출
+			poll_result = ring_buffer__poll(cap->ringbuf, wait_ms);
+			// 꺼낸 것이 있거나(>0), 신호/상한/오류(<0)
+			if (poll_result != 0 || cap->poll.delivered_count > 0)
+				break;
+			if (monotonic_ns() >= deadline_ns)
+				break;
+			if (interfaces_lost(cap)) {
+				poll_result = -ENODEV;
+				break;
+			}
+			// 넘긴 것 없이 일찍 돌아온 경우: 커널이 아직 쓰는 중인 레코드가 맨 앞에 있으면 epoll 이 곧바로
+			// 준비됨을 다시 알려 줘서 헛돌 수 있다 -> sched_yield()
+			sched_yield();
+		}
+	}
+
+	cap->poll.record_cb = NULL;
+	cap->poll.user_ctx = NULL;
+	// -EINTR : 기다리는 중 신호(Ctrl+C 등)가 옴
+	// -EAGAIN: on_ringbuf_record 가 CAP_POLL_MAX 에서 스스로 멈춤
+	if (poll_result < 0 && poll_result != -EINTR && poll_result != -EAGAIN)
+		return poll_result;
+	return cap->poll.delivered_count;
 }
 
 static void detach_one(struct bpf_link **attach_ptr) {
