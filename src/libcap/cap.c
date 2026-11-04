@@ -407,6 +407,8 @@ int cap_get_stats(const struct cap *cap, struct cap_stats *stats_out) {
 		return -EINVAL;
 	// 유저공간에서 버린 깨진 레코드도 truncated_count 에 합산
 	stats_out->truncated_count = cap->bad_record_count;                     
+	_Static_assert(ST_COUNT == 10, "ST_* 가 바뀌면 아래 표도 고칠 것");
+	_Static_assert(SLOT_MAX == 4, "SLOT_MAX 가 바뀌면 아래 slot_used_count 줄 수도 고칠 것");
 
 	// 필드 순서 중요 : 커널은 칸 부족 때 ST_SLOT_BUSY 를 먼저, ST_RINGBUF_FULL 을 나중에 세야 함.
 	//   (cap.bpf.c 의 두 bump). 두 카운터는 따로 읽으므로(맵 조회 2회) 그 사이에 패킷 드롭이 낄 수도 있음.

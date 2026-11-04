@@ -10,6 +10,7 @@
 
 // sctp_packet[] 상한
 #define MAX_CAP_BYTES 65536 
+_Static_assert((MAX_CAP_BYTES & (MAX_CAP_BYTES - 1)) == 0, "MAX_CAP_BYTES 는 2의 거듭제곱이어야 한다 (복사 길이 증명이 & (MAX_CAP_BYTES-1) 로 상한을 세운다)");
 
 #define HOOK_TC_INGRESS 0
 #define HOOK_TC_EGRESS 1
@@ -62,6 +63,18 @@ struct cap_event {
 	__u8 sctp_packet[MAX_CAP_BYTES];      
 };
 
+_Static_assert(sizeof(struct cap_event_hdr) == 40, "cap_event_hdr 크기가 바뀜: 커널·로더 양쪽 확인");
+_Static_assert(__builtin_offsetof(struct cap_event_hdr, capture_hook) == 24, "cap_event_hdr 배치가 바뀜");
+_Static_assert(__builtin_offsetof(struct cap_event_hdr, packet_len) == 28, "cap_event_hdr 배치가 바뀜");
+_Static_assert(__builtin_offsetof(struct cap_event_hdr, padding1) == 36, "cap_event_hdr 배치가 바뀜");
+_Static_assert(__builtin_offsetof(struct cap_event, sctp_packet) == 40, "sctp_packet 은 머리 바로 뒤에서 시작해야 함");
+
+#ifndef __bpf__
+#include "cap.h"
+_Static_assert(HOOK_TC_INGRESS == CAP_HOOK_TC_INGRESS, "HOOK_TC_INGRESS != CAP_HOOK_TC_INGRESS");
+_Static_assert(HOOK_TC_EGRESS == CAP_HOOK_TC_EGRESS, "HOOK_TC_EGRESS != CAP_HOOK_TC_EGRESS");
+_Static_assert(SLOT_MAX == CAP_SLOT_MAX, "SLOT_MAX != CAP_SLOT_MAX: cap.h 의 slot_used_count[] 길이도 함께 고칠 것");
+#endif
 
 #endif // TELEMETRY_CAP_KERN_ABI_H
 
