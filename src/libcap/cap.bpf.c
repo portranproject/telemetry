@@ -20,7 +20,7 @@
  *            |   slot 획득 실패 -> ST_SLOT_BUSY + ST_RINGBUF_FULL
  *            |   slot 점유      -> ST_SLOT_USED_BASE + i
  *            |
- *            +-- emit(slot->kern_event)
+ *            +-- emit(slot->kernel_event)
  *            |   복사 실패      -> ST_TRUNCATED
  *            |   버퍼 한계      -> ST_RINGBUF_FULL
  *            |   성공           -> ST_CAPTURED (+ 잘렸으면 ST_TRUNCATED)
@@ -53,7 +53,7 @@ struct vlan_tag {
 struct slot {
 	__u32 busy;
 	__u32 padding;
-	struct cap_event kern_event;
+	struct cap_event kernel_event;
 };
 
 const volatile __u32 slot_count = 1;
@@ -113,11 +113,11 @@ static __always_inline void bump(__u32 stat_index) {
 //       key:         0  1  2  3 |  4  5  6  7 |  8  9 10 11 | 12 13 14 15
 //       slot_index:  0  1  2  3 |  0  1  2  3 |  0  1  2  3 |  0  1  2  3
 static __always_inline struct slot *slot_get(__u8 capture_hook) {
-	__u32 base = (bpf_get_smp_processor_id() * HOOK_COUNT + capture_hook) * slot_count;
+	__u32 slot_base_index = (bpf_get_smp_processor_id() * HOOK_COUNT + capture_hook) * slot_count;
 	for (__u32 slot_index = 0; slot_index < SLOT_MAX; slot_index++) { 
 		if (slot_index >= slot_count)
 			break;
-		__u32 slot_key = base + slot_index;
+		__u32 slot_key = slot_base_index + slot_index;
 		struct slot *slot = bpf_map_lookup_elem(&scratch, &slot_key);
 		if (slot && __sync_val_compare_and_swap(&slot->busy, 0, 1) == 0) {
 			bump(ST_SLOT_USED_BASE + slot_index);
@@ -142,19 +142,19 @@ struct parsed_pkt {
 	__u8  capture_hook;
 };
 
-// emit: 획득한 slot 의 kern_event 에 레코드를 채워 Ring Buffer 로 전송
-static __always_inline void emit(struct __sk_buff *skb, struct cap_event *kern_event, const struct parsed_pkt *pkt) {
-	kern_event->hdr.capture_tai_ns = bpf_ktime_get_tai_ns();     
+// emit: 획득한 slot 의 kernel_event 에 레코드를 채워 Ring Buffer 로 전송
+static __always_inline void emit(struct __sk_buff *skb, struct cap_event *kernel_event, const struct parsed_pkt *pkt) {
+	kernel_event->hdr.capture_tai_ns = bpf_ktime_get_tai_ns();     
 
-	kern_event->hdr.interface_index = pkt->interface_index;
-	kern_event->hdr.src_addr = pkt->src_addr;
-	kern_event->hdr.dst_addr = pkt->dst_addr;
-	kern_event->hdr.src_port = pkt->src_port;
-	kern_event->hdr.dst_port = pkt->dst_port;
-	kern_event->hdr.packet_len = pkt->packet_len;
-	kern_event->hdr.capture_hook = pkt->capture_hook;
-	kern_event->hdr.padding0 = 0;
-	kern_event->hdr.padding1 = 0;
+	kernel_event->hdr.interface_index = pkt->interface_index;
+	kernel_event->hdr.src_addr = pkt->src_addr;
+	kernel_event->hdr.dst_addr = pkt->dst_addr;
+	kernel_event->hdr.src_port = pkt->src_port;
+	kernel_event->hdr.dst_port = pkt->dst_port;
+	kernel_event->hdr.packet_len = pkt->packet_len;
+	kernel_event->hdr.capture_hook = pkt->capture_hook;
+	kernel_event->hdr.padding0 = 0;
+	kernel_event->hdr.padding1 = 0;
 
 	__u32 captured_len = pkt->packet_len;
 	if (captured_len > MAX_CAP_BYTES - 1)
@@ -162,22 +162,22 @@ static __always_inline void emit(struct __sk_buff *skb, struct cap_event *kern_e
 	barrier_var(captured_len);
 	captured_len = ((captured_len - 1) & (MAX_CAP_BYTES - 1)) + 1;
 	
-	kern_event->hdr.captured_len = captured_len;
-	kern_event->hdr.flags = captured_len < pkt->packet_len ? EVENT_TRUNCATED : 0;
+	kernel_event->hdr.captured_len = captured_len;
+	kernel_event->hdr.flags = captured_len < pkt->packet_len ? EVENT_TRUNCATED : 0;
 
-	if (load(skb, pkt->sctp_offset_bytes, kern_event->sctp_packet, captured_len)) {  
+	if (load(skb, pkt->sctp_offset_bytes, kernel_event->sctp_packet, captured_len)) {  
 		// ip_header.tot_len 이 실제 패킷보다 길게 적힌 깨진 패킷
 		bump(ST_TRUNCATED);
 		return;
 	}
 	// map 에서 다시 읽은 값은 verifier 가 범위 모름 -> 같은 마스크로 상한을 다시 증명
-	__u32 captured_len_from_map = ((kern_event->hdr.captured_len - 1) & (MAX_CAP_BYTES - 1)) + 1;
-	if (bpf_ringbuf_output(&ringbuf, kern_event, sizeof(struct cap_event_hdr) + captured_len_from_map, 0)) {
+	__u32 captured_len_from_map = ((kernel_event->hdr.captured_len - 1) & (MAX_CAP_BYTES - 1)) + 1;
+	if (bpf_ringbuf_output(&ringbuf, kernel_event, sizeof(struct cap_event_hdr) + captured_len_from_map, 0)) {
 		bump(ST_RINGBUF_FULL); 
 		return;
 	}
 	bump(ST_CAPTURED);
-	if (kern_event->hdr.flags & EVENT_TRUNCATED)
+	if (kernel_event->hdr.flags & EVENT_TRUNCATED)
 		bump(ST_TRUNCATED);
 }
 
@@ -265,7 +265,7 @@ static __always_inline void tap(struct __sk_buff *skb, const __u8 capture_hook, 
 		.interface_index = interface_index, .src_addr = ip_header.saddr, .dst_addr = ip_header.daddr,
 		.sctp_offset_bytes = sctp_offset_bytes, .packet_len = packet_len, .src_port = src_port, .dst_port = dst_port, .capture_hook = capture_hook,
 	};
-	emit(skb, &slot->kern_event, &pkt);
+	emit(skb, &slot->kernel_event, &pkt);
 	slot_put(slot);
 }
 

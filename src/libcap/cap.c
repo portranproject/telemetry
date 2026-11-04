@@ -34,7 +34,7 @@ struct cap_attached_interface {
 	uint32_t interface_index;   
 	enum cap_interface_role role;
 	// lo 인가. ingress/egress 둘 다 붙이면 모든 패킷이 두 번 잡힘
-	int loopback; 
+	bool loopback; 
 	struct bpf_link *ingress_attach;
 	struct bpf_link *egress_attach;
 };
