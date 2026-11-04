@@ -44,7 +44,7 @@
 #define SCTP_COMMON_HEADER_BYTES 12
 #define VLAN_MAX_TAGS 2
 
-// 802.1Q/802.1ad VLAN 태그 (4B). -> h_proto 가 0x8100/0x88A8 인 경우
+// 802.1Q/802.1ad VLAN 태그 (4B). h_proto 가 0x8100/0x88A8 인 경우
 struct vlan_tag {
 	__be16 tci;
 	__be16 inner_ether_type;
@@ -170,7 +170,7 @@ static __always_inline void emit(struct __sk_buff *skb, struct cap_event *kernel
 		bump(ST_TRUNCATED);
 		return;
 	}
-	// map 에서 다시 읽은 값은 verifier 가 범위 모름 -> 같은 마스크로 상한을 다시 증명
+	// map 에서 다시 읽은 값은 verifier 가 범위 모름. 같은 마스크로 상한을 다시 증명
 	__u32 captured_len_from_map = ((kernel_event->header.captured_len - 1) & (MAX_CAP_BYTES - 1)) + 1;
 	if (bpf_ringbuf_output(&ringbuf, kernel_event, sizeof(struct cap_event_header) + captured_len_from_map, 0)) {
 		bump(ST_RINGBUF_FULL); 
