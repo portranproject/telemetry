@@ -39,28 +39,28 @@ struct cap_interface {
 
 #define CAP_SLOT_MAX 4
 struct cap_stats {
-	uint64_t captured;          
-	uint64_t ringbuf_full;
-	uint64_t truncated;
-	uint64_t ip_frag_skipped;
+	uint64_t captured_count;          
+	uint64_t ringbuf_full_count;
+	uint64_t truncated_count;
+	uint64_t ip_frag_skipped_count;
 	// IPsec(ESP) 패킷	
-	uint64_t esp_seen;
+	uint64_t esp_seen_count;
 	
-	// slot_busy : PREEMPT_RT 재진입이 CAP_SLOT_MAX 보다 깊은 경우
-	// ringbuf_full - slot_busy : consumer 처리가 늦은 경우
-	uint64_t slot_busy;
+	// slot_busy_count : PREEMPT_RT 재진입이 CAP_SLOT_MAX 보다 깊은 경우
+	// ringbuf_full_count - slot_busy_count : consumer 처리가 늦은 경우
+	uint64_t slot_busy_count;
 	
-	// slot_used[1~] != 0 : nesting 을 다른 slot 으로 해결한 것
-	// (단, slot 이 다 차면 slot_busy)
-	uint64_t slot_used[CAP_SLOT_MAX];
+	// slot_used_count[1~] != 0 : nesting 을 다른 slot 으로 해결한 것
+	// (단, slot 이 다 차면 slot_busy_count)
+	uint64_t slot_used_count[CAP_SLOT_MAX];
 };
 
 struct cap;
 
-typedef void (*cap_record_cb)(void *user, const struct cap_record *record);
+typedef void (*cap_record_cb)(void *user_ctx, const struct cap_record *record);
 
 int cap_open(const struct cap_interface *interfaces, int interface_count, struct cap **cap_out);
-int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *user);
+int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *user_ctx);
 void cap_detach(struct cap *cap);
 int cap_get_stats(const struct cap *cap, struct cap_stats *stats_out);
 enum cap_interface_role cap_get_interface_role(const struct cap *cap, uint32_t interface_index);
