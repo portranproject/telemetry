@@ -20,7 +20,7 @@ _Static_assert((MAX_CAP_BYTES & (MAX_CAP_BYTES - 1)) == 0, "MAX_CAP_BYTES 는 2�
 // 	PREEMPT_RT nesting 깊이 상한 (보통 커널은 1칸)
 #define SLOT_MAX 4
 
-// cap_event_hdr.flags (captured_len < packet_len)
+// cap_event_header.flags (captured_len < packet_len)
 #define EVENT_TRUNCATED 0x1
 
 // +--------+------------+---------+---------------+--------+---------+---+---+---+---+
@@ -37,7 +37,7 @@ _Static_assert((MAX_CAP_BYTES & (MAX_CAP_BYTES - 1)) == 0, "MAX_CAP_BYTES 는 2�
 #define ST_SLOT_USED_BASE 6
 #define ST_COUNT (ST_SLOT_USED_BASE + SLOT_MAX)   
 
-struct cap_event_hdr {
+struct cap_event_header {
 	// bpf_ktime_get_tai_ns
 	__u64 capture_tai_ns;   
 	__u32 interface_index;
@@ -58,15 +58,15 @@ struct cap_event_hdr {
 
 // 커널(bpf)에서 조립한 레코드 (scratch map -> ring buffer)
 struct cap_event {
-	struct cap_event_hdr hdr;
+	struct cap_event_header header;
 	// SCTP 공통 헤더(12B)부터 시작
 	__u8 sctp_packet[MAX_CAP_BYTES];      
 };
 
-_Static_assert(sizeof(struct cap_event_hdr) == 40, "cap_event_hdr 크기가 바뀜: 커널·로더 양쪽 확인");
-_Static_assert(__builtin_offsetof(struct cap_event_hdr, capture_hook) == 24, "cap_event_hdr 배치가 바뀜");
-_Static_assert(__builtin_offsetof(struct cap_event_hdr, packet_len) == 28, "cap_event_hdr 배치가 바뀜");
-_Static_assert(__builtin_offsetof(struct cap_event_hdr, padding1) == 36, "cap_event_hdr 배치가 바뀜");
+_Static_assert(sizeof(struct cap_event_header) == 40, "cap_event_header 크기가 바뀜: 커널·로더 양쪽 확인");
+_Static_assert(__builtin_offsetof(struct cap_event_header, capture_hook) == 24, "cap_event_header 배치가 바뀜");
+_Static_assert(__builtin_offsetof(struct cap_event_header, packet_len) == 28, "cap_event_header 배치가 바뀜");
+_Static_assert(__builtin_offsetof(struct cap_event_header, padding1) == 36, "cap_event_header 배치가 바뀜");
 _Static_assert(__builtin_offsetof(struct cap_event, sctp_packet) == 40, "sctp_packet 은 머리 바로 뒤에서 시작해야 함");
 
 #ifndef __bpf__

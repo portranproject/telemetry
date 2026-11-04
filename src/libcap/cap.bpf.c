@@ -41,7 +41,7 @@
 #define IP_MF     0x2000 
 #define IP_OFFSET 0x1FFF
 
-#define SCTP_COMMON_HDR_BYTES 12
+#define SCTP_COMMON_HEADER_BYTES 12
 #define VLAN_MAX_TAGS 2
 
 // 802.1Q/802.1ad VLAN 태그 (4B). -> h_proto 가 0x8100/0x88A8 인 경우
@@ -81,14 +81,14 @@ struct {
 //
 //     0       14      34                                      60000
 //     +-------+-------+----------+----------+----------+----------+
-//     | Eth   | IP    | SCTP hdr | chunks 1 | chunks 2 | chunks 3 |
+//     | Eth   | IP    | SCTP header | chunks 1 | chunks 2 | chunks 3 |
 //     +-------+-------+----------+----------+----------+----------+
 //     |<----------- linear head ----------->|<---- frag_list ---->|
 //                     |<------- load(skb, 34, dst, 59966) ------->|
 //                                     |
 //                                     v
 //     +----------+----------+----------+----------+
-//     | SCTP hdr | chunks 1 | chunks 2 | chunks 3 |
+//     | SCTP header | chunks 1 | chunks 2 | chunks 3 |
 //     +----------+----------+----------+----------+
 static __always_inline long load(struct __sk_buff *skb, __u32 offset_bytes, void *dst, __u32 len) {
 	return bpf_skb_load_bytes(skb, offset_bytes, dst, len);
@@ -144,17 +144,17 @@ struct parsed_pkt {
 
 // emit: 획득한 slot 의 kernel_event 에 레코드를 채워 Ring Buffer 로 전송
 static __always_inline void emit(struct __sk_buff *skb, struct cap_event *kernel_event, const struct parsed_pkt *pkt) {
-	kernel_event->hdr.capture_tai_ns = bpf_ktime_get_tai_ns();     
+	kernel_event->header.capture_tai_ns = bpf_ktime_get_tai_ns();     
 
-	kernel_event->hdr.interface_index = pkt->interface_index;
-	kernel_event->hdr.src_addr = pkt->src_addr;
-	kernel_event->hdr.dst_addr = pkt->dst_addr;
-	kernel_event->hdr.src_port = pkt->src_port;
-	kernel_event->hdr.dst_port = pkt->dst_port;
-	kernel_event->hdr.packet_len = pkt->packet_len;
-	kernel_event->hdr.capture_hook = pkt->capture_hook;
-	kernel_event->hdr.padding0 = 0;
-	kernel_event->hdr.padding1 = 0;
+	kernel_event->header.interface_index = pkt->interface_index;
+	kernel_event->header.src_addr = pkt->src_addr;
+	kernel_event->header.dst_addr = pkt->dst_addr;
+	kernel_event->header.src_port = pkt->src_port;
+	kernel_event->header.dst_port = pkt->dst_port;
+	kernel_event->header.packet_len = pkt->packet_len;
+	kernel_event->header.capture_hook = pkt->capture_hook;
+	kernel_event->header.padding0 = 0;
+	kernel_event->header.padding1 = 0;
 
 	__u32 captured_len = pkt->packet_len;
 	if (captured_len > MAX_CAP_BYTES - 1)
@@ -162,8 +162,8 @@ static __always_inline void emit(struct __sk_buff *skb, struct cap_event *kernel
 	barrier_var(captured_len);
 	captured_len = ((captured_len - 1) & (MAX_CAP_BYTES - 1)) + 1;
 	
-	kernel_event->hdr.captured_len = captured_len;
-	kernel_event->hdr.flags = captured_len < pkt->packet_len ? EVENT_TRUNCATED : 0;
+	kernel_event->header.captured_len = captured_len;
+	kernel_event->header.flags = captured_len < pkt->packet_len ? EVENT_TRUNCATED : 0;
 
 	if (load(skb, pkt->sctp_offset_bytes, kernel_event->sctp_packet, captured_len)) {  
 		// ip_header.tot_len 이 실제 패킷보다 길게 적힌 깨진 패킷
@@ -171,13 +171,13 @@ static __always_inline void emit(struct __sk_buff *skb, struct cap_event *kernel
 		return;
 	}
 	// map 에서 다시 읽은 값은 verifier 가 범위 모름 -> 같은 마스크로 상한을 다시 증명
-	__u32 captured_len_from_map = ((kernel_event->hdr.captured_len - 1) & (MAX_CAP_BYTES - 1)) + 1;
-	if (bpf_ringbuf_output(&ringbuf, kernel_event, sizeof(struct cap_event_hdr) + captured_len_from_map, 0)) {
+	__u32 captured_len_from_map = ((kernel_event->header.captured_len - 1) & (MAX_CAP_BYTES - 1)) + 1;
+	if (bpf_ringbuf_output(&ringbuf, kernel_event, sizeof(struct cap_event_header) + captured_len_from_map, 0)) {
 		bump(ST_RINGBUF_FULL); 
 		return;
 	}
 	bump(ST_CAPTURED);
-	if (kernel_event->hdr.flags & EVENT_TRUNCATED)
+	if (kernel_event->header.flags & EVENT_TRUNCATED)
 		bump(ST_TRUNCATED);
 }
 
@@ -243,7 +243,7 @@ static __always_inline void tap(struct __sk_buff *skb, const __u8 capture_hook, 
 			return;
 		packet_len = ip_total_len - ip_header_len;
 	}
-	if (packet_len < SCTP_COMMON_HDR_BYTES)
+	if (packet_len < SCTP_COMMON_HEADER_BYTES)
 		return; 
 
 	__be16 ports[2];

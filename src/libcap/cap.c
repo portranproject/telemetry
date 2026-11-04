@@ -184,7 +184,7 @@ static int on_ringbuf_record(void *ctx, void *ringbuf_record, size_t size_bytes)
 	const struct cap_event *kernel_event = ringbuf_record;
 
 	// 크기 검증: 정상 커널이면 항상 통과하지만, 레코드 경계 밖을 읽는 일은 절대 없게 한 번 더 확인
-	if (size_bytes < sizeof(kernel_event->hdr) || kernel_event->hdr.captured_len > MAX_CAP_BYTES || sizeof(kernel_event->hdr) + kernel_event->hdr.captured_len > size_bytes) {
+	if (size_bytes < sizeof(kernel_event->header) || kernel_event->header.captured_len > MAX_CAP_BYTES || sizeof(kernel_event->header) + kernel_event->header.captured_len > size_bytes) {
 		cap->bad_record_count++;
 		return 0;
 	}
@@ -196,17 +196,17 @@ static int on_ringbuf_record(void *ctx, void *ringbuf_record, size_t size_bytes)
 	// 커널 레코드(event) → 공개 API 레코드(cap_record)
 	struct cap_record record = {
 		// TAI -> 벽시계(UTC)
-		.capture_time_ns = (uint64_t)((int64_t)kernel_event->hdr.capture_tai_ns - cap->tai_offset_ns),  
-		.interface_index = kernel_event->hdr.interface_index,
-		.capture_hook    = (enum cap_hook)kernel_event->hdr.capture_hook,  
-		.src_addr        = kernel_event->hdr.src_addr,
-		.dst_addr        = kernel_event->hdr.dst_addr,
-		.src_port        = kernel_event->hdr.src_port,
-		.dst_port        = kernel_event->hdr.dst_port,
+		.capture_time_ns = (uint64_t)((int64_t)kernel_event->header.capture_tai_ns - cap->tai_offset_ns),  
+		.interface_index = kernel_event->header.interface_index,
+		.capture_hook    = (enum cap_hook)kernel_event->header.capture_hook,  
+		.src_addr        = kernel_event->header.src_addr,
+		.dst_addr        = kernel_event->header.dst_addr,
+		.src_port        = kernel_event->header.src_port,
+		.dst_port        = kernel_event->header.dst_port,
 		// 링 버퍼 메모리를 그대로 빌려줌 → 콜백이 끝나면 커널이 덮어쓸 수 있음
 		.sctp_packet     = kernel_event->sctp_packet,
-		.captured_len    = kernel_event->hdr.captured_len,
-		.packet_len      = kernel_event->hdr.packet_len,
+		.captured_len    = kernel_event->header.captured_len,
+		.packet_len      = kernel_event->header.packet_len,
 	};
 	cap->poll.record_cb(cap->poll.user_ctx, &record);
 	cap->poll.delivered_count++;
