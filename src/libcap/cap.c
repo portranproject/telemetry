@@ -399,6 +399,69 @@ int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *use
 	return cap->poll.delivered_count;
 }
 
+int cap_get_stats(const struct cap *cap, struct cap_stats *stats_out) {
+	if (!stats_out)
+		return -EINVAL;
+	memset(stats_out, 0, sizeof(*stats_out));
+	if (!cap || !cap->bpf_skeleton)
+		return -EINVAL;
+	// 유저공간에서 버린 깨진 레코드도 truncated_count 에 합산
+	stats_out->truncated_count = cap->bad_record_count;                     
+
+	// 필드 순서 중요 : 커널은 칸 부족 때 ST_SLOT_BUSY 를 먼저, ST_RINGBUF_FULL 을 나중에 세야 함.
+	//   (cap.bpf.c 의 두 bump). 두 카운터는 따로 읽으므로(맵 조회 2회) 그 사이에 패킷 드롭이 낄 수도 있음.
+	//   slot_busy_count 를 먼저 읽으면: 그 시점에 세어진 사건은 모두 ringbuf_full_count 도 이미 세었거나,
+	//   아직 세지 않았어도 ringbuf_full_count 을 나중에 읽으므로 포함됨 -> slot_busy_count ≤ ringbuf_full_count 이 항상 성립.
+	//   순서를 뒤집으면 ringbuf_full_count=0, slot_busy_count=1 이 관측될 수 있고, 공개 계약이 말하는
+	//   순수 링버퍼 포화 = ringbuf_full_count − slot_busy_count 가 uint64 에서 음수 방향으로 증가할 수 있음.
+	const struct { __u32 stat_index; uint64_t *dst; } stat_fields[] = {
+		{ ST_CAPTURED, &stats_out->captured_count },
+		{ ST_SLOT_BUSY,     &stats_out->slot_busy_count },      // ← 반드시 ST_RINGBUF_FULL 보다 먼저
+		{ ST_RINGBUF_FULL,  &stats_out->ringbuf_full_count },
+		{ ST_TRUNCATED,    &stats_out->truncated_count },
+		{ ST_IP_FRAG_SKIPPED,   &stats_out->ip_frag_skipped_count },
+		{ ST_ESP_SEEN,      &stats_out->esp_seen_count },
+		{ ST_SLOT_USED_BASE + 0, &stats_out->slot_used_count[0] },
+		{ ST_SLOT_USED_BASE + 1, &stats_out->slot_used_count[1] },
+		{ ST_SLOT_USED_BASE + 2, &stats_out->slot_used_count[2] },
+		{ ST_SLOT_USED_BASE + 3, &stats_out->slot_used_count[3] },
+	};
+
+	int cpu_count = libbpf_num_possible_cpus();
+	if (cpu_count <= 0)
+		return cpu_count < 0 ? cpu_count : -EIO;
+	__u64 *values = calloc((size_t)cpu_count, sizeof(*values));
+	if (!values)
+		return -ENOMEM;
+
+	int error = 0;
+	int stats_map_fd = bpf_map__fd(cap->bpf_skeleton->maps.stats);
+	for (size_t i = 0; i < sizeof(stat_fields) / sizeof(stat_fields[0]); i++) {
+		if (bpf_map_lookup_elem(stats_map_fd, &stat_fields[i].stat_index, values)) {
+			error = negative_errno();
+			continue;
+		}
+		for (int value_index = 0; value_index < cpu_count; value_index++)
+			*stat_fields[i].dst += values[value_index];
+	}
+	free(values);
+	// 하나라도 못 읽었으면 stats_out 은 반쪽 합이라 신뢰 불가
+	//   0 으로 비워 호출자가 오류를 무시해도 값을 읽지 못하게 함.
+	if (error)  
+		memset(stats_out, 0, sizeof(*stats_out));         
+	return error;
+}
+
+enum cap_interface_role cap_get_interface_role(const struct cap *cap, uint32_t interface_index) {
+	if (cap) {
+		for (int i = 0; i < cap->interface_count; i++) {
+			if (cap->attached_interfaces[i].interface_index == interface_index)
+				return cap->attached_interfaces[i].role;
+		}
+	}
+	return CAP_ROLE_UNKNOWN;
+}
+
 static void detach_one(struct bpf_link **attach_ptr) {
 	if (!*attach_ptr)
 		return;
