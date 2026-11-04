@@ -53,10 +53,13 @@ struct ap_cause {
 
 struct f1ap_rrc_container {
     int ie_id;           // 담긴 IE: F1AP_IE_ID_RRC_CONTAINER 등(위 상수). RRC 층이 RRC 메시지와 CellGroupConfig 를 가름
-    int srb_id;          // 같은 메시지의 SRB ID. RRC 층이 채널(SRB0 = CCCH, 그 밖 = DCCH)을 고름. 없거나 IE 128 이면 -1(0 은 SRB0 이라서)
+    int srb_id;          // 같은 메시지의 SRB ID. RRC 층이 procedure_code 와 함께 채널(CCCH/DCCH)을 고름. 없거나 IE 128 이면 -1(0 은 SRB0 이라서)
     const uint8_t *data; // f1ap_release 전까지 유효
     size_t len;
 };
+
+// f1ap_internal: f1ap_parse 가 잡은 asn1c 트리·배열. 안의 모양은 f1ap.c 에만 두고 밖에는 포인터로만 둠(asn1c 타입을 이 헤더에 넣지 않으려고)
+struct f1ap_internal;
 
 // f1ap_msg: F1AP PDU 하나에서 꺼낸 값. f1ap_parse 가 채우고 f1ap_release 가 해제
 //   has_… 가 false 면 짝 값은 0
@@ -92,9 +95,7 @@ struct f1ap_msg {
     int served_cell_count;
     const struct nr_cgi *served_cells; // gNB-DU Served Cells List 의 항목마다 NR CGI. F1 SETUP REQUEST. 그 DU 의 셀 목록(탐지 명세 f1_evt.cells). 없으면 NULL
 
-    // 계측
-    int unknown_ie_count; // 문법이 모르는 IE 를 건너뛴 수(관대 패치 계수기의 차이). 0 이 아니면 상대 장비와 문법 판본이 다를 수 있음
-    void *internal;       // f1ap.c 전용(asn1c 트리·배열)
+    struct f1ap_internal *internal; // f1ap.c 전용(asn1c 트리·배열)
 };
 
 /* f1ap_parse: F1AP PDU 하나를 해석해 f1ap_msg 에 값을 채움.
