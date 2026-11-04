@@ -41,7 +41,7 @@ struct cap_event_header {
 	// bpf_ktime_get_tai_ns
 	__u64 capture_tai_ns;   
 	__u32 interface_index;
-        // addr : network order	
+	// addr : network order	
 	__u32 src_addr;
 	__u32 dst_addr;
 	// port : host order

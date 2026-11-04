@@ -80,16 +80,16 @@ struct {
 // load : offset_bytes ~ +len 구간에 걸친 skb 조각(선형 헤더/frags[]/frag_list)를 순서대로 dst 로 복사
 //
 //     0       14      34                                      60000
-//     +-------+-------+----------+----------+----------+----------+
+//     +-------+-------+----------+----------+----------+-------------+
 //     | Eth   | IP    | SCTP header | chunks 1 | chunks 2 | chunks 3 |
-//     +-------+-------+----------+----------+----------+----------+
-//     |<----------- linear head ----------->|<---- frag_list ---->|
-//                     |<------- load(skb, 34, dst, 59966) ------->|
+//     +-------+-------+----------+----------+----------+-------------+
+//     |<----------- linear head ----------->|<---- frag_list ------->|
+//                     |<------- load(skb, 34, dst, 59966) ---------->|
 //                                     |
 //                                     v
-//     +----------+----------+----------+----------+
+//     +----------+----------+----------+-------------+
 //     | SCTP header | chunks 1 | chunks 2 | chunks 3 |
-//     +----------+----------+----------+----------+
+//     +----------+----------+----------+-------------+
 static __always_inline long load(struct __sk_buff *skb, __u32 offset_bytes, void *dst, __u32 len) {
 	return bpf_skb_load_bytes(skb, offset_bytes, dst, len);
 }
@@ -226,9 +226,8 @@ static __always_inline void tap(struct __sk_buff *skb, const __u8 capture_hook, 
 	if (frame_len < l2_len + ip_header_len) 
 		return;
        
-       	// SCTP Common Header 시작 위치	
+	// SCTP Common Header 시작 위치	
 	__u32 sctp_offset_bytes = l2_len + ip_header_len;
-
 	// SCTP packet_len 결정(하드닝)
 	//   - skb_ip_len ≤ 65535: ip_header.tot_len 활용
 	//   - skb_ip_len > 65535: ip_header.tot_len 으로 나타낼 수 없는 길이 = GSO 로 묶인 큰 skb. 

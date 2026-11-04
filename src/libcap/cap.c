@@ -11,6 +11,7 @@
  *       cap_get_interface_role    O       O     attached_interfaces 를 훑음
  *       새 레코드 유입            O       X     tap() 이 동작하지 않기 때문
  *
+ *
  * [2] cap_open / cap_close 
  *
  *       cap_open                                        cap_close
@@ -429,7 +430,7 @@ int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *use
 	cap->poll.user_ctx = user_ctx;
 	cap->poll.delivered_count = 0;
 
-     	// ring_buffer__consume/poll 반환: ≥0 = 꺼낸 레코드 수, <0 = errno (libbpf 규약)
+	// ring_buffer__consume/poll 반환: ≥0 = 꺼낸 레코드 수, <0 = errno (libbpf 규약)
 	int poll_result;
 
 	if (timeout_ms == 0) {
@@ -458,9 +459,9 @@ int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *use
 			}
 			// ring_buffer__poll 이 준 0 에는 두 가지가 섞여 있음
                         // 	(a) 링 버퍼가 진짜 비었다          
-			// 		-> epoll 이 wait_ms 만큼 지난 경우
+			// 	-> epoll 이 wait_ms 만큼 지난 경우
                         //     	(b) 맨 앞 레코드를 커널이 쓰는 중  
-			//     		-> epoll 이 자지 않고 즉시 돌아온 경우
+			//	-> epoll 이 자지 않고 즉시 돌아온 경우
                         //
                         // (b) 의 원인: 커널은 자리를 예약할 때 producer_pos 를 먼저 올리고 BUSY 는 나중에 제거.
                         //        커널 (bpf_ringbuf_output)           현재 루프
@@ -470,7 +471,7 @@ int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *use
                         //   |                                          커널 poll 은 producer_pos 만 확인
                         //   |    memcpy(rec, data, size)             libbpf -> 맨 앞이 BUSY 라 0개
                         //   |      (최대 64KB)                       poll_result=0, delivered_count=0
-                        //   |      RT 면 이 안에서 선점 가능         sched_yield()      <-- 여기
+                        //   |      RT 면 이 안에서 선점 가능         sched_yield()
                         //   +--  hdr->len ^= BUSY  (commit)          <- 닫힌다
                         //                                            epoll_wait -> 1개! on_ringbuf_record
 			// BUSY 윈도우가 열려 있는 동안, commit 될 때까지 CPU 를 계속 사용하기 때문.
@@ -489,7 +490,6 @@ int cap_poll(struct cap *cap, int timeout_ms, cap_record_cb record_cb, void *use
 
 /* cap_get_stats: 커널 카운터를 모두 더해 공개 통계로 채움.
  *   이유: stats 는 PERCPU_ARRAY. 커널이 CPU 간 경쟁 없이 세는 대신, 읽는 쪽이 CPU 수만큼 더함.
- *
  *     key = ST_CAPTURED  ->  values[0] values[1] ... values[cpu_count-1]
  *                            +--------- 다 더해서 ---------------------+
  *                                       captured_count
@@ -506,9 +506,9 @@ int cap_get_stats(const struct cap *cap, struct cap_stats *stats_out) {
 	_Static_assert(SLOT_MAX == 4, "SLOT_MAX 가 바뀌면 아래 slot_used_count 줄 수도 고칠 것");
     	
 	// stat_fields[] 의 줄 순서: slot_busy_count 를 ringbuf_full_count 보다 먼저 읽음.
-    	// 	커널은 slot 부족 때 ST_SLOT_BUSY 를 먼저, ST_RINGBUF_FULL 을 나중에 셈(cap.bpf.c 의 두 bump).
-    	//   	이 순서면 두 값이 어긋날 창이 그 두 bump 사이로 줄어듬. 다만 두 bump 는 원자적이지 않아
-    	//   	slot_busy_count <= ringbuf_full_count 가 보장되지는 않음
+	// 	커널은 slot 부족 때 ST_SLOT_BUSY 를 먼저, ST_RINGBUF_FULL 을 나중에 셈(cap.bpf.c 의 두 bump).
+	// 	이 순서면 두 값이 어긋날 창이 그 두 bump 사이로 줄어듬. 다만 두 bump 는 원자적이지 않아
+	// 	slot_busy_count <= ringbuf_full_count 가 보장되지는 않음
 	const struct { __u32 stat_index; uint64_t *dst; } stat_fields[] = {
 		{ ST_CAPTURED, &stats_out->captured_count },
 		{ ST_SLOT_BUSY,     &stats_out->slot_busy_count },
