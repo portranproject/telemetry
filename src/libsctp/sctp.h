@@ -6,11 +6,10 @@
 #ifndef TELEMETRY_SCTP_H
 #define TELEMETRY_SCTP_H
 
-// TODO: include libcap/cap.h
 #include <stddef.h>
 #include <stdint.h>
 
-struct cap_record; // TODO: libcap/cap.h include 시 제거. cap.h 에 정의, 여기선 포인터로만 쓰므로 선언만
+#include "libcap/cap.h"
 
 #define SCTP_PPID_NGAP 60
 #define SCTP_PPID_F1AP 62
