@@ -80,7 +80,10 @@ struct f1ap_msg {
     uint32_t crnti; // DU 가 UE 에 준 무선 구간 번호. Table I C-RNTI
 
     // 셀
-    struct nr_cgi nr_cgi;            // UE 가 접속한 셀(INITIAL UL RRC). 탐지 명세 cell_id
+    //   nr_cgi 는 메시지 종류와 상관없이 NR CGI IE 를 담으므로, 무슨 셀인지는 procedure_code 로 가림.
+    //   INITIAL UL RRC 에서는 UE 가 접속한 셀(탐지 명세 cell_id). ACCESS SUCCESS, CELL SWITCH NOTIFICATION,
+    //   SYSTEM INFORMATION DELIVERY COMMAND 등에도 실리며 그때의 뜻은 그 메시지가 정함
+    struct nr_cgi nr_cgi;            // NR CGI IE 가 가리키는 셀
     bool has_du_to_cu_rrc_container; // INITIAL UL RRC 에 없으면 DU 가 그 UE 를 받을 수 없다는 뜻. 탐지 명세 ext.DuCannotServe
 
     // 연결 수명
