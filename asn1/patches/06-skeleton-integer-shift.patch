@@ -1,0 +1,20 @@
+# 06-skeleton-integer-shift.patch
+#
+# 대상 : asn1c 런타임 (skeletons/INTEGER_aper.c)
+#
+# 증상 : 큰 범위의 INTEGER 를 옥텟 단위로 모을 때 부호 있는 정수를 왼쪽으로 민다. 8옥텟 값에서
+#   부호 비트까지 밀리면 C 표준상 정의되지 않은 동작이다(UBSan 이 잡는다).
+#
+# 해결 : 부호 없는 정수로 계산한 뒤 되돌린다. 결과 비트는 같다. (전에는 Makefile 의 sed 한 줄이었다.)
+
+--- a/skeletons/INTEGER_aper.c
++++ b/skeletons/INTEGER_aper.c
+@@ -79,7 +79,7 @@
+                     int buf = per_get_few_bits(pd, 8);
+                     if (buf < 0)
+                         ASN__DECODE_FAILED;
+-                    value += (((intmax_t)buf) << (8 * length));
++                    value = (intmax_t)((uintmax_t)value + ((uintmax_t)buf << (8 * length)));
+                 }
+ 
+                 value += ct->lower_bound;

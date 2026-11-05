@@ -1,0 +1,47 @@
+# 02-asn1c-enum-t-name-clash.patch
+#
+# 대상 : asn1c 컴파일러 (libasn1compiler/asn1c_naming.c)
+#
+# 증상 : ENUMERATED 의 값 이름이 t 이면 생성된 C 가 컴파일되지 않는다. asn1c 는 타입 이름에 _t 를 붙이는데
+#   (NR_CA_BandwidthClassNR_r17_t), 값 이름도 <타입>_<값> 이라 둘이 같은 식별자가 된다.
+#   TS 38.331 의 CA-BandwidthClassNR-r17 ::= ENUMERATED {r, s, t, u, ...} 가 이 경우다(V17.3.0 에는 없던 정의).
+#
+# 출처 : mouse07410/asn1c 커밋 0695fe88 (2025-09-15) 을 그대로 옮겼다(바꾼 줄 없음).
+#
+# 효과 : 겹치는 값 이름 뒤에 _member 를 붙인다(NR_CA_BandwidthClassNR_r17_t_member). 부호화와 무관하다.
+
+--- a/libasn1compiler/asn1c_naming.c
++++ b/libasn1compiler/asn1c_naming.c
+@@ -264,8 +264,10 @@
+ const char *
+ c_member_name(arg_t *arg, asn1p_expr_t *expr) {
+     static abuf ab;
++    static abuf typedef_name;
+ 
+     abuf_clear(&ab);
++    abuf_clear(&typedef_name);
+ 
+     /* NB: do not use part_name, doesn't work for -fcompound-names */
+     abuf_str(&ab, asn1c_prefix_get());
+@@ -273,6 +275,21 @@
+     abuf_str(&ab, "_");
+     abuf_str(&ab, asn1c_make_identifier(0, expr, 0));
+ 
++    /* 
++     * Check for potential collision with typedef name.
++     * For ENUMERATED types, the typedef is named <base_name>_t,
++     * so if an enum member would have the same name, add a suffix to avoid clash.
++     */
++    if (arg->expr->expr_type == ASN_BASIC_ENUMERATED) {
++        abuf_str(&typedef_name, asn1c_prefix_get());
++        abuf_str(&typedef_name, c_name_impl(arg, arg->expr, 0).base_name);
++        abuf_str(&typedef_name, "_t");
++        
++        if (strcmp(ab.buffer, typedef_name.buffer) == 0) {
++            abuf_str(&ab, "_member");
++        }
++    }
++
+     return ab.buffer;
+ }
+ 
