@@ -1,0 +1,24 @@
+# 10-asn1c-enum-alias-per-constraints.patch
+#
+# 대상 : asn1c 컴파일러 (libasn1compiler/asn1c_C.c)
+#
+# 증상 : ENUMERATED 타입에 다른 이름을 붙인 정의(A ::= B, B 는 ENUMERATED)의 타입 디스크립터에 PER 제약 표가
+#   비어(0) 생성된다. 런타임은 제약 표가 없는 ENUMERATED 를 디코드 실패로 처리한다.
+#   TS 38.331 의 RangeToBestCell ::= Q-OffsetRange 하나가 해당한다(SIB2 의 rangeToBestCell).
+#
+# 출처 : mouse07410/asn1c 커밋 5f8f225b (2025-09-12) 를 그대로 옮겼다(바꾼 줄 없음).
+#
+# 효과 : 그런 정의의 디스크립터가 자기 PER 제약 표를 가리킨다.
+
+--- a/libasn1compiler/asn1c_C.c
++++ b/libasn1compiler/asn1c_C.c
+@@ -3159,7 +3159,8 @@
+             if(expr->combined_constraints
+                || expr->expr_type == ASN_BASIC_ENUMERATED
+                || expr->expr_type == ASN_CONSTR_CHOICE
+-               || (expr->expr_type & ASN_STRING_KM_MASK)) {
++               || (expr->expr_type & ASN_STRING_KM_MASK)
++               || (expr->expr_type == A1TC_REFERENCE && terminal && terminal->expr_type == ASN_BASIC_ENUMERATED)) {
+                 OUT("&asn_PER_type_%s_constr_%d",
+ 					expr_id, expr->_type_unique_index);
+ 			} else {

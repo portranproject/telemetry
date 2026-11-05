@@ -1,0 +1,56 @@
+# 09-asn1c-choice-version-brackets.patch
+#
+# 대상 : asn1c 컴파일러 (libasn1parser/asn1p_y.y, libasn1compiler/asn1c_C.c)
+#
+# 증상 : CHOICE 의 "..." 뒤에 [[ ]] 로 묶인 선택지들을 묶음 하나(ext1, ext2 …)로 취급한다.
+#   그래서 [[ ]] 안의 선택지가 오면 디코드가 실패하거나 다른 선택지로 읽힌다.
+#   TS 38.331 의 EventTriggerConfig.eventId(eventX1-r17, eventD1-r17 …), EventTriggerConfigInterRAT.eventId,
+#   MeasResultsSL-r16 세 곳이 해당한다. F1AP·NGAP 문법에는 없다.
+#
+# 근거 : X.691(02/2021) 23 절 끝의 NOTE — CHOICE 의 확장 추가에 쓰인 version bracket 은 선택지의 부호화에
+#   영향을 주지 않는다. 즉 [[ ]] 안의 선택지도 하나씩 따로 번호가 매겨진다(SEQUENCE 의 [[ ]] 와 다르다).
+#
+# 출처 : mouse07410/asn1c 커밋 8baade52 (2024-09-26) 의 소스 수정 두 덩어리를 그대로 옮겼다
+#   (그 커밋에 함께 든 시험 파일 2개는 옮기지 않았다).
+#
+# 효과 : [[ ]] 안의 선택지가 각각 CHOICE 의 선택지로 생성된다(NR_EventTriggerConfig__eventId_PR_eventX1_r17 등).
+
+--- a/libasn1compiler/asn1c_C.c
++++ b/libasn1compiler/asn1c_C.c
+@@ -971,7 +971,6 @@
+ 	asn1p_expr_t *expr = arg->expr;
+ 	asn1p_expr_t *v;
+ 	int saved_target = arg->target->target;
+-	int ext_num = 1;
+ 
+ 	DEPENDENCIES;
+ 
+@@ -992,13 +991,6 @@
+ 				continue;
+ 			}
+ 
+-			if((v->expr_type == ASN_CONSTR_SEQUENCE) &&
+-				(v->marker.flags & EM_OPTIONAL) &&
+-				(v->Identifier == NULL)) {
+-				char ext_name[20];
+-				sprintf(ext_name, "ext%d", ext_num++);
+-				v->Identifier = strdup(ext_name);
+-			}
+ 			OUT("%s", c_presence_name(arg, v));
+ 		}
+ 		OUT("\n");
+--- a/libasn1parser/asn1p_y.y
++++ b/libasn1parser/asn1p_y.y
+@@ -1097,10 +1097,8 @@
+ 	}
+ 	| AlternativeTypeLists ',' TOK_VBracketLeft AlternativeTypeLists TOK_VBracketRight {
+ 		$$ = $1;
+-		$4->meta_type = AMT_TYPE;
+-		$4->expr_type = ASN_CONSTR_SEQUENCE;
+-		$4->marker.flags |= EM_OPTIONAL;
+-		asn1p_expr_add($$, $4);
++		asn1p_expr_add_many($$, $4);
++		asn1p_expr_free($4);
+ 	}
+ 	;
+ 
