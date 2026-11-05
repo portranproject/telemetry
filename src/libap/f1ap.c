@@ -16,7 +16,7 @@
 
 // MARK: - 상수
 
-// asn1c 디코드의 재귀 스택 상한(256 KiB). 일부러 깊게 중첩한 입력이 스택을 넘치게 하지 못하도록. 넘으면 디코드 실패
+// asn1c 디코드 재귀 스택 상한. 깊게 중첩한 입력으로 스택이 넘치지 않게(넘으면 디코드 실패)
 #define DECODE_MAX_STACK_BYTES (256 * 1024)
 
 // NRCellIdentity ::= BIT STRING (SIZE(36)) (TS 38.473). asn1c 는 앞에서부터 채운 5바이트와 끝 미사용 4비트로 담음
@@ -24,7 +24,7 @@
 #define NR_CELL_IDENTITY_BYTES ((NR_CELL_IDENTITY_BITS + 7) / 8)
 #define NR_CELL_IDENTITY_UNUSED_BITS (NR_CELL_IDENTITY_BYTES * 8 - NR_CELL_IDENTITY_BITS)
 
-// SRBID ::= INTEGER (0..3, ..., 4 | 5) (TS 38.473). 확장 뒤 값까지 받고, 그보다 크면 문법이 모르는 SRB 라 "없음"
+// SRBID ::= INTEGER (0..3, ..., 4 | 5) (TS 38.473). 이보다 크면 모르는 SRB 라 없음
 #define SRB_ID_MAX 5
 
 // MARK: - 자료구조
@@ -33,30 +33,27 @@
 //   f1ap_parse 가 0 으로 채워 할당. SRB ID·배열 칸은 IE 를 꺼내는 코드가 채우고, 그 전에는 0·NULL
 struct f1ap_internal {
     F1AP_F1AP_PDU_t *pdu; // asn1c 가 디코드한 트리. 꺼낸 바이트 포인터가 이 트리를 빌림
-    bool has_srb_id;      // IE 를 도는 중에 SRB ID(IE 64)를 봤는지
+    bool has_srb_id;      // IE 를 도는 중에 SRB ID 를 봤는지
     int srb_id;           // 그 값. SRB ID IE 가 RRC 컨테이너보다 뒤에 올 수 있어, IE 를 다 돈 뒤 컨테이너마다 붙임
 
-    // 결과 배열. f1ap_msg 쪽 포인터는 위 층이 읽기만 하도록 const 라, 늘리고 풀 때는 이쪽 포인터를 씀(const 를 벗기는 캐스트 없이)
+    // 결과 배열. f1ap_msg 쪽은 const 라, 늘리고 풀 때는 이쪽을 씀(캐스트 없이)
     struct f1ap_rrc_container *rrc_containers; // f1ap_msg.rrc_containers 와 같은 배열
     int rrc_container_capacity;                // rrc_containers 에 할당한 칸 수. 개수가 닿으면 늘림
     struct nr_cgi *served_cells;               // f1ap_msg.served_cells 와 같은 배열
     int served_cell_capacity;                  // served_cells 에 할당한 칸 수. 개수가 닿으면 늘림
 };
 
-// ie_view: IE 하나의 번호와 값. 메시지 종류와 상관없이 번호로 고르려고 IE 목록의 C 타입 대신 이 모양으로 읽음
-//   값은 asn1c 트리를 가리키므로 해석하는 동안만 씀
+// ie_view: IE 하나의 번호·값. 메시지마다 다른 C 타입 대신 이 모양으로 읽음(값은 트리를 가리킴)
 struct ie_view {
     long id;                           // IE 번호(ProtocolIE-ID). 꺼낼 값을 고르는 기준
-    const asn_TYPE_descriptor_t *type; // 값의 asn1c 타입. 같은 번호라도 타입을 확인한 뒤 읽으려고 둠. 문법이 모르는 IE 라 asn1c 가 건너뛴 칸이면 NULL
+    const asn_TYPE_descriptor_t *type; // 값의 asn1c 타입. 읽기 전에 타입을 보려고 둠. asn1c 가 값을 건너뛴 IE(모르는 IE, 그 메시지에 없는 IE)면 NULL
     const void *value;                 // 값 위치. type 이 NULL 이면 NULL
 };
 
 // MARK: - asn1c 설명표 읽기
 
-/* member_by_name: asn1c 타입 설명표(type)의 멤버 중 이름이 name 인 것을 찾음.
- *   이유: 메시지 종류와 상관없이 같은 코드로 읽으려면 메시지마다 다른 C 타입 대신 설명표의 멤버 이름
- *   ("procedureCode", "value" 등, 문법의 ASN.1 이름)으로 찾아가야 함.
- *   반환: 멤버. 없으면 NULL. 설명표는 생성 코드의 고정 데이터라 프로그램 끝까지 유효
+/* member_by_name: 설명표(type)에서 이름이 name 인 멤버를 찾음. 없으면 NULL.
+ *   이유: 메시지마다 다른 C 타입 대신 문법의 이름("procedureCode" 등)으로 찾아, 모든 메시지를 같은 코드로 읽음
  */
 static const asn_TYPE_member_t *member_by_name(const asn_TYPE_descriptor_t *type, const char *name) {
     for (unsigned i = 0; i < type->elements_count; i++) {
@@ -67,10 +64,7 @@ static const asn_TYPE_member_t *member_by_name(const asn_TYPE_descriptor_t *type
     return NULL;
 }
 
-/* member_value_ptr: 구조체(struct_base) 안 멤버(member) 값의 위치.
- *   멤버를 포인터로 담는 경우(asn1c 의 ATF_POINTER — 선택 멤버, CHOICE 의 큰 갈래)는 그 포인터가 가리키는 곳.
- *   반환: 값 위치. 포인터로 담는 멤버가 비어 있으면 NULL
- */
+/* member_value_ptr: 구조체 안 멤버 값의 위치. 포인터로 담는 멤버(ATF_POINTER)는 따라감(비면 NULL) */
 static const void *member_value_ptr(const asn_TYPE_member_t *member, const void *struct_base) {
     const void *value_ptr = (const char *)struct_base + member->memb_offset;
     if (member->flags & ATF_POINTER)
@@ -78,10 +72,8 @@ static const void *member_value_ptr(const asn_TYPE_member_t *member, const void 
     return value_ptr;
 }
 
-/* choice_selected: CHOICE 값(choice_base)에서 고른 갈래와 그 값의 위치를 찾음.
- *   이유: F1AP-PDU 의 세 갈래, 메시지 본체(value), IE 의 값이 모두 CHOICE 라 같은 방법으로 고른 쪽을 읽음.
- *   present_out 이 NULL 이 아니면 고른 순번(1부터, 0 = 고른 것 없음)을 씀.
- *   반환: 고른 갈래. 고른 것이 없거나(문법이 모르는 open type 은 asn1c 가 건너뛰어 0) 순번이 범위 밖이면 NULL 이고 *value_out 도 NULL
+/* choice_selected: CHOICE 에서 고른 갈래와 값 위치. present_out 에 고른 순번(1부터, 0 = 없음).
+ *   PDU 갈래·메시지 본체·IE 값에 같이 씀. 고른 것이 없으면(모르는 open type) NULL 이고 *value_out 도 NULL
  */
 static const asn_TYPE_member_t *choice_selected(const asn_TYPE_descriptor_t *type, const void *choice_base, const void **value_out,
                                                 unsigned *present_out) {
@@ -96,10 +88,9 @@ static const asn_TYPE_member_t *choice_selected(const asn_TYPE_descriptor_t *typ
     return member;
 }
 
-/* ie_at: IE 목록(ProtocolIE-Field 의 SEQUENCE OF)의 index 번째 IE 를 설명표의 "id"·"value" 멤버로 읽음.
- *   이유: IE 목록의 C 타입이 메시지마다 달라, 설명표로 읽어야 모든 메시지의 IE 를 같은 코드로 고를 수 있음.
- *   반환: 읽었으면 true. index 가 범위 밖이거나, 칸이 비었거나, 설명표 모양이 다르면 false.
- *   문법이 모르는 IE 면 true 이고 ie->type·value 는 NULL. ie 는 트리를 빌림(f1ap_release 전까지)
+/* ie_at: IE 목록의 index 번째 IE 를 설명표의 "id"·"value" 로 읽음. 범위 밖·빈 칸이면 false.
+ *   이유: IE 목록의 C 타입이 메시지마다 달라, 설명표로 읽어야 한 코드로 고를 수 있음.
+ *   asn1c 가 값을 건너뛴 IE(모르는 IE, 그 메시지에 없는 IE)면 true 에 ie->type·value NULL. ie 는 트리를 빌림
  */
 static bool ie_at(const asn_TYPE_descriptor_t *list_type, const void *list, int index, struct ie_view *ie) {
     const asn_anonymous_sequence_ *ie_list = _A_CSEQUENCE_FROM_VOID(list);
@@ -131,15 +122,13 @@ static bool ie_at(const asn_TYPE_descriptor_t *list_type, const void *list, int 
 
 // MARK: - IE 값 꺼내기
 
-/* ie_read_uint: 정수 IE 값을 0 ~ max_value 의 수로 읽음.
- *   이유: 확장할 수 있는 정수(C-RNTI ::= INTEGER (0..65535, ...) 등)는 확장 비트를 켜면 음수나 아주 큰 값도 실림.
- *   받을 칸에 못 담는 값을 잘라 담으면 없는 번호가 되므로(예: -5 → 4294967291) "없음"으로 둠.
- *   반환: 읽었으면 true 이고 *value_out 에 씀. 정수 타입이 아니거나, 음수거나, max_value 보다 크면 false 이고 *value_out 은 그대로
+/* ie_read_uint: 정수 IE 를 0 ~ max_value 로 읽음. 음수·상한 초과·정수 아님이면 false(*value_out 그대로).
+ *   이유: 확장 값을 칸에 잘라 담으면 없는 번호가 됨(예 -5 → 4294967291)
  */
 static bool ie_read_uint(const struct ie_view *ie, uint64_t max_value, uint64_t *value_out) {
     if (!ie->type || !ie->value || ie->type->op != &asn_OP_NativeInteger)
         return false;
-    // asn1c 는 범위에 따라 long 또는 unsigned long 으로 담고 설명표의 field_unsigned 로 알림. 예: UE ID(0..4294967295)는 unsigned long, C-RNTI·SRB ID 는 long
+    // long·unsigned long 중 무엇으로 담았는지는 field_unsigned 가 알림
     const asn_INTEGER_specifics_t *specifics = ie->type->specifics;
     bool is_unsigned = specifics && specifics->field_unsigned;
     uint64_t value = 0;
@@ -157,9 +146,8 @@ static bool ie_read_uint(const struct ie_view *ie, uint64_t max_value, uint64_t 
     return true;
 }
 
-/* nr_cgi_take: asn1c NRCGI 를 nr_cgi 로 옮김. 셀 번호는 5바이트를 앞에서부터 이어 붙인 뒤 미사용 4비트만큼 오른쪽으로 밂.
- *   PLMN 3바이트, 셀 번호 5바이트·끝 미사용 4비트일 때만 유효. 아니면 전부 0(ap.h 의 약속 — 반쯤 채운 값을 남기지 않음).
- *   이유: 문법상 두 길이는 고정이라 선로 바이트로는 늘 맞지만, asn1c 판이 바뀌어 담는 모양이 달라져도 버퍼 밖을 읽지 않도록 길이를 먼저 봄
+/* nr_cgi_take: NRCGI → nr_cgi. 셀 번호는 5바이트를 이어 붙여 미사용 4비트만큼 오른쪽으로. 길이가 맞을 때만 유효, 아니면 전부 0.
+ *   이유: asn1c 판이 바뀌어 담는 모양이 달라져도 버퍼 밖을 읽지 않게 길이부터 봄
  */
 static struct nr_cgi nr_cgi_take(const F1AP_NRCGI_t *f1ap_nr_cgi) {
     struct nr_cgi nr_cgi = {.is_valid = false};
@@ -181,10 +169,9 @@ static struct nr_cgi nr_cgi_take(const F1AP_NRCGI_t *f1ap_nr_cgi) {
     return nr_cgi;
 }
 
-/* take_ie: 최상위 IE 하나를 번호로 골라 f1ap_msg 에 채움(SRB ID 는 internal 에 읽어 둠). 꺼내지 않는 번호와 문법이 모르는 IE 는 지나감.
- *   이유: 같은 값이 CU 구현마다 다른 메시지에 실려(OCUDU·OAI), 메시지 종류가 아니라 IE 번호로 고름.
- *   정수는 ie_read_uint 로 범위를 보고, 범위 밖이면 그 값은 "없음"으로 둠. NR CGI 는 값 타입이 NRCGI 일 때만 읽음.
- *   같은 번호가 두 번 오면 뒤의 것이 남음(정수는 읽을 수 있는 값만)
+/* take_ie: 최상위 IE 하나를 번호로 골라 f1ap_msg 에 채움(SRB ID 는 internal). 꺼내지 않는 번호·값 없는 IE 는 지나감.
+ *   이유: 같은 값이 CU 구현마다 다른 메시지에 실려(OCUDU·OAI) 번호로 고름.
+ *   정수는 범위 밖이면 없음, NR CGI 는 타입이 NRCGI 일 때만. 같은 번호가 두 번 오면 뒤의 것(정수는 읽을 수 있는 값만)
  */
 static void take_ie(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, const struct ie_view *ie) {
     uint64_t value = 0;
@@ -237,11 +224,7 @@ static void msg_clear(struct f1ap_msg *f1ap_msg) {
     f1ap_msg->cause.value = -1;
 }
 
-/* f1ap_release: f1ap_parse 가 잡은 asn1c 트리, 결과 배열, 내부 상태를 해제.
- *   돌아온 뒤 rrc_containers·served_cells 와 그 안의 바이트 포인터는 무효(NULL·0 으로 바꿈).
- *   msg_name·cause 이름은 생성 코드의 고정 문자열이라 그대로 유효.
- *   f1ap_msg 가 NULL 이거나 해제할 것이 없으면 아무것도 하지 않음. 두 번 불러도 됨.
- */
+/* f1ap_release: 트리 → 결과 배열 → 내부 상태 순으로 풀고, f1ap_msg 의 포인터를 NULL·0 으로. 약속은 ap.h */
 void f1ap_release(struct f1ap_msg *f1ap_msg) {
     if (!f1ap_msg || !f1ap_msg->internal)
         return;
@@ -267,12 +250,8 @@ static enum f1ap_result parse_fail(struct f1ap_msg *f1ap_msg, enum f1ap_result r
     return result;
 }
 
-/* f1ap_parse: F1AP PDU 하나를 해석해 f1ap_msg 에 값을 채움.
- *   이유: Table I·II 와 탐지에 쓰는 값만 asn1c 타입 없이 넘겨, 위 층이 asn1c 를 몰라도 되게 함.
- *   순서: 입력 검사 → APER 디코드 → 꼬리 검사 → PDU 종류 → 절차 번호·메시지 이름 → IE 를 번호로 골라 채움.
- *   pdu_bytes 는 호출한 쪽 소유. 돌아온 뒤에는 쓰지 않음(필요한 바이트는 asn1c 트리에 복사됨).
- *   반환: F1AP_OK(뒤에 f1ap_release 로 해제) / F1AP_DECODE_FAILED / F1AP_UNKNOWN_MESSAGE / F1AP_NO_MEMORY.
- *   실패하면 f1ap_msg 는 값 없는 상태이고 해제할 것도 없음.
+/* f1ap_parse: 입력 검사 → APER 디코드 → 꼬리 검사 → PDU 종류 → 절차 번호·메시지 이름 → IE 를 번호로 골라 채움.
+ *   내부 상태를 잡은 뒤의 실패는 모두 parse_fail 로 끝냄. 약속(소유권·반환·실패 상태)은 ap.h
  */
 enum f1ap_result f1ap_parse(const uint8_t *pdu_bytes, size_t len, struct f1ap_msg *f1ap_msg) {
     if (!f1ap_msg)
@@ -314,7 +293,7 @@ enum f1ap_result f1ap_parse(const uint8_t *pdu_bytes, size_t len, struct f1ap_ms
         return parse_fail(f1ap_msg, F1AP_UNKNOWN_MESSAGE);
     }
 
-    // 세 갈래 모두 { procedureCode, criticality, value } 모양. 생성 코드의 멤버라 없으면 문법과 코드가 어긋난 것
+    // 세 갈래 모두 { procedureCode, criticality, value }. 없으면 생성 코드가 어긋난 것
     const asn_TYPE_member_t *procedure_code_member = member_by_name(outcome_member->type, "procedureCode");
     const asn_TYPE_member_t *value_member = member_by_name(outcome_member->type, "value");
     if (!procedure_code_member || !value_member)
