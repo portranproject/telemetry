@@ -67,6 +67,11 @@
 #define AMF_POINTER_BITS 6
 #define FIVEG_TMSI_BYTES 4
 
+// TransportLayerAddress 가 IP 주소일 때의 폭: IPv4(RFC 791), IPv6(RFC 8200) (TS 38.412 §6), IPv4+IPv6 (TS 38.413 §9.3.2.4 가 TS 38.414 로 넘김)
+#define IPV4_ADDRESS_BITS      32
+#define IPV6_ADDRESS_BITS      128
+#define IPV4_IPV6_ADDRESS_BITS 160
+
 // 결과 배열(NAS, TNL 주소, RESET UE)의 첫 칸 수
 #define ARRAY_FIRST_CAPACITY 4
 
@@ -487,6 +492,65 @@ static enum ngap_result item_nas_take(struct ngap_msg *ngap_msg, struct ngap_int
 	return NGAP_OK;
 }
 
+// tnla_take: TNL Association to Add(IE 6) / Remove(IE 7) List 의 IPv4 주소를 *ipv4_out 배열에 모음. 개수는 *count_out
+//
+//   항목의 주소 (CPTransportLayerInformation)
+//     endpointIPAddress                              주소만
+//     choice-Extensions: EndpointIPAddressAndPort    주소 + 포트 (IE 169). 주소만 담음
+//
+//   주소 = BIT STRING (SIZE(1..160, ...))
+//     폭(비트)    뜻                처리
+//     32          IPv4              담음. 비교 대상 cap_record.src_addr 가 IPv4
+//     128, 160    IPv6, IPv4+IPv6   담지 않음, 세지 않음
+//     그 외       IP 주소 아님      rejected_ie_count
+//
+//   폭 = size * 8 - bits_unused. size 만 보면 25비트 주소도 4옥텟이라 IPv4 로 읽힘
+//   capacity 가 지역 변수인 전제: IE 6, IE 7 은 seen_ie_mask 로 PDU 당 한 번만 옴 -> 배열은 이 호출 안에서만 자람
+//   반환: NGAP_OK / NGAP_NO_MEMORY (그때까지 모은 배열은 *ipv4_out 에 남음. 해제는 ngap_release)
+static enum ngap_result tnla_take(struct ngap_msg *ngap_msg, const struct ie_view *ie, uint32_t **ipv4_out, int *count_out) {
+	const asn_anonymous_sequence_ *item_list = _A_CSEQUENCE_FROM_VOID(ie->value);
+	const asn_TYPE_member_t *address_member = member_by_name(ie->type->elements[0].type, "aMF-TNLAssociationAddress");
+	if (!address_member || address_member->type != &asn_DEF_NGAP_CPTransportLayerInformation)
+		return NGAP_OK;
+	int capacity = 0;
+	for (int i = 0; i < item_list->count; i++) {
+		const void *item = item_list->array[i];
+		if (!item)
+			continue;
+		const NGAP_CPTransportLayerInformation_t *cp_transport_info = member_value_ptr(address_member, item);
+		if (!cp_transport_info)
+			continue;
+		const BIT_STRING_t *address = NULL;
+		if (cp_transport_info->present == NGAP_CPTransportLayerInformation_PR_endpointIPAddress) {
+			address = &cp_transport_info->choice.endpointIPAddress;
+		} else if (cp_transport_info->present == NGAP_CPTransportLayerInformation_PR_choice_Extensions && cp_transport_info->choice.choice_Extensions) {
+			// asn1c 는 이 CHOICE 의 choice-Extensions 를 NGAP_CPTransportLayerInformation_ExtIEs 로 생성 (ProtocolIE-SingleContainer 의 typedef)
+			const NGAP_CPTransportLayerInformation_ExtIEs_t *extension = (const void *)cp_transport_info->choice.choice_Extensions;
+			if (extension->value.present == NGAP_CPTransportLayerInformation_ExtIEs__value_PR_EndpointIPAddressAndPort)
+				address = &extension->value.choice.EndpointIPAddressAndPort.endpointIPAddress;
+		}
+		if (!address || !address->buf)
+			continue;
+		size_t address_bits = address->size * 8 - (size_t)address->bits_unused;
+		if (address_bits == IPV6_ADDRESS_BITS || address_bits == IPV4_IPV6_ADDRESS_BITS)
+			continue;
+		if (address_bits != IPV4_ADDRESS_BITS) {
+			ngap_msg->rejected_ie_count++;
+			continue;
+		}
+		if (*count_out == capacity) {
+			uint32_t *grown = array_grow(*ipv4_out, &capacity, sizeof(*grown));
+			if (!grown)
+				return NGAP_NO_MEMORY;
+			*ipv4_out = grown;
+		}
+		// 와이어 바이트 순서 그대로 (= cap_record.src_addr)
+		memcpy(&(*ipv4_out)[*count_out], address->buf, sizeof(uint32_t));
+		(*count_out)++;
+	}
+	return NGAP_OK;
+}
+
 // reset_take: ResetType(IE 88, NG RESET) -> reset_type, reset_ues. f1ap.c reset_take 와 같은 규칙
 //
 //   nG-Interface          reset-all 일 때만 RESET_TYPE_ALL. 모르는 확장값이면 RESET_TYPE_NONE (범위 모름) + rejected_ie_count
@@ -552,6 +616,8 @@ static const struct taken_ie {
 	{ NGAP_ProtocolIE_ID_id_AMFName,                           &asn_DEF_NGAP_AMFName },
 	{ NGAP_ProtocolIE_ID_id_ServedGUAMIList,                   &asn_DEF_NGAP_ServedGUAMIList },
 	{ NGAP_ProtocolIE_ID_id_UERetentionInformation,            &asn_DEF_NGAP_UERetentionInformation },
+	{ NGAP_ProtocolIE_ID_id_AMF_TNLAssociationToAddList,       &asn_DEF_NGAP_AMF_TNLAssociationToAddList },
+	{ NGAP_ProtocolIE_ID_id_AMF_TNLAssociationToRemoveList,    &asn_DEF_NGAP_AMF_TNLAssociationToRemoveList },
 };
 
 #define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
@@ -650,6 +716,16 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 	case NGAP_ProtocolIE_ID_id_UERetentionInformation:
 		ngap_msg->ue_contexts_retained = enum_read(ngap_msg, *(const NGAP_UERetentionInformation_t *)ie->value) == NGAP_UERetentionInformation_ues_retained;
 		break;
+	case NGAP_ProtocolIE_ID_id_AMF_TNLAssociationToAddList: {
+		enum ngap_result result = tnla_take(ngap_msg, ie, &internal->tnla_add_ipv4, &ngap_msg->tnla_add_count);
+		ngap_msg->tnla_add_ipv4 = internal->tnla_add_ipv4;
+		return result;
+	}
+	case NGAP_ProtocolIE_ID_id_AMF_TNLAssociationToRemoveList: {
+		enum ngap_result result = tnla_take(ngap_msg, ie, &internal->tnla_remove_ipv4, &ngap_msg->tnla_remove_count);
+		ngap_msg->tnla_remove_ipv4 = internal->tnla_remove_ipv4;
+		return result;
+	}
 	}
 	return NGAP_OK;
 }
