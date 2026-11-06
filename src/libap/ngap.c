@@ -618,6 +618,9 @@ static const struct taken_ie {
 	{ NGAP_ProtocolIE_ID_id_UERetentionInformation,            &asn_DEF_NGAP_UERetentionInformation },
 	{ NGAP_ProtocolIE_ID_id_AMF_TNLAssociationToAddList,       &asn_DEF_NGAP_AMF_TNLAssociationToAddList },
 	{ NGAP_ProtocolIE_ID_id_AMF_TNLAssociationToRemoveList,    &asn_DEF_NGAP_AMF_TNLAssociationToRemoveList },
+	{ NGAP_ProtocolIE_ID_id_RRCState,                                    &asn_DEF_NGAP_RRCState },
+	{ NGAP_ProtocolIE_ID_id_CoreNetworkAssistanceInformationForInactive, &asn_DEF_NGAP_CoreNetworkAssistanceInformationForInactive },
+	{ NGAP_ProtocolIE_ID_id_RRCInactiveTransitionReportRequest,          &asn_DEF_NGAP_RRCInactiveTransitionReportRequest },
 };
 
 #define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
@@ -725,6 +728,21 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 		enum ngap_result result = tnla_take(ngap_msg, ie, &internal->tnla_remove_ipv4, &ngap_msg->tnla_remove_count);
 		ngap_msg->tnla_remove_ipv4 = internal->tnla_remove_ipv4;
 		return result;
+	}
+
+	// [RRC INACTIVE 판정]
+	case NGAP_ProtocolIE_ID_id_RRCState:
+		ngap_msg->rrc_state = (int)enum_read(ngap_msg, *(const NGAP_RRCState_t *)ie->value);
+		break;
+	case NGAP_ProtocolIE_ID_id_CoreNetworkAssistanceInformationForInactive:
+		ngap_msg->core_network_assistance_present = true;
+		break;
+	// 보고를 요청하는 두 값일 때만 true. cancel-report 와 모르는 확장값은 요청 아님
+	case NGAP_ProtocolIE_ID_id_RRCInactiveTransitionReportRequest: {
+		long report_request = enum_read(ngap_msg, *(const NGAP_RRCInactiveTransitionReportRequest_t *)ie->value);
+		ngap_msg->inactive_report_requested = report_request == NGAP_RRCInactiveTransitionReportRequest_subsequent_state_transition_report
+			|| report_request == NGAP_RRCInactiveTransitionReportRequest_single_rrc_connected_state_report;
+		break;
 	}
 	}
 	return NGAP_OK;
