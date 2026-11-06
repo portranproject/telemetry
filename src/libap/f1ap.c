@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -9,6 +10,7 @@
 #include <F1AP_ProcedureCode.h>
 #include <F1AP_ProtocolIE-ID.h>
 #include <NativeInteger.h>
+#include <OCTET_STRING.h>
 #include <asn_SEQUENCE_OF.h>
 #include <constr_CHOICE.h>
 
@@ -26,6 +28,9 @@
 
 // SRBID ::= INTEGER (0..3, ..., 4 | 5) (TS 38.473). 이보다 크면 모르는 SRB 라 없음
 #define SRB_ID_MAX 5
+
+// RRC 컨테이너 배열을 처음 잡을 때 칸 수. 한 메시지에 보통 1~2개(INITIAL UL RRC 가 2개)라 늘리는 일이 거의 없게
+#define RRC_CONTAINER_FIRST_CAPACITY 4
 
 // MARK: - 자료구조
 
@@ -169,11 +174,39 @@ static struct nr_cgi nr_cgi_take(const F1AP_NRCGI_t *f1ap_nr_cgi) {
     return nr_cgi;
 }
 
+/* rrc_container_push: RRC 컨테이너 하나를 결과 배열 끝에 더함. 칸이 차면 2배로 늘림. 메모리 부족이면 false.
+ *   이유: 컨테이너 수는 메시지마다 달라 미리 정할 수 없음(같은 IE 가 여러 번 와도 모두 담음).
+ *   data 는 트리의 바이트를 빌림(복사 안 함). srb_id 는 -1 로 두고 IE 를 다 돈 뒤 f1ap_parse 가 붙임
+ */
+static bool rrc_container_push(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, int ie_id, const OCTET_STRING_t *octets) {
+    if (f1ap_msg->rrc_container_count == internal->rrc_container_capacity) {
+        if (internal->rrc_container_capacity > INT_MAX / 2)
+            return false; // 2배가 int 를 넘음. 입력 길이로는 닿지 않는 수
+        int new_capacity = internal->rrc_container_capacity == 0 ? RRC_CONTAINER_FIRST_CAPACITY : internal->rrc_container_capacity * 2;
+        struct f1ap_rrc_container *grown = realloc(internal->rrc_containers, (size_t)new_capacity * sizeof(*grown));
+        if (!grown)
+            return false;
+        internal->rrc_containers = grown;
+        internal->rrc_container_capacity = new_capacity;
+        f1ap_msg->rrc_containers = grown; // realloc 으로 자리가 옮겨질 수 있어 늘릴 때마다 다시 가리킴
+    }
+    internal->rrc_containers[f1ap_msg->rrc_container_count] = (struct f1ap_rrc_container){
+        .ie_id = ie_id,
+        .srb_id = -1,
+        .data = octets->buf,
+        .len = octets->size,
+    };
+    f1ap_msg->rrc_container_count++;
+    return true;
+}
+
 /* take_ie: 최상위 IE 하나를 번호로 골라 f1ap_msg 에 채움(SRB ID 는 internal). 꺼내지 않는 번호·값 없는 IE 는 지나감.
  *   이유: 같은 값이 CU 구현마다 다른 메시지에 실려(OCUDU·OAI) 번호로 고름.
- *   정수는 범위 밖이면 없음, NR CGI 는 타입이 NRCGI 일 때만. 같은 번호가 두 번 오면 뒤의 것(정수는 읽을 수 있는 값만)
+ *   정수는 범위 밖이면 없음, NR CGI 는 타입이 NRCGI 일 때만. 같은 번호가 두 번 오면 뒤의 것(정수는 읽을 수 있는 값만).
+ *   RRC 컨테이너는 같은 번호가 여러 번 와도 모두 담음.
+ *   반환: F1AP_OK / F1AP_NO_MEMORY(컨테이너 배열을 늘리지 못함)
  */
-static void take_ie(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, const struct ie_view *ie) {
+static enum f1ap_result take_ie(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, const struct ie_view *ie) {
     uint64_t value = 0;
     switch (ie->id) {
     case F1AP_ProtocolIE_ID_id_gNB_CU_UE_F1AP_ID:
@@ -210,9 +243,20 @@ static void take_ie(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, c
         if (ie->type == &asn_DEF_F1AP_NRCGI)
             f1ap_msg->nr_cgi = nr_cgi_take(ie->value);
         break;
+    case F1AP_ProtocolIE_ID_id_RRCContainer:
+    case F1AP_ProtocolIE_ID_id_RRCContainer_RRCSetupComplete:
+    case F1AP_ProtocolIE_ID_id_DUtoCURRCContainer:
+        if (!ie->type || ie->type->op != &asn_OP_OCTET_STRING)
+            break; // 바이트 열(OCTET STRING)이 아니면 담는 모양을 모름
+        if (!rrc_container_push(f1ap_msg, internal, (int)ie->id, ie->value))
+            return F1AP_NO_MEMORY;
+        if (ie->id == F1AP_ProtocolIE_ID_id_DUtoCURRCContainer)
+            f1ap_msg->has_du_to_cu_rrc_container = true;
+        break;
     default:
         break; // 꺼내지 않는 IE
     }
+    return F1AP_OK;
 }
 
 // MARK: - 해석
@@ -250,7 +294,7 @@ static enum f1ap_result parse_fail(struct f1ap_msg *f1ap_msg, enum f1ap_result r
     return result;
 }
 
-/* f1ap_parse: 입력 검사 → APER 디코드 → 꼬리 검사 → PDU 종류 → 절차 번호·메시지 이름 → IE 를 번호로 골라 채움.
+/* f1ap_parse: 입력 검사 → APER 디코드 → 꼬리 검사 → PDU 종류 → 절차 번호·메시지 이름 → IE 를 번호로 골라 채움 → RRC 컨테이너에 SRB ID.
  *   내부 상태를 잡은 뒤의 실패는 모두 parse_fail 로 끝냄. 약속(소유권·반환·실패 상태)은 ap.h
  */
 enum f1ap_result f1ap_parse(const uint8_t *pdu_bytes, size_t len, struct f1ap_msg *f1ap_msg) {
@@ -321,8 +365,18 @@ enum f1ap_result f1ap_parse(const uint8_t *pdu_bytes, size_t len, struct f1ap_ms
     int ie_count = _A_CSEQUENCE_FROM_VOID(ie_list)->count;
     for (int i = 0; i < ie_count; i++) {
         struct ie_view ie;
-        if (ie_at(ie_list_member->type, ie_list, i, &ie))
-            take_ie(f1ap_msg, internal, &ie);
+        if (!ie_at(ie_list_member->type, ie_list, i, &ie))
+            continue;
+        enum f1ap_result result = take_ie(f1ap_msg, internal, &ie);
+        if (result != F1AP_OK)
+            return parse_fail(f1ap_msg, result);
+    }
+
+    // SRB ID IE 가 컨테이너보다 뒤에 올 수 있어 IE 를 다 돈 뒤 붙임. DU to CU 컨테이너는 RRC 메시지가 아니라 붙이지 않음
+    for (int i = 0; i < f1ap_msg->rrc_container_count; i++) {
+        bool is_rrc_message = internal->rrc_containers[i].ie_id != F1AP_ProtocolIE_ID_id_DUtoCURRCContainer;
+        if (internal->has_srb_id && is_rrc_message)
+            internal->rrc_containers[i].srb_id = internal->srb_id;
     }
     return F1AP_OK;
 }

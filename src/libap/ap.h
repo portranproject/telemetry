@@ -105,6 +105,8 @@ struct f1ap_msg {
  *   pdu_bytes 는 빌려 씀(돌아온 뒤 안 씀). 남는 바이트가 있으면 실패(F1AP_DECODE_FAILED).
  *   반환: F1AP_OK / F1AP_DECODE_FAILED / F1AP_UNKNOWN_MESSAGE / F1AP_NO_MEMORY.
  *   실패하면 값 없는 상태(has_… false, 개수 0, cause.group·value -1)이고 해제할 것 없음. f1ap_release 는 결과와 상관없이 불러도 됨.
+ *   성공한 결과가 든 f1ap_msg 는 f1ap_release 한 뒤 다시 넘길 것(시작할 때 덮어써 앞 트리가 누수). 복사본을 따로 해제하면 두 번 해제.
+ *   스레드: 한 번에 한 스레드만. asn1c 디코더가 모르는 IE·ENUMERATED 값을 만나면 잠금 없는 전역 계수기를 올림(asn1/asn1_glue.c).
  */
 enum f1ap_result f1ap_parse(const uint8_t *pdu_bytes, size_t len, struct f1ap_msg *f1ap_msg);
 
