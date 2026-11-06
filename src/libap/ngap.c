@@ -66,6 +66,9 @@
 // 결과 배열(NAS, TNL 주소, RESET UE)의 첫 칸 수
 #define ARRAY_FIRST_CAPACITY 4
 
+// NRCellIdentity ::= BIT STRING (SIZE(36)) (TS 38.413 §9.3.1.7)
+#define NR_CELL_IDENTITY_BITS 36
+
 // asn1c 가 모르는 open type 을 버릴 때마다 +1 
 // TODO: libap 밖 의존. 정의는 asn1/asn1_glue.c (libasn1skel.a 에 링크) 확인 가능 
 extern unsigned long asn_portran_opentype_skipped_count;
@@ -249,6 +252,30 @@ static bool bits_read(const BIT_STRING_t *bits, unsigned bit_count, uint64_t *va
 	return true;
 }
 
+// enum_read: 확장 가능한 열거형 값을 그대로 돌려줌. 이 문법이 모르는 확장값이면 -1 (asn1c 패치 04) + rejected_ie_count
+//   쓰는 자리: 값이 -1 이면 결과가 'IE 없음' 과 같아지는 다섯 곳 (IE 90, 92, 91, 147, ResetAll)
+//   Cause, Overload Action 은 is_present, overload_response_present 가 따로 있어 세지 않음
+static long enum_read(struct ngap_msg *ngap_msg, long enum_value) {
+	if (enum_value < 0)
+		ngap_msg->rejected_ie_count++;
+	return enum_value;
+}
+
+// nr_cgi_take: NR-CGI -> nr_cgi. 길이가 맞을 때만 유효, 아니면 전부 0.
+static struct nr_cgi nr_cgi_take(const NGAP_NR_CGI_t *ngap_nr_cgi) {
+	struct nr_cgi nr_cgi = {.is_valid = false};
+	const OCTET_STRING_t *plmn = &ngap_nr_cgi->pLMNIdentity;
+	uint64_t nr_cell_identity = 0;
+	// PLMNIdentity ::= OCTET STRING (SIZE(3))
+	bool is_plmn_valid = plmn->buf && plmn->size == sizeof(nr_cgi.plmn_identity);
+	if (!is_plmn_valid || !bits_read(&ngap_nr_cgi->nRCellIdentity, NR_CELL_IDENTITY_BITS, &nr_cell_identity))
+		return nr_cgi;
+	memcpy(nr_cgi.plmn_identity, plmn->buf, sizeof(nr_cgi.plmn_identity));
+	nr_cgi.nr_cell_identity = nr_cell_identity;
+	nr_cgi.is_valid = true;
+	return nr_cgi;
+}
+
 // ue_ngap_ids_take: UE-NGAP-IDs(IE 114, UE CONTEXT RELEASE COMMAND)의 AMF 쪽, RAN 쪽 ID
 //   AMF ID 단독, 또는 짝(AMF ID + RAN ID). 짝의 AMF ID 가 범위 밖이어도 RAN ID 는 담음
 //   IE 10, IE 85 와 같은 메시지에 실리지 않음 (15.8.0 에서 IE 114 는 이 메시지에만) -> 앞 값을 덮을 일 없음
@@ -368,6 +395,9 @@ static const struct taken_ie {
 	{ NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListCxtReq, &asn_DEF_NGAP_PDUSessionResourceSetupListCxtReq },
 	{ NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListSUReq,  &asn_DEF_NGAP_PDUSessionResourceSetupListSUReq },
 	{ NGAP_ProtocolIE_ID_id_PDUSessionResourceModifyListModReq, &asn_DEF_NGAP_PDUSessionResourceModifyListModReq },
+	{ NGAP_ProtocolIE_ID_id_RRCEstablishmentCause,   &asn_DEF_NGAP_RRCEstablishmentCause },
+	{ NGAP_ProtocolIE_ID_id_UserLocationInformation, &asn_DEF_NGAP_UserLocationInformation },
+
 };
 
 #define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
@@ -421,6 +451,17 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 	case NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListSUReq:
 	case NGAP_ProtocolIE_ID_id_PDUSessionResourceModifyListModReq:
 		return item_nas_take(ngap_msg, internal, ie);
+	// 모르는 확장값(mo-ExceptionData 등)이면 -1
+	case NGAP_ProtocolIE_ID_id_RRCEstablishmentCause:
+		ngap_msg->rrc_establishment_cause = (int)enum_read(ngap_msg, *(const NGAP_RRCEstablishmentCause_t *)ie->value);
+		break;
+	// NR 위치일 때만. E-UTRA, N3IWF 면 is_valid = false 유지
+	case NGAP_ProtocolIE_ID_id_UserLocationInformation: {
+		const NGAP_UserLocationInformation_t *user_location = ie->value;
+		if (user_location->present == NGAP_UserLocationInformation_PR_userLocationInformationNR && user_location->choice.userLocationInformationNR)
+			ngap_msg->uli_nr_cgi = nr_cgi_take(&user_location->choice.userLocationInformationNR->nR_CGI);
+		break;
+	}
 	}
 	return NGAP_OK;
 }
