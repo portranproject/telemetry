@@ -593,7 +593,7 @@ static void fragment_evict(struct sctp_ctx *ctx, struct reassembly_queue *queue,
  *   같은 메시지의 조각 = TSN 이 1 씩 이어지고, 스트림이 같고, 순서를 지키는 메시지(U 없음)면 SSN 도 같음 (RFC 9260 §3.3.1).
  *   처리 순서는 본문의 1)~4). 다 모이지 않았으면 조각만 보관하고, 나머지 조각이 오면 그때 다시 봄.
  *   chunk 와 record 는 호출한 쪽 소유. 전달하는 메시지의 data 는 reassembly_buf 를 가리키며 콜백 안에서만 유효.
- *   함께 바뀌는 것: queue, ctx 의 reassembly_buf·통계(fragment_evicted_count, reassembled_count), on_message 호출.
+ *   함께 바뀌는 것: queue, ctx 의 reassembly_buf·통계(fragment_evicted_count, reassembled_count, alloc_failed_drop_count), on_message 호출.
  */
 static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, const struct cap_record *record,
                          uint32_t assoc_id, const struct data_chunk *chunk) {
@@ -605,8 +605,10 @@ static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, c
     fragment_evict(ctx, queue, record->capture_time_ns, chunk->len);
 
     struct fragment *added = malloc(sizeof(*added) + chunk->len);
-    if (!added)
-        return; // 메모리 부족. 이 조각을 버리므로 그 메시지는 조립되지 않음
+    if (!added) {
+        ctx->stats.alloc_failed_drop_count++; // 메모리 부족. 이 조각을 버리므로 그 메시지는 조립되지 않음
+        return;
+    }
     added->received_time_ns = record->capture_time_ns;
     added->tsn = chunk->tsn;
     added->ppid = chunk->ppid;
@@ -672,8 +674,14 @@ static void fragment_add(struct sctp_ctx *ctx, struct reassembly_queue *queue, c
     // 4) 이어 붙이기. message_len 은 보관 합계 이하라 FRAGMENT_MAX_BYTES 를 넘지 않음
     if (message_len > ctx->reassembly_buf_bytes) {
         uint8_t *grown = realloc(ctx->reassembly_buf, message_len);
-        if (!grown)
-            return; // 메모리 부족. 조각은 남겨 두므로 시간 초과·상한 정리로 반납됨
+        if (!grown) {
+            // 메모리 부족. 이 조각들은 다시 조립될 길이 없어(TSN 을 이미 봤다고 적어 재전송도 버림) 바로 반납.
+            // 범위는 2) 에서 찾은 구간(segment_link 부터 piece_count 개). 실패한 realloc 은 기존 reassembly_buf 를 그대로 둠
+            ctx->stats.alloc_failed_drop_count++;
+            for (uint16_t i = 0; i < piece_count; i++)
+                fragment_remove(queue, segment_link);
+            return;
+        }
         ctx->reassembly_buf = grown;
         ctx->reassembly_buf_bytes = message_len;
     }

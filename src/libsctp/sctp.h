@@ -58,9 +58,10 @@ struct sctp_stats {
     uint64_t partial_chunk_count;
 
     // 단편
-    uint64_t fragment_chunk_count;   // 메시지 일부만 담은 DATA 청크(B·E 중 하나 이상 꺼짐)
-    uint64_t reassembled_count;      // 조각을 모아 완성한 메시지
-    uint64_t fragment_evicted_count; // 유효 시간·메모리 상한 때문에 버린 조각
+    uint64_t fragment_chunk_count;    // 메시지 일부만 담은 DATA 청크(B·E 중 하나 이상 꺼짐)
+    uint64_t reassembled_count;       // 조각을 모아 완성한 메시지
+    uint64_t fragment_evicted_count;  // 유효 시간·메모리 상한 때문에 버린 조각
+    uint64_t alloc_failed_drop_count; // 메모리 할당 실패로 조각 보관·조립을 포기한 횟수. 규칙으로 버린 조각(위)과 원인을 가름. 메시지 수가 아님
 
     // 전달
     uint64_t message_count; // 콜백으로 넘긴 메시지
