@@ -1,3 +1,80 @@
+/**
+ * ngap.c
+ * : NGAP PDU 한 개 디코드 -> 지표에 쓰는 값만 struct ngap_msg 로 전달 (TS 38.413 V15.8.0, APER, asn1c)
+ *
+ * [1] 흐름
+ *
+ *   ngap_parse(pdu_bytes, len, ngap_msg)        libsctp 가 재조립한 PPID 60 메시지 한 개
+ *     |         인자 NULL, len 0             -> NGAP_DECODE_FAILED
+ *     |         내부 상태 할당 실패          -> NGAP_NO_MEMORY
+ *     |
+ *     +---- 1. aper_decode_complete             asn1c 트리 생성 (힙, ngap_internal 소유)
+ *     |         디코드 실패, 남는 바이트     -> NGAP_DECODE_FAILED
+ *     |         문법이 모르는 IE             -> 버림 + unknown_ie_count
+ *     |
+ *     +---- 2. PDU 종류, 절차 번호, 본체     -> pdu_type, procedure_code, msg_name
+ *     |         문법에 없는 (절차, PDU 종류) -> NGAP_UNKNOWN_MESSAGE
+ *     |
+ *     +---- 3. IE 목록: ie_at -> ie_take
+ *               담는 24종 아님               -> 건너뜀
+ *               같은 IE 재등장               -> 건너뜀 + duplicate_ie_count
+ *               값이 규격 범위 밖            -> 담지 않음 + rejected_ie_count
+ *               그 외                        -> ngap_msg 필드
+ *               배열 할당 실패               -> NGAP_NO_MEMORY
+ *
+ *   ngap_internal 을 잡은 뒤의 실패 반환은 전부 parse_fail 경유: 잡은 것 해제 + ngap_msg 를 값 없는 상태로
+ *   ngap_release(ngap_msg)                      트리, 배열 해제. ngap_msg 의 해당 포인터는 NULL
+ *
+ * [2] 담는 범위
+ *
+ *   절차 53개(메시지 79종) -> 이름 79종 전부. 메시지별 코드 없이 asn1c 설명표에서 얻음
+ *   IE 174개(최상위 137종) -> 아래 24종만. 지표와 탐지가 읽는 값
+ *
+ *   UE 식별
+ *     RAN-UE-NGAP-ID (85)     ran_ue_ngap_id
+ *     AMF-UE-NGAP-ID (10)     amf_ue_ngap_id
+ *     UE-NGAP-IDs (114)       amf_ue_ngap_id, ran_ue_ngap_id
+ *     NewAMF-UE-NGAP-ID (40)  new_amf_ue_ngap_id
+ *     5G-S-TMSI (26)          stmsi48
+ *
+ *   F1과 대응
+ *     NAS-PDU (38)                             nas_ies
+ *     PDUSessionResourceSetupListCxtReq (71)   nas_ies, from_pdu_session_item = true
+ *     PDUSessionResourceSetupListSUReq (74)    위와 같음
+ *     PDUSessionResourceModifyListModReq (64)  위와 같음
+ *     RRCEstablishmentCause (90)               rrc_establishment_cause
+ *     UserLocationInformation (121)            uli_nr_cgi
+ *
+ *   연결 수명
+ *     Cause (15)      cause
+ *     ResetType (88)  reset_type, reset_ues
+ *
+ *   AMF 상태
+ *     AMFOverloadResponse (2)                overload_response_present, overload_action_mask
+ *     AMFTrafficLoadReductionIndication (9)  traffic_load_reduction_percent
+ *     OverloadStartNSSAIList (49)            overload_nssai_list_present
+ *     AMFName (1)                            amf_name, amf_name_len
+ *     ServedGUAMIList (96)                   guami_digest
+ *     UERetentionInformation (147)           ue_contexts_retained
+ *     AMF-TNLAssociationToAddList (6)        tnla_add_ipv4
+ *     AMF-TNLAssociationToRemoveList (7)     tnla_remove_ipv4
+ *
+ *   RRC INACTIVE 판정
+ *     RRCState (92)                                     rrc_state
+ *     CoreNetworkAssistanceInformationForInactive (18)  core_network_assistance_present
+ *     RRCInactiveTransitionReportRequest (91)           inactive_report_requested
+ *
+ *   담지 않는 것
+ *     SecurityKey (94), SecurityContext (93) 의 NH, MaskedIMEISV (34)
+ *       비밀값과 영구 단말 식별자. 지표에 불필요 -> ngap_msg 에 필드 자체가 없음
+ *     핸드오버 투명 컨테이너 (101, 106) 안의 RRCContainer, UERadioCapability (117)
+ *       UE 로 가는 RRC 는 F1 의 RRC-Container 로 관측. 능력 정보는 지표에 불필요
+ *     HandoverRequest 의 NASC (37)
+ *       NAS 메시지가 아님 (TS 38.413 §9.2.3.4) -> libnas 대상 아님
+ *
+ *   NAS 내용은 바이트만 nas_ies 로 전달. 해석은 libnas 에서 진행
+ */
+
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
