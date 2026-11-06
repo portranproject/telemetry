@@ -58,6 +58,11 @@
 // AMF-UE-NGAP-ID ::= INTEGER (0..1099511627775) (TS 38.413 §9.3.3.1). 40비트.
 #define AMF_UE_NGAP_ID_MAX ((1ull << 40) - 1)
 
+// FiveG-S-TMSI 의 세 필드: AMFSetID BIT STRING (SIZE(10)), AMFPointer BIT STRING (SIZE(6)), FiveG-TMSI OCTET STRING (SIZE(4)) (TS 38.413 §9.3.3.20)
+#define AMF_SET_ID_BITS  10
+#define AMF_POINTER_BITS 6
+#define FIVEG_TMSI_BYTES 4
+
 // asn1c 가 모르는 open type 을 버릴 때마다 +1 
 // TODO: libap 밖 의존. 정의는 asn1/asn1_glue.c (libasn1skel.a 에 링크) 확인 가능 
 extern unsigned long asn_portran_opentype_skipped_count;
@@ -225,6 +230,22 @@ static bool ran_ue_ngap_id_read(const NGAP_RAN_UE_NGAP_ID_t *ran_ue_ngap_id, uin
 	return true;
 }
 
+// bits_read: BIT STRING(64비트 이하) -> 정수. 첫 비트가 최상위. 바이트 수, 미사용 비트 수가 bit_count 와 맞을 때만 true
+//
+//   AMF Set ID 10비트: 2바이트, 끝 6비트 미사용
+//   buf   [ b0 ][ b1: 위 2비트만 유효 ]      value = (b0 b1) >> 6
+static bool bits_read(const BIT_STRING_t *bits, unsigned bit_count, uint64_t *value_out) {
+	size_t byte_count = (bit_count + 7) / 8;
+	int unused_bits = (int)(byte_count * 8 - bit_count);
+	if (!bits->buf || bits->size != byte_count || bits->bits_unused != unused_bits)
+		return false;
+	uint64_t uint_value = 0;
+	for (size_t i = 0; i < byte_count; i++)
+		uint_value = (uint_value << 8) | bits->buf[i];
+	*value_out = uint_value >> unused_bits;
+	return true;
+}
+
 // ue_ngap_ids_take: UE-NGAP-IDs(IE 114, UE CONTEXT RELEASE COMMAND)의 AMF 쪽, RAN 쪽 ID
 //   AMF ID 단독, 또는 짝(AMF ID + RAN ID). 짝의 AMF ID 가 범위 밖이어도 RAN ID 는 담음
 //   IE 10, IE 85 와 같은 메시지에 실리지 않음 (15.8.0 에서 IE 114 는 이 메시지에만) -> 앞 값을 덮을 일 없음
@@ -246,6 +267,34 @@ static void ue_ngap_ids_take(struct ngap_msg *ngap_msg, const NGAP_UE_NGAP_IDs_t
 	}
 }
 
+// stmsi48_take: 5G-S-TMSI(IE 26)의 세 필드를 48비트 하나로 이음 (TS 23.003 §2.10.1)
+//
+//   47            38 37         32 31                             0
+//   +---------------+-------------+--------------------------------+
+//   | AMF Set ID 10 | AMF Ptr 6   | 5G-TMSI 32                     |
+//   +---------------+-------------+--------------------------------+
+//
+//   RRC 의 ng-5G-S-TMSI(BIT STRING 48)와 같은 값 -> F1 쪽 레코드와 그대로 비교 가능
+//   세 필드의 크기는 문법에 고정. 어긋나 있으면 담지 않음 + rejected_ie_count
+static void stmsi48_take(struct ngap_msg *ngap_msg, const NGAP_FiveG_S_TMSI_t *fiveg_s_tmsi) {
+	const OCTET_STRING_t *fiveg_tmsi_octets = &fiveg_s_tmsi->fiveG_TMSI;
+	uint64_t amf_set_id = 0;
+	uint64_t amf_pointer = 0;
+	bool is_valid = bits_read(&fiveg_s_tmsi->aMFSetID, AMF_SET_ID_BITS, &amf_set_id)
+		&& bits_read(&fiveg_s_tmsi->aMFPointer, AMF_POINTER_BITS, &amf_pointer)
+		&& fiveg_tmsi_octets->buf
+		&& fiveg_tmsi_octets->size == FIVEG_TMSI_BYTES;
+	if (!is_valid) {
+		ngap_msg->rejected_ie_count++;
+		return;
+	}
+	uint64_t fiveg_tmsi = 0;
+	for (size_t i = 0; i < FIVEG_TMSI_BYTES; i++)
+		fiveg_tmsi = (fiveg_tmsi << 8) | fiveg_tmsi_octets->buf[i];
+	ngap_msg->stmsi48 = (amf_set_id << 38) | (amf_pointer << 32) | fiveg_tmsi;
+	ngap_msg->has_stmsi48 = true;
+}
+
 // TAKEN_IES: 담는 IE 표. IE 번호 -> 값 타입 (머리 주석 [2] 의 표와 같은 순서)
 static const struct taken_ie {
 	long id;
@@ -255,6 +304,7 @@ static const struct taken_ie {
 	{ NGAP_ProtocolIE_ID_id_AMF_UE_NGAP_ID,    &asn_DEF_NGAP_AMF_UE_NGAP_ID },
 	{ NGAP_ProtocolIE_ID_id_UE_NGAP_IDs,       &asn_DEF_NGAP_UE_NGAP_IDs },
 	{ NGAP_ProtocolIE_ID_id_NewAMF_UE_NGAP_ID, &asn_DEF_NGAP_AMF_UE_NGAP_ID },
+	{ NGAP_ProtocolIE_ID_id_FiveG_S_TMSI,      &asn_DEF_NGAP_FiveG_S_TMSI },
 };
 
 #define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
@@ -296,6 +346,9 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 	// UE CONTEXT MODIFICATION REQUEST: 이 UE 의 AMF 쪽 ID 변경 (TS 38.413 §8.3.4.2)
 	case NGAP_ProtocolIE_ID_id_NewAMF_UE_NGAP_ID:
 		ngap_msg->has_new_amf_ue_ngap_id = amf_ue_ngap_id_read(ngap_msg, ie->value, &ngap_msg->new_amf_ue_ngap_id);
+		break;
+	case NGAP_ProtocolIE_ID_id_FiveG_S_TMSI:
+		stmsi48_take(ngap_msg, ie->value);
 		break;
 	}
 	return NGAP_OK;
