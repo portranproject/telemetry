@@ -58,6 +58,10 @@
 // AMF-UE-NGAP-ID ::= INTEGER (0..1099511627775) (TS 38.413 §9.3.3.1). 40비트.
 #define AMF_UE_NGAP_ID_MAX ((1ull << 40) - 1)
 
+// TrafficLoadReductionIndication ::= INTEGER (1..99) (TS 38.413 §9.3.1.106). 필드 폭 7비트 -> 디코더는 128 까지 통과시킴
+#define TRAFFIC_LOAD_REDUCTION_PERCENT_MIN 1
+#define TRAFFIC_LOAD_REDUCTION_PERCENT_MAX 99
+
 // FiveG-S-TMSI 의 세 필드: AMFSetID BIT STRING (SIZE(10)), AMFPointer BIT STRING (SIZE(6)), FiveG-TMSI OCTET STRING (SIZE(4)) (TS 38.413 §9.3.3.20)
 #define AMF_SET_ID_BITS  10
 #define AMF_POINTER_BITS 6
@@ -352,6 +356,17 @@ static void stmsi48_take(struct ngap_msg *ngap_msg, const NGAP_FiveG_S_TMSI_t *f
 	ngap_msg->has_stmsi48 = true;
 }
 
+// overload_response_take: AMF Overload Response(IE 2)의 조치를 비트 하나로. 조치 순번 n -> 1 << n
+//   overload_response_present = IE 가 있었음. 모르는 확장 조치면 마스크 0
+static void overload_response_take(struct ngap_msg *ngap_msg, const NGAP_OverloadResponse_t *overload_response) {
+	ngap_msg->overload_response_present = true;
+	if (overload_response->present != NGAP_OverloadResponse_PR_overloadAction)
+		return;
+	long overload_action = overload_response->choice.overloadAction;
+	if (overload_action >= 0 && overload_action < 32)
+		ngap_msg->overload_action_mask = 1u << overload_action;
+}
+
 // array_grow: 결과 배열을 늘림. 처음이면 ARRAY_FIRST_CAPACITY 칸, 아니면 2배. 실패하면 NULL(array, *capacity 그대로).
 //   개수가 칸 수에 닿았을 때 호출. realloc 으로 자리가 옮겨질 수 있어 호출한 쪽이 포인터를 다시 가리킴
 static void *array_grow(void *array, int *capacity, size_t element_bytes) {
@@ -467,6 +482,9 @@ static const struct taken_ie {
 	{ NGAP_ProtocolIE_ID_id_UserLocationInformation, &asn_DEF_NGAP_UserLocationInformation },
 	{ NGAP_ProtocolIE_ID_id_Cause,     &asn_DEF_NGAP_Cause },
 	{ NGAP_ProtocolIE_ID_id_ResetType, &asn_DEF_NGAP_ResetType },
+	{ NGAP_ProtocolIE_ID_id_AMFOverloadResponse,               &asn_DEF_NGAP_OverloadResponse },
+	{ NGAP_ProtocolIE_ID_id_AMFTrafficLoadReductionIndication, &asn_DEF_NGAP_TrafficLoadReductionIndication },
+	{ NGAP_ProtocolIE_ID_id_OverloadStartNSSAIList,            &asn_DEF_NGAP_OverloadStartNSSAIList },
 };
 
 #define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
@@ -538,6 +556,24 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 		break;
 	case NGAP_ProtocolIE_ID_id_ResetType:
 		return reset_take(ngap_msg, internal, ie->value);
+
+	// [AMF 상태]
+	case NGAP_ProtocolIE_ID_id_AMFOverloadResponse:
+		overload_response_take(ngap_msg, ie->value);
+		break;
+	case NGAP_ProtocolIE_ID_id_AMFTrafficLoadReductionIndication: {
+		uint64_t traffic_load_reduction_percent = 0;
+		bool is_in_range = ie_read_uint(ie, TRAFFIC_LOAD_REDUCTION_PERCENT_MAX, &traffic_load_reduction_percent)
+			&& traffic_load_reduction_percent >= TRAFFIC_LOAD_REDUCTION_PERCENT_MIN;
+		if (is_in_range)
+			ngap_msg->traffic_load_reduction_percent = (int)traffic_load_reduction_percent;
+		else
+			ngap_msg->rejected_ie_count++;
+		break;
+	}
+	case NGAP_ProtocolIE_ID_id_OverloadStartNSSAIList:
+		ngap_msg->overload_nssai_list_present = true;
+		break;
 	}
 	return NGAP_OK;
 }
