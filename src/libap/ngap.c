@@ -70,6 +70,11 @@
 // 결과 배열(NAS, TNL 주소, RESET UE)의 첫 칸 수
 #define ARRAY_FIRST_CAPACITY 4
 
+// guami_digest_take 의 해시 상수. 식과 prime 은 FNV-1a(Fowler-Noll-Vo) 64비트
+//   SEED 는 표준 시작값 14695981039346656037 에서 끝자리 7 이 빠진 값. 같은지만 비교하므로 영향 없음 -> 기존 출력 유지
+#define GUAMI_DIGEST_SEED 1469598103934665603ull
+#define FNV1A64_PRIME 1099511628211ull
+
 // NRCellIdentity ::= BIT STRING (SIZE(36)) (TS 38.413 §9.3.1.7)
 #define NR_CELL_IDENTITY_BITS 36
 
@@ -367,6 +372,65 @@ static void overload_response_take(struct ngap_msg *ngap_msg, const NGAP_Overloa
 		ngap_msg->overload_action_mask = 1u << overload_action;
 }
 
+// amf_name_take: AMF Name(IE 1). 길이는 amf_name_len (asn1c 가 끝에 NUL 을 붙이나 약속 아님)
+//   APER 디코더는 PrintableString 의 알파벳, 크기 미검사 -> asn1c 가 생성한 제약 함수로 검사 (TS 38.413 §9.3.3.21)
+//   실패 -> 담지 않음 + rejected_ie_count. 151옥텟 이상도 거부 (와이어로는 적법, 제약 함수는 1..150 만 수용)
+static void amf_name_take(struct ngap_msg *ngap_msg, const OCTET_STRING_t *octets) {
+	if (!octets->buf || NGAP_AMFName_constraint(&asn_DEF_NGAP_AMFName, octets, NULL, NULL) != 0) {
+		ngap_msg->rejected_ie_count++;
+		return;
+	}
+	ngap_msg->amf_name = (const char *)octets->buf;
+	ngap_msg->amf_name_len = octets->size;
+}
+
+// fnv_bytes: hash 에 바이트열을 섞음. 바이트마다 xor 후 prime 곱
+static uint64_t fnv_bytes(uint64_t hash, const uint8_t *bytes, size_t byte_count) {
+	for (size_t i = 0; i < byte_count; i++) {
+		hash ^= bytes[i];
+		hash *= FNV1A64_PRIME;
+	}
+	return hash;
+}
+
+// fnv_bits: hash 에 BIT STRING 을 섞음. 바이트열 뒤에 미사용 비트 수도 섞어 길이가 다른 비트열을 구별
+static uint64_t fnv_bits(uint64_t hash, const BIT_STRING_t *bits) {
+	if (!bits->buf)
+		return hash;
+	hash = fnv_bytes(hash, bits->buf, bits->size);
+	uint8_t unused_bits = (uint8_t)bits->bits_unused;
+	return fnv_bytes(hash, &unused_bits, 1);
+}
+
+// guami_digest_take: Served GUAMI List(IE 96) -> 64비트 요약값. 쓰임이 '같은 AMF 인가' 비교뿐이라 목록은 미보관
+//   항목마다 아래 바이트를 차례로 해시에 넣음
+//
+//     PLMN            3옥텟
+//     AMF Region ID   1옥텟 + bits_unused(0)
+//     AMF Set ID      2옥텟 + bits_unused(6)
+//     AMF Pointer     1옥텟 + bits_unused(2)
+//     0x7C            항목 경계
+//
+//   항목 순서가 바뀌면 값도 바뀜
+static void guami_digest_take(struct ngap_msg *ngap_msg, const NGAP_ServedGUAMIList_t *guami_list) {
+	uint64_t guami_digest = GUAMI_DIGEST_SEED;
+	const uint8_t item_boundary = 0x7C;
+	for (int i = 0; i < guami_list->list.count; i++) {
+		const NGAP_ServedGUAMIItem_t *guami_item = guami_list->list.array[i];
+		if (!guami_item)
+			continue;
+		const NGAP_GUAMI_t *guami = &guami_item->gUAMI;
+		if (guami->pLMNIdentity.buf)
+			guami_digest = fnv_bytes(guami_digest, guami->pLMNIdentity.buf, guami->pLMNIdentity.size);
+		guami_digest = fnv_bits(guami_digest, &guami->aMFRegionID);
+		guami_digest = fnv_bits(guami_digest, &guami->aMFSetID);
+		guami_digest = fnv_bits(guami_digest, &guami->aMFPointer);
+		guami_digest = fnv_bytes(guami_digest, &item_boundary, 1);
+	}
+	ngap_msg->guami_digest = guami_digest;
+	ngap_msg->has_guami_digest = true;
+}
+
 // array_grow: 결과 배열을 늘림. 처음이면 ARRAY_FIRST_CAPACITY 칸, 아니면 2배. 실패하면 NULL(array, *capacity 그대로).
 //   개수가 칸 수에 닿았을 때 호출. realloc 으로 자리가 옮겨질 수 있어 호출한 쪽이 포인터를 다시 가리킴
 static void *array_grow(void *array, int *capacity, size_t element_bytes) {
@@ -485,6 +549,9 @@ static const struct taken_ie {
 	{ NGAP_ProtocolIE_ID_id_AMFOverloadResponse,               &asn_DEF_NGAP_OverloadResponse },
 	{ NGAP_ProtocolIE_ID_id_AMFTrafficLoadReductionIndication, &asn_DEF_NGAP_TrafficLoadReductionIndication },
 	{ NGAP_ProtocolIE_ID_id_OverloadStartNSSAIList,            &asn_DEF_NGAP_OverloadStartNSSAIList },
+	{ NGAP_ProtocolIE_ID_id_AMFName,                           &asn_DEF_NGAP_AMFName },
+	{ NGAP_ProtocolIE_ID_id_ServedGUAMIList,                   &asn_DEF_NGAP_ServedGUAMIList },
+	{ NGAP_ProtocolIE_ID_id_UERetentionInformation,            &asn_DEF_NGAP_UERetentionInformation },
 };
 
 #define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
@@ -573,6 +640,15 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 	}
 	case NGAP_ProtocolIE_ID_id_OverloadStartNSSAIList:
 		ngap_msg->overload_nssai_list_present = true;
+		break;
+	case NGAP_ProtocolIE_ID_id_AMFName:
+		amf_name_take(ngap_msg, ie->value);
+		break;
+	case NGAP_ProtocolIE_ID_id_ServedGUAMIList:
+		guami_digest_take(ngap_msg, ie->value);
+		break;
+	case NGAP_ProtocolIE_ID_id_UERetentionInformation:
+		ngap_msg->ue_contexts_retained = enum_read(ngap_msg, *(const NGAP_UERetentionInformation_t *)ie->value) == NGAP_UERetentionInformation_ues_retained;
 		break;
 	}
 	return NGAP_OK;
