@@ -16,7 +16,7 @@ struct nr_cgi {
 
 // reset_type: RESET 의 범위. F1AP RESET 의 Reset Type·NGAP NG RESET 의 ResetType 과 같은 두 갈래
 enum reset_type {
-    RESET_TYPE_NONE = 0, // RESET 이 아니거나 범위를 모름(확장 갈래). 값 없음(0)
+    RESET_TYPE_NONE = 0, // RESET 이 아니거나 범위를 모름(확장 갈래, 모르는 ResetAll 값). 값 없음(0)
     RESET_TYPE_ALL,      // 모든 UE 연결 초기화(f1-Interface, NGAP nG-Interface)
     RESET_TYPE_PART,     // 목록의 UE 연결만 초기화(partOfF1-Interface, NGAP partOfNG-Interface)
 };

@@ -14,6 +14,7 @@
 #include <F1AP_NRCGI.h>
 #include <F1AP_ProcedureCode.h>
 #include <F1AP_ProtocolIE-ID.h>
+#include <F1AP_ResetAll.h>
 #include <F1AP_ResetType.h>
 #include <F1AP_UE-associatedLogicalF1-ConnectionItem.h>
 #include <F1AP_UE-associatedLogicalF1-ConnectionListRes.h>
@@ -56,11 +57,11 @@ struct f1ap_internal {
 
     // 결과 배열. f1ap_msg 쪽은 const 라, 늘리고 풀 때는 이쪽을 씀(캐스트 없이)
     struct f1ap_rrc_container *rrc_containers; // f1ap_msg.rrc_containers 와 같은 배열
-    int rrc_container_capacity;                // rrc_containers 에 할당한 칸 수. 개수가 닿으면 늘림
-    struct nr_cgi *served_cells;               // f1ap_msg.served_cells 와 같은 배열
-    int served_cell_capacity;                  // served_cells 에 할당한 칸 수. 개수가 닿으면 늘림
-    struct f1ap_reset_ue *reset_ues;           // f1ap_msg.reset_ues 와 같은 배열
-    int reset_ue_capacity;                     // reset_ues 에 할당한 칸 수. 개수가 닿으면 늘림
+    int rrc_container_capacity;
+    struct nr_cgi *served_cells; // f1ap_msg.served_cells 와 같은 배열
+    int served_cell_capacity;
+    struct f1ap_reset_ue *reset_ues; // f1ap_msg.reset_ues 와 같은 배열
+    int reset_ue_capacity;
 };
 
 // ie_view: IE 하나의 번호·값. 메시지마다 다른 C 타입 대신 이 모양으로 읽음(값은 트리를 가리킴)
@@ -309,16 +310,19 @@ static struct f1ap_reset_ue reset_ue_take(const F1AP_UE_associatedLogicalF1_Conn
 
 /* reset_take: Reset Type → reset_type. 일부 RESET 이면 목록의 UE 를 reset_ues 에(메시지 안 순서).
  *   이유: 일부 RESET 이면 탐지 엔진이 목록의 UE 만 닫게 함(f1_evt.du_ue_ids). 목록 항목은 IE 목록과 같은 모양이라 ie_at 으로 읽음.
- *   choice-extension 이면 범위를 몰라 RESET_TYPE_NONE. 번호가 하나도 없는 항목도 그대로 담음(버릴지는 출력 층).
+ *   choice-extension 이거나 전체 갈래의 ResetAll 이 모르는 확장 값(asn1c 가 -1 로 둠)이면 범위를 몰라 reset_type 을 건드리지 않음
+ *   (msg_clear 가 둔 RESET_TYPE_NONE 그대로). 번호가 하나도 없는 항목도 그대로 담음(버릴지는 출력 층).
  *   반환: F1AP_OK / F1AP_NO_MEMORY(목록 배열을 늘리지 못함)
  */
 static enum f1ap_result reset_take(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, const F1AP_ResetType_t *reset_type) {
     if (reset_type->present == F1AP_ResetType_PR_f1_Interface) {
-        f1ap_msg->reset_type = RESET_TYPE_ALL;
-        return F1AP_OK;
+        // 아는 값(reset-all)일 때만 ALL. 모르는 확장 값을 전체로 정하면 탐지 엔진이 그 셀의 UE 를 모두 닫음
+        if (reset_type->choice.f1_Interface == F1AP_ResetAll_reset_all)
+            f1ap_msg->reset_type = RESET_TYPE_ALL;
+        return F1AP_OK; // 모르는 확장 값: msg_clear 가 둔 RESET_TYPE_NONE(범위 모름) 그대로
     }
     if (reset_type->present != F1AP_ResetType_PR_partOfF1_Interface)
-        return F1AP_OK; // choice-extension: 범위를 모름
+        return F1AP_OK; // choice-extension: msg_clear 가 둔 RESET_TYPE_NONE(범위 모름) 그대로
     f1ap_msg->reset_type = RESET_TYPE_PART;
     const F1AP_UE_associatedLogicalF1_ConnectionListRes_t *list = reset_type->choice.partOfF1_Interface;
     if (!list)
