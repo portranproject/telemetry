@@ -58,6 +58,14 @@ struct f1ap_rrc_container {
     size_t len;
 };
 
+// f1ap_reset_ue: 일부 RESET 목록의 UE 하나. 두 번호 모두 선택 필드라 둘 다 없을 수도 있음(그대로 넘김)
+struct f1ap_reset_ue {
+    bool has_cu_ue_id;
+    uint32_t cu_ue_id;
+    bool has_du_ue_id;
+    uint32_t du_ue_id; // 탐지 f1_evt.du_ue_ids
+};
+
 // f1ap_internal: f1ap.c 전용 상태(트리·배열). asn1c 타입을 헤더에 두지 않으려고 이름만
 struct f1ap_internal;
 
@@ -96,6 +104,8 @@ struct f1ap_msg {
     const struct f1ap_rrc_container *rrc_containers; // RRC 컨테이너 IE 전부(메시지 안 순서). 없으면 NULL
     int served_cell_count;
     const struct nr_cgi *served_cells; // F1 SETUP REQUEST 의 셀 목록(탐지 f1_evt.cells). 없으면 NULL
+    int reset_ue_count;
+    const struct f1ap_reset_ue *reset_ues; // 일부 RESET(partOfF1-Interface) 목록의 UE(메시지 안 순서). 없으면 NULL
 
     struct f1ap_internal *internal; // f1ap.c 전용(asn1c 트리·배열)
 };
@@ -111,7 +121,7 @@ struct f1ap_msg {
 enum f1ap_result f1ap_parse(const uint8_t *pdu_bytes, size_t len, struct f1ap_msg *f1ap_msg);
 
 /* f1ap_release: f1ap_parse 가 잡은 asn1c 트리와 배열을 해제.
- *   돌아온 뒤에는 rrc_containers·served_cells 와 그 안의 바이트 포인터가 무효(NULL·0 으로 바꿈).
+ *   돌아온 뒤에는 rrc_containers·served_cells·reset_ues 와 그 안의 바이트 포인터가 무효(NULL·0 으로 바꿈).
  *   msg_name·cause 의 이름은 고정 문자열이라 그대로 유효.
  *   f1ap_msg 가 NULL 이거나 해제할 것이 없으면 아무것도 하지 않음. 두 번 불러도 됨.
  */

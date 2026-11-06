@@ -5,10 +5,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <F1AP_Cause.h>
 #include <F1AP_F1AP-PDU.h>
+#include <F1AP_GNB-CU-UE-F1AP-ID.h>
+#include <F1AP_GNB-DU-Served-Cells-Item.h>
+#include <F1AP_GNB-DU-Served-Cells-List.h>
+#include <F1AP_GNB-DU-UE-F1AP-ID.h>
 #include <F1AP_NRCGI.h>
 #include <F1AP_ProcedureCode.h>
 #include <F1AP_ProtocolIE-ID.h>
+#include <F1AP_ResetType.h>
+#include <F1AP_UE-associatedLogicalF1-ConnectionItem.h>
+#include <F1AP_UE-associatedLogicalF1-ConnectionListRes.h>
+#include <INTEGER.h>
+#include <NativeEnumerated.h>
 #include <NativeInteger.h>
 #include <OCTET_STRING.h>
 #include <asn_SEQUENCE_OF.h>
@@ -29,8 +39,11 @@
 // SRBID ::= INTEGER (0..3, ..., 4 | 5) (TS 38.473). 이보다 크면 모르는 SRB 라 없음
 #define SRB_ID_MAX 5
 
-// RRC 컨테이너 배열을 처음 잡을 때 칸 수. 한 메시지에 보통 1~2개(INITIAL UL RRC 가 2개)라 늘리는 일이 거의 없게
-#define RRC_CONTAINER_FIRST_CAPACITY 4
+// GNB-DU-ID ::= INTEGER (0..68719476735) (TS 38.473). 36비트
+#define GNB_DU_ID_MAX ((1ull << 36) - 1)
+
+// 결과 배열(RRC 컨테이너·셀·RESET UE)을 처음 잡을 때 칸 수. 한 메시지에 보통 1~2개(INITIAL UL RRC 의 컨테이너 2개, 테스트베드 셀 1개)라 늘리는 일이 거의 없게
+#define ARRAY_FIRST_CAPACITY 4
 
 // MARK: - 자료구조
 
@@ -46,6 +59,8 @@ struct f1ap_internal {
     int rrc_container_capacity;                // rrc_containers 에 할당한 칸 수. 개수가 닿으면 늘림
     struct nr_cgi *served_cells;               // f1ap_msg.served_cells 와 같은 배열
     int served_cell_capacity;                  // served_cells 에 할당한 칸 수. 개수가 닿으면 늘림
+    struct f1ap_reset_ue *reset_ues;           // f1ap_msg.reset_ues 와 같은 배열
+    int reset_ue_capacity;                     // reset_ues 에 할당한 칸 수. 개수가 닿으면 늘림
 };
 
 // ie_view: IE 하나의 번호·값. 메시지마다 다른 C 타입 대신 이 모양으로 읽음(값은 트리를 가리킴)
@@ -129,9 +144,22 @@ static bool ie_at(const asn_TYPE_descriptor_t *list_type, const void *list, int 
 
 /* ie_read_uint: 정수 IE 를 0 ~ max_value 로 읽음. 음수·상한 초과·정수 아님이면 false(*value_out 그대로).
  *   이유: 확장 값을 칸에 잘라 담으면 없는 번호가 됨(예 -5 → 4294967291)
+ *   asn1c 는 범위가 32비트 안이면 long·unsigned long 으로, 넘으면 바이트열(INTEGER_t, 예 gNB-DU ID 36비트)로 담음
  */
 static bool ie_read_uint(const struct ie_view *ie, uint64_t max_value, uint64_t *value_out) {
-    if (!ie->type || !ie->value || ie->type->op != &asn_OP_NativeInteger)
+    if (!ie->type || !ie->value)
+        return false;
+    if (ie->type->op == &asn_OP_INTEGER) {
+        // 부호 있는 바이트열이라 imax 로 읽음(asn_INTEGER2umax 는 음수를 큰 양수로 읽음)
+        intmax_t big_value = 0;
+        if (asn_INTEGER2imax(ie->value, &big_value) != 0)
+            return false;
+        if (big_value < 0 || (uint64_t)big_value > max_value)
+            return false;
+        *value_out = (uint64_t)big_value;
+        return true;
+    }
+    if (ie->type->op != &asn_OP_NativeInteger)
         return false;
     // long·unsigned long 중 무엇으로 담았는지는 field_unsigned 가 알림
     const asn_INTEGER_specifics_t *specifics = ie->type->specifics;
@@ -174,21 +202,57 @@ static struct nr_cgi nr_cgi_take(const F1AP_NRCGI_t *f1ap_nr_cgi) {
     return nr_cgi;
 }
 
-/* rrc_container_push: RRC 컨테이너 하나를 결과 배열 끝에 더함. 칸이 차면 2배로 늘림. 메모리 부족이면 false.
+/* cause_take: Cause(CHOICE) → ap_cause. 범주는 고른 갈래의 순번·이름, 값은 그 ENUMERATED 값과 asn1c 이름표의 이름.
+ *   이유: 출력 층이 탐지 명세의 원인 문자열("radioNetwork:normal-release")을 asn1c 없이 만들게 이름까지 넘김.
+ *   choice-extension 이거나 모르는 확장 값(asn1c 가 -1 로 둠)이면 값 -1·값 이름 NULL. 이름은 생성 코드의 고정 문자열
+ */
+static struct ap_cause cause_take(const F1AP_Cause_t *f1ap_cause) {
+    struct ap_cause cause = {.group = -1, .value = -1};
+    const void *selected = NULL;
+    unsigned present = 0;
+    const asn_TYPE_member_t *group_member = choice_selected(&asn_DEF_F1AP_Cause, f1ap_cause, &selected, &present);
+    if (!group_member)
+        return cause;
+    cause.is_present = true;
+    cause.group = (int)present - 1; // present 는 1부터
+    cause.group_name = group_member->name;
+    bool is_enumerated = selected && group_member->type->op == &asn_OP_NativeEnumerated;
+    if (!is_enumerated)
+        return cause; // choice-extension: 값 없음
+    const asn_INTEGER_enum_map_t *value_entry = INTEGER_map_value2enum(group_member->type->specifics, *(const long *)selected);
+    if (!value_entry)
+        return cause; // 모르는 확장 값
+    cause.value = (int)value_entry->nat_value;
+    cause.value_name = value_entry->enum_name;
+    return cause;
+}
+
+/* array_grow: 결과 배열을 늘림. 처음이면 ARRAY_FIRST_CAPACITY 칸, 아니면 2배. 실패하면 NULL(array·*capacity 그대로).
+ *   이유: RRC 컨테이너·셀·RESET UE 배열이 같은 방법으로 늘어남. 개수가 칸 수에 닿았을 때 부름.
+ *   반환: 늘린 배열. realloc 으로 자리가 옮겨질 수 있어 부르는 쪽이 internal·f1ap_msg 의 포인터를 둘 다 다시 가리킴
+ */
+static void *array_grow(void *array, int *capacity, size_t element_bytes) {
+    if (*capacity > INT_MAX / 2)
+        return NULL; // 2배가 int 를 넘음. 입력 길이로는 닿지 않는 수
+    int new_capacity = *capacity == 0 ? ARRAY_FIRST_CAPACITY : *capacity * 2;
+    void *grown = realloc(array, (size_t)new_capacity * element_bytes);
+    if (!grown)
+        return NULL;
+    *capacity = new_capacity;
+    return grown;
+}
+
+/* rrc_container_push: RRC 컨테이너 하나를 결과 배열 끝에 더함. 메모리 부족이면 false.
  *   이유: 컨테이너 수는 메시지마다 달라 미리 정할 수 없음(같은 IE 가 여러 번 와도 모두 담음).
  *   data 는 트리의 바이트를 빌림(복사 안 함). srb_id 는 -1 로 두고 IE 를 다 돈 뒤 f1ap_parse 가 붙임
  */
 static bool rrc_container_push(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, int ie_id, const OCTET_STRING_t *octets) {
     if (f1ap_msg->rrc_container_count == internal->rrc_container_capacity) {
-        if (internal->rrc_container_capacity > INT_MAX / 2)
-            return false; // 2배가 int 를 넘음. 입력 길이로는 닿지 않는 수
-        int new_capacity = internal->rrc_container_capacity == 0 ? RRC_CONTAINER_FIRST_CAPACITY : internal->rrc_container_capacity * 2;
-        struct f1ap_rrc_container *grown = realloc(internal->rrc_containers, (size_t)new_capacity * sizeof(*grown));
+        struct f1ap_rrc_container *grown = array_grow(internal->rrc_containers, &internal->rrc_container_capacity, sizeof(*grown));
         if (!grown)
             return false;
         internal->rrc_containers = grown;
-        internal->rrc_container_capacity = new_capacity;
-        f1ap_msg->rrc_containers = grown; // realloc 으로 자리가 옮겨질 수 있어 늘릴 때마다 다시 가리킴
+        f1ap_msg->rrc_containers = grown;
     }
     internal->rrc_containers[f1ap_msg->rrc_container_count] = (struct f1ap_rrc_container){
         .ie_id = ie_id,
@@ -200,11 +264,89 @@ static bool rrc_container_push(struct f1ap_msg *f1ap_msg, struct f1ap_internal *
     return true;
 }
 
+/* served_cells_take: Served Cells 목록(F1 SETUP REQUEST) → served_cells. 항목마다 served-Cell-Information 의 NR CGI.
+ *   이유: 그 DU 의 셀 목록(탐지 f1_evt.cells). 목록 항목은 IE 목록과 같은 모양(번호·값)이라 ie_at 으로 읽음.
+ *   반환: F1AP_OK / F1AP_NO_MEMORY(셀 배열을 늘리지 못함)
+ */
+static enum f1ap_result served_cells_take(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, const F1AP_GNB_DU_Served_Cells_List_t *list) {
+    for (int i = 0; i < list->list.count; i++) {
+        struct ie_view item;
+        if (!ie_at(&asn_DEF_F1AP_GNB_DU_Served_Cells_List, list, i, &item))
+            continue;
+        if (item.type != &asn_DEF_F1AP_GNB_DU_Served_Cells_Item)
+            continue; // asn1c 가 값을 건너뛴 항목(모르는 IE 번호)
+        if (f1ap_msg->served_cell_count == internal->served_cell_capacity) {
+            struct nr_cgi *grown = array_grow(internal->served_cells, &internal->served_cell_capacity, sizeof(*grown));
+            if (!grown)
+                return F1AP_NO_MEMORY;
+            internal->served_cells = grown;
+            f1ap_msg->served_cells = grown;
+        }
+        const F1AP_GNB_DU_Served_Cells_Item_t *served_cell = item.value;
+        internal->served_cells[f1ap_msg->served_cell_count] = nr_cgi_take(&served_cell->served_Cell_Information.nRCGI);
+        f1ap_msg->served_cell_count++;
+    }
+    return F1AP_OK;
+}
+
+/* reset_ue_take: 일부 RESET 목록 항목 → f1ap_reset_ue. 두 번호는 선택 필드라 있는 것만(범위 밖은 없음) */
+static struct f1ap_reset_ue reset_ue_take(const F1AP_UE_associatedLogicalF1_ConnectionItem_t *connection) {
+    struct f1ap_reset_ue reset_ue = {.has_cu_ue_id = false};
+    // 번호 칸을 ie_view 모양으로 감싸 정수 IE 와 같은 방법(ie_read_uint)으로 읽음. 없는 선택 필드는 NULL
+    const struct ie_view cu_ue_id = {.type = &asn_DEF_F1AP_GNB_CU_UE_F1AP_ID, .value = connection->gNB_CU_UE_F1AP_ID};
+    const struct ie_view du_ue_id = {.type = &asn_DEF_F1AP_GNB_DU_UE_F1AP_ID, .value = connection->gNB_DU_UE_F1AP_ID};
+    uint64_t value = 0;
+    if (ie_read_uint(&cu_ue_id, UINT32_MAX, &value)) {
+        reset_ue.cu_ue_id = (uint32_t)value;
+        reset_ue.has_cu_ue_id = true;
+    }
+    if (ie_read_uint(&du_ue_id, UINT32_MAX, &value)) {
+        reset_ue.du_ue_id = (uint32_t)value;
+        reset_ue.has_du_ue_id = true;
+    }
+    return reset_ue;
+}
+
+/* reset_take: Reset Type → reset_type. 일부 RESET 이면 목록의 UE 를 reset_ues 에(메시지 안 순서).
+ *   이유: 일부 RESET 이면 탐지 엔진이 목록의 UE 만 닫게 함(f1_evt.du_ue_ids). 목록 항목은 IE 목록과 같은 모양이라 ie_at 으로 읽음.
+ *   choice-extension 이면 범위를 몰라 RESET_TYPE_NONE. 번호가 하나도 없는 항목도 그대로 담음(버릴지는 출력 층).
+ *   반환: F1AP_OK / F1AP_NO_MEMORY(목록 배열을 늘리지 못함)
+ */
+static enum f1ap_result reset_take(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, const F1AP_ResetType_t *reset_type) {
+    if (reset_type->present == F1AP_ResetType_PR_f1_Interface) {
+        f1ap_msg->reset_type = RESET_TYPE_ALL;
+        return F1AP_OK;
+    }
+    if (reset_type->present != F1AP_ResetType_PR_partOfF1_Interface)
+        return F1AP_OK; // choice-extension: 범위를 모름
+    f1ap_msg->reset_type = RESET_TYPE_PART;
+    const F1AP_UE_associatedLogicalF1_ConnectionListRes_t *list = reset_type->choice.partOfF1_Interface;
+    if (!list)
+        return F1AP_OK;
+    for (int i = 0; i < list->list.count; i++) {
+        struct ie_view item;
+        if (!ie_at(&asn_DEF_F1AP_UE_associatedLogicalF1_ConnectionListRes, list, i, &item))
+            continue;
+        if (item.type != &asn_DEF_F1AP_UE_associatedLogicalF1_ConnectionItem)
+            continue; // asn1c 가 값을 건너뛴 항목(모르는 IE 번호)
+        if (f1ap_msg->reset_ue_count == internal->reset_ue_capacity) {
+            struct f1ap_reset_ue *grown = array_grow(internal->reset_ues, &internal->reset_ue_capacity, sizeof(*grown));
+            if (!grown)
+                return F1AP_NO_MEMORY;
+            internal->reset_ues = grown;
+            f1ap_msg->reset_ues = grown;
+        }
+        internal->reset_ues[f1ap_msg->reset_ue_count] = reset_ue_take(item.value);
+        f1ap_msg->reset_ue_count++;
+    }
+    return F1AP_OK;
+}
+
 /* take_ie: 최상위 IE 하나를 번호로 골라 f1ap_msg 에 채움(SRB ID 는 internal). 꺼내지 않는 번호·값 없는 IE 는 지나감.
  *   이유: 같은 값이 CU 구현마다 다른 메시지에 실려(OCUDU·OAI) 번호로 고름.
- *   정수는 범위 밖이면 없음, NR CGI 는 타입이 NRCGI 일 때만. 같은 번호가 두 번 오면 뒤의 것(정수는 읽을 수 있는 값만).
- *   RRC 컨테이너는 같은 번호가 여러 번 와도 모두 담음.
- *   반환: F1AP_OK / F1AP_NO_MEMORY(컨테이너 배열을 늘리지 못함)
+ *   정수는 범위 밖이면 없음, NR CGI·Cause·Reset Type·셀 목록은 타입이 맞을 때만. 같은 번호가 두 번 오면 뒤의 것(정수는 읽을 수 있는 값만).
+ *   RRC 컨테이너·셀·RESET UE 는 같은 번호가 여러 번 와도 모두 담음.
+ *   반환: F1AP_OK / F1AP_NO_MEMORY(결과 배열을 늘리지 못함)
  */
 static enum f1ap_result take_ie(struct f1ap_msg *f1ap_msg, struct f1ap_internal *internal, const struct ie_view *ie) {
     uint64_t value = 0;
@@ -253,6 +395,24 @@ static enum f1ap_result take_ie(struct f1ap_msg *f1ap_msg, struct f1ap_internal 
         if (ie->id == F1AP_ProtocolIE_ID_id_DUtoCURRCContainer)
             f1ap_msg->has_du_to_cu_rrc_container = true;
         break;
+    case F1AP_ProtocolIE_ID_id_Cause:
+        if (ie->type == &asn_DEF_F1AP_Cause)
+            f1ap_msg->cause = cause_take(ie->value);
+        break;
+    case F1AP_ProtocolIE_ID_id_ResetType:
+        if (ie->type == &asn_DEF_F1AP_ResetType)
+            return reset_take(f1ap_msg, internal, ie->value);
+        break;
+    case F1AP_ProtocolIE_ID_id_gNB_DU_ID:
+        if (ie_read_uint(ie, GNB_DU_ID_MAX, &value)) {
+            f1ap_msg->du_id = value;
+            f1ap_msg->has_du_id = true;
+        }
+        break;
+    case F1AP_ProtocolIE_ID_id_gNB_DU_Served_Cells_List:
+        if (ie->type == &asn_DEF_F1AP_GNB_DU_Served_Cells_List)
+            return served_cells_take(f1ap_msg, internal, ie->value);
+        break;
     default:
         break; // 꺼내지 않는 IE
     }
@@ -276,12 +436,15 @@ void f1ap_release(struct f1ap_msg *f1ap_msg) {
     ASN_STRUCT_FREE(asn_DEF_F1AP_F1AP_PDU, internal->pdu); // pdu 가 NULL 이어도 됨(asn1c 가 확인)
     free(internal->rrc_containers);
     free(internal->served_cells);
+    free(internal->reset_ues);
     free(internal);
     f1ap_msg->internal = NULL;
     f1ap_msg->rrc_container_count = 0;
     f1ap_msg->rrc_containers = NULL;
     f1ap_msg->served_cell_count = 0;
     f1ap_msg->served_cells = NULL;
+    f1ap_msg->reset_ue_count = 0;
+    f1ap_msg->reset_ues = NULL;
 }
 
 /* parse_fail: 해석 실패 처리. 잡은 것을 모두 해제하고 f1ap_msg 를 값 없는 상태로 되돌림.
