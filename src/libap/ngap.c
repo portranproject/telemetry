@@ -55,6 +55,14 @@
 // asn1c 스택 사용 상한 256KB
 #define DECODE_MAX_STACK_BYTES (256 * 1024)
 
+// AMF-UE-NGAP-ID ::= INTEGER (0..1099511627775) (TS 38.413 §9.3.3.1). 40비트.
+#define AMF_UE_NGAP_ID_MAX ((1ull << 40) - 1)
+
+// asn1c 가 모르는 open type 을 버릴 때마다 +1 
+// TODO: libap 밖 의존. 정의는 asn1/asn1_glue.c (libasn1skel.a 에 링크) 확인 가능 
+extern unsigned long asn_portran_opentype_skipped_count;
+
+
 // ngap_internal: ngap_msg.internal 이 가리키는 ngap.c 전용 상태. ngap_release 가 해제
 //
 //   struct ngap_msg (호출자)        struct ngap_internal (힙)
@@ -77,6 +85,16 @@ struct ngap_internal {
 	int reset_ue_capacity;
 	// 이 PDU 에서 이미 본 IE. 비트 n = TAKEN_IES[n]. 중복 판정용
 	uint32_t seen_ie_mask;
+};
+
+// ie_view: IE 하나의 번호, 값.
+struct ie_view {
+	// IE 번호(ProtocolIE-ID)
+	long id;
+	// 값의 asn1c 타입. asn1c 가 값을 버린 IE(모르는 IE, 그 메시지에 없는 IE)면 NULL
+	const asn_TYPE_descriptor_t *type;
+	// 값 위치. type 이 NULL 이면 NULL
+	const void *value;
 };
 
 // member_by_name: 설명표(type)에서 이름이 name 인 멤버. 없으면 NULL
@@ -109,6 +127,178 @@ static const asn_TYPE_member_t *choice_selected(const asn_TYPE_descriptor_t *typ
 	const asn_TYPE_member_t *member = &type->elements[present - 1];
 	*value_out = member_value_ptr(member, choice_base);
 	return member;
+}
+
+// ie_at: IE 목록의 index 번째 IE. 범위 밖, 빈 칸이면 false
+//
+//   IE 한 개
+//   +----+-------------+-------+
+//   | id | criticality | value |     value = IE 번호로 고르는 open type. asn1c 는 CHOICE 로 생성
+//   +----+-------------+-------+
+//
+//   asn1c 가 값을 버린 IE 면 true 에 ie->type, ie->value 가 NULL
+static bool ie_at(const asn_TYPE_descriptor_t *list_type, const void *list, int index, struct ie_view *ie) {
+	const asn_anonymous_sequence_ *ie_list = _A_CSEQUENCE_FROM_VOID(list);
+	if (index < 0 || index >= ie_list->count || list_type->elements_count < 1)
+		return false;
+	const void *field = ie_list->array[index];
+	const asn_TYPE_descriptor_t *field_type = list_type->elements[0].type;
+	const asn_TYPE_member_t *id_member = member_by_name(field_type, "id");
+	const asn_TYPE_member_t *value_member = member_by_name(field_type, "value");
+	if (!field || !id_member || !value_member)
+		return false;
+	const NGAP_ProtocolIE_ID_t *id = member_value_ptr(id_member, field);
+	const void *choice_base = member_value_ptr(value_member, field);
+	if (!id || !choice_base)
+		return false;
+
+	const void *value = NULL;
+	const asn_TYPE_member_t *value_choice = choice_selected(value_member->type, choice_base, &value, NULL);
+	ie->id = *id;
+	ie->type = NULL;
+	ie->value = NULL;
+	if (value_choice && value) {
+		ie->type = value_choice->type;
+		ie->value = value;
+	}
+	return true;
+}
+
+// ie_read_uint: 정수 IE 를 0 ~ max_value 로 읽음. 음수, 상한 초과, 정수 아님이면 false (*value_out 그대로). f1ap.c 와 같음
+//   asn1c 는 범위가 32비트 안이면 long / unsigned long, 넘으면 부호 있는 바이트열(INTEGER_t)로 저장 -> asn_INTEGER2imax 로 읽고 음수 거부
+//
+//     AMF-UE-NGAP-ID 의 와이어 8옥텟   asn1c 저장       asn_INTEGER2umax      asn_INTEGER2imax
+//     00 00 00 FF FF FF FF FF          2^40-1           2^40-1  담음          2^40-1  담음
+//     00 00 01 00 00 00 00 00          2^40             2^40    거부          2^40    거부
+//     FF FF FF FF FF FF FF FE          -2 (1옥텟 FE)    254     담음 (오류)   -2      거부
+static bool ie_read_uint(const struct ie_view *ie, uint64_t max_value, uint64_t *value_out) {
+	if (!ie->type || !ie->value)
+		return false;
+	if (ie->type->op == &asn_OP_INTEGER) {
+		intmax_t big_value = 0;
+		if (asn_INTEGER2imax(ie->value, &big_value) != 0)
+			return false;
+		if (big_value < 0 || (uint64_t)big_value > max_value)
+			return false;
+		*value_out = (uint64_t)big_value;
+		return true;
+	}
+	if (ie->type->op != &asn_OP_NativeInteger)
+		return false;
+	const asn_INTEGER_specifics_t *specifics = ie->type->specifics;
+	bool is_unsigned = specifics && specifics->field_unsigned;
+	uint64_t uint_value = 0;
+	if (is_unsigned) {
+		uint_value = (uint64_t)*(const unsigned long *)ie->value;
+	} else {
+		long signed_value = *(const long *)ie->value;
+		if (signed_value < 0)
+			return false;
+		uint_value = (uint64_t)signed_value;
+	}
+	if (uint_value > max_value)
+		return false;
+	*value_out = uint_value;
+	return true;
+}
+
+// amf_ue_ngap_id_read: AMF-UE-NGAP-ID 를 읽음. IE 10, IE 40, IE 114 의 AMF 쪽, NG RESET 목록 항목이 공용
+//   반환: 담았으면 true. 없으면(NULL) false. 범위 밖이면 false + rejected_ie_count
+static bool amf_ue_ngap_id_read(struct ngap_msg *ngap_msg, const NGAP_AMF_UE_NGAP_ID_t *amf_ue_ngap_id, uint64_t *value_out) {
+	if (!amf_ue_ngap_id)
+		return false;
+	const struct ie_view ie = {.type = &asn_DEF_NGAP_AMF_UE_NGAP_ID, .value = amf_ue_ngap_id};
+	if (ie_read_uint(&ie, AMF_UE_NGAP_ID_MAX, value_out))
+		return true;
+	ngap_msg->rejected_ie_count++;
+	return false;
+}
+
+// ran_ue_ngap_id_read: RAN-UE-NGAP-ID 를 읽음. IE 85, IE 114 의 RAN 쪽, NG RESET 목록 항목이 공용. 없으면(NULL) false
+//   rejected_ie_count 없음: 와이어의 길이 필드가 4옥텟까지만 표현 -> 2^32-1 을 넘는 값이 올 수 없음
+static bool ran_ue_ngap_id_read(const NGAP_RAN_UE_NGAP_ID_t *ran_ue_ngap_id, uint32_t *value_out) {
+	const struct ie_view ie = {.type = &asn_DEF_NGAP_RAN_UE_NGAP_ID, .value = ran_ue_ngap_id};
+	uint64_t uint_value = 0;
+	if (!ie_read_uint(&ie, UINT32_MAX, &uint_value))
+		return false;
+	*value_out = (uint32_t)uint_value;
+	return true;
+}
+
+// ue_ngap_ids_take: UE-NGAP-IDs(IE 114, UE CONTEXT RELEASE COMMAND)의 AMF 쪽, RAN 쪽 ID
+//   AMF ID 단독, 또는 짝(AMF ID + RAN ID). 짝의 AMF ID 가 범위 밖이어도 RAN ID 는 담음
+//   IE 10, IE 85 와 같은 메시지에 실리지 않음 (15.8.0 에서 IE 114 는 이 메시지에만) -> 앞 값을 덮을 일 없음
+static void ue_ngap_ids_take(struct ngap_msg *ngap_msg, const NGAP_UE_NGAP_IDs_t *ue_ngap_ids) {
+	switch (ue_ngap_ids->present) {
+	case NGAP_UE_NGAP_IDs_PR_aMF_UE_NGAP_ID:
+		ngap_msg->has_amf_ue_ngap_id = amf_ue_ngap_id_read(ngap_msg, &ue_ngap_ids->choice.aMF_UE_NGAP_ID, &ngap_msg->amf_ue_ngap_id);
+		break;
+	case NGAP_UE_NGAP_IDs_PR_uE_NGAP_ID_pair: {
+		const NGAP_UE_NGAP_ID_pair_t *id_pair = ue_ngap_ids->choice.uE_NGAP_ID_pair;
+		if (!id_pair)
+			break;
+		ngap_msg->has_amf_ue_ngap_id = amf_ue_ngap_id_read(ngap_msg, &id_pair->aMF_UE_NGAP_ID, &ngap_msg->amf_ue_ngap_id);
+		ngap_msg->has_ran_ue_ngap_id = ran_ue_ngap_id_read(&id_pair->rAN_UE_NGAP_ID, &ngap_msg->ran_ue_ngap_id);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+// TAKEN_IES: 담는 IE 표. IE 번호 -> 값 타입 (머리 주석 [2] 의 표와 같은 순서)
+static const struct taken_ie {
+	long id;
+	const asn_TYPE_descriptor_t *type;
+} TAKEN_IES[] = {
+	{ NGAP_ProtocolIE_ID_id_RAN_UE_NGAP_ID,    &asn_DEF_NGAP_RAN_UE_NGAP_ID },
+	{ NGAP_ProtocolIE_ID_id_AMF_UE_NGAP_ID,    &asn_DEF_NGAP_AMF_UE_NGAP_ID },
+	{ NGAP_ProtocolIE_ID_id_UE_NGAP_IDs,       &asn_DEF_NGAP_UE_NGAP_IDs },
+	{ NGAP_ProtocolIE_ID_id_NewAMF_UE_NGAP_ID, &asn_DEF_NGAP_AMF_UE_NGAP_ID },
+};
+
+#define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
+_Static_assert(TAKEN_IE_COUNT <= 32, "seen_ie_mask 는 32비트");
+
+// ie_take: 최상위 IE 하나를 ngap_msg 에 담음
+//
+//   TAKEN_IES 에 없는 번호   -> 건너뜀
+//   이미 본 번호             -> 건너뜀 + duplicate_ie_count. 첫 것만 담음
+//                               규격상 초과 출현은 추상 구문 오류, 받는 쪽은 절차 거부 (TS 38.413 §10.3.6). 관측자는 거부 불가 -> 첫 값 + 계수
+//   값 타입이 표와 다름      -> 건너뜀. 15.8.0 에서 IE 번호마다 값 타입은 하나 -> 문법이 바뀐 경우만 해당
+//
+//   반환: NGAP_OK / NGAP_NO_MEMORY (결과 배열을 늘리지 못함)
+static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal *internal, const struct ie_view *ie) {
+	int taken_index = 0;
+	while (taken_index < TAKEN_IE_COUNT && TAKEN_IES[taken_index].id != ie->id)
+		taken_index++;
+	if (taken_index == TAKEN_IE_COUNT)
+		return NGAP_OK;
+	if (internal->seen_ie_mask & (1u << taken_index)) {
+		ngap_msg->duplicate_ie_count++;
+		return NGAP_OK;
+	}
+	internal->seen_ie_mask |= 1u << taken_index;
+	if (ie->type != TAKEN_IES[taken_index].type)
+		return NGAP_OK;
+
+	switch (ie->id) {
+	// [UE 식별]
+	case NGAP_ProtocolIE_ID_id_RAN_UE_NGAP_ID:
+		ngap_msg->has_ran_ue_ngap_id = ran_ue_ngap_id_read(ie->value, &ngap_msg->ran_ue_ngap_id);
+		break;
+	case NGAP_ProtocolIE_ID_id_AMF_UE_NGAP_ID:
+		ngap_msg->has_amf_ue_ngap_id = amf_ue_ngap_id_read(ngap_msg, ie->value, &ngap_msg->amf_ue_ngap_id);
+		break;
+	case NGAP_ProtocolIE_ID_id_UE_NGAP_IDs:
+		ue_ngap_ids_take(ngap_msg, ie->value);
+		break;
+	// UE CONTEXT MODIFICATION REQUEST: 이 UE 의 AMF 쪽 ID 변경 (TS 38.413 §8.3.4.2)
+	case NGAP_ProtocolIE_ID_id_NewAMF_UE_NGAP_ID:
+		ngap_msg->has_new_amf_ue_ngap_id = amf_ue_ngap_id_read(ngap_msg, ie->value, &ngap_msg->new_amf_ue_ngap_id);
+		break;
+	}
+	return NGAP_OK;
 }
 
 // msg_clear: ngap_msg 를 꺼낸 값이 없는 상태로 만듦. 0 이 유효한 값인 네 칸(수립 원인, 감축률, rrc_state, cause)은 -1
