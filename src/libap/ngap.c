@@ -276,6 +276,33 @@ static struct nr_cgi nr_cgi_take(const NGAP_NR_CGI_t *ngap_nr_cgi) {
 	return nr_cgi;
 }
 
+// cause_take: Cause(CHOICE) -> ap_cause (TS 38.413 §9.3.1.2).
+//
+//   group   0 radioNetwork   1 transport   2 nas   3 protocol   4 misc   5 choice-Extensions
+//   value   범주 안의 순번. 이 문법이 모르는 확장값이면 -1, 이름 NULL (asn1c 패치 04. 0 으로 읽히는 것을 방지)
+//
+//   이름은 asn1c 생성 코드의 고정 문자열 -> ngap_release 뒤에도 유효
+static struct ap_cause cause_take(const NGAP_Cause_t *ngap_cause) {
+	struct ap_cause cause = {.group = -1, .value = -1};
+	const void *selected = NULL;
+	unsigned present = 0;
+	const asn_TYPE_member_t *group_member = choice_selected(&asn_DEF_NGAP_Cause, ngap_cause, &selected, &present);
+	if (!group_member)
+		return cause;
+	cause.is_present = true;
+	cause.group = (int)present - 1;
+	cause.group_name = group_member->name;
+	bool is_enumerated = selected && group_member->type->op == &asn_OP_NativeEnumerated;
+	if (!is_enumerated)
+		return cause;
+	const asn_INTEGER_enum_map_t *value_entry = INTEGER_map_value2enum(group_member->type->specifics, *(const long *)selected);
+	if (!value_entry)
+		return cause;
+	cause.value = (int)value_entry->nat_value;
+	cause.value_name = value_entry->enum_name;
+	return cause;
+}
+
 // ue_ngap_ids_take: UE-NGAP-IDs(IE 114, UE CONTEXT RELEASE COMMAND)의 AMF 쪽, RAN 쪽 ID
 //   AMF ID 단독, 또는 짝(AMF ID + RAN ID). 짝의 AMF ID 가 범위 밖이어도 RAN ID 는 담음
 //   IE 10, IE 85 와 같은 메시지에 실리지 않음 (15.8.0 에서 IE 114 는 이 메시지에만) -> 앞 값을 덮을 일 없음
@@ -381,6 +408,47 @@ static enum ngap_result item_nas_take(struct ngap_msg *ngap_msg, struct ngap_int
 	return NGAP_OK;
 }
 
+// reset_take: ResetType(IE 88, NG RESET) -> reset_type, reset_ues. f1ap.c reset_take 와 같은 규칙
+//
+//   nG-Interface          reset-all 일 때만 RESET_TYPE_ALL. 모르는 확장값이면 RESET_TYPE_NONE (범위 모름) + rejected_ie_count
+//   partOfNG-Interface    RESET_TYPE_PART + 목록의 항목을 메시지 안 순서대로 reset_ues 에
+//
+//   항목의 AMF ID, RAN ID 는 둘 다 OPTIONAL (TS 38.413 §9.3.3.25). 둘 다 없는 항목도 그대로 담음 (§8.7.4.2.1, §8.7.4.2.2 의 빈 항목)
+//   AMF ID 가 범위 밖이면 rejected_ie_count, 그 항목은 has_amf_ue_ngap_id = false
+//   반환: NGAP_OK / NGAP_NO_MEMORY
+static enum ngap_result reset_take(struct ngap_msg *ngap_msg, struct ngap_internal *internal, const NGAP_ResetType_t *ngap_reset_type) {
+	if (ngap_reset_type->present == NGAP_ResetType_PR_nG_Interface) {
+		if (enum_read(ngap_msg, ngap_reset_type->choice.nG_Interface) == NGAP_ResetAll_reset_all)
+			ngap_msg->reset_type = RESET_TYPE_ALL;
+		return NGAP_OK;
+	}
+	if (ngap_reset_type->present != NGAP_ResetType_PR_partOfNG_Interface)
+		return NGAP_OK;
+	ngap_msg->reset_type = RESET_TYPE_PART;
+	const NGAP_UE_associatedLogicalNG_connectionList_t *connection_list = ngap_reset_type->choice.partOfNG_Interface;
+	if (!connection_list)
+		return NGAP_OK;
+
+	for (int i = 0; i < connection_list->list.count; i++) {
+		const NGAP_UE_associatedLogicalNG_connectionItem_t *connection = connection_list->list.array[i];
+		if (!connection)
+			continue;
+		if (ngap_msg->reset_ue_count == internal->reset_ue_capacity) {
+			struct ngap_reset_ue *grown = array_grow(internal->reset_ues, &internal->reset_ue_capacity, sizeof(*grown));
+			if (!grown)
+				return NGAP_NO_MEMORY;
+			internal->reset_ues = grown;
+			ngap_msg->reset_ues = grown;
+		}
+		struct ngap_reset_ue reset_ue = {.has_amf_ue_ngap_id = false};
+		reset_ue.has_amf_ue_ngap_id = amf_ue_ngap_id_read(ngap_msg, connection->aMF_UE_NGAP_ID, &reset_ue.amf_ue_ngap_id);
+		reset_ue.has_ran_ue_ngap_id = ran_ue_ngap_id_read(connection->rAN_UE_NGAP_ID, &reset_ue.ran_ue_ngap_id);
+		internal->reset_ues[ngap_msg->reset_ue_count] = reset_ue;
+		ngap_msg->reset_ue_count++;
+	}
+	return NGAP_OK;
+}
+
 // TAKEN_IES: 담는 IE 표. IE 번호 -> 값 타입 (머리 주석 [2] 의 표와 같은 순서)
 static const struct taken_ie {
 	long id;
@@ -397,7 +465,8 @@ static const struct taken_ie {
 	{ NGAP_ProtocolIE_ID_id_PDUSessionResourceModifyListModReq, &asn_DEF_NGAP_PDUSessionResourceModifyListModReq },
 	{ NGAP_ProtocolIE_ID_id_RRCEstablishmentCause,   &asn_DEF_NGAP_RRCEstablishmentCause },
 	{ NGAP_ProtocolIE_ID_id_UserLocationInformation, &asn_DEF_NGAP_UserLocationInformation },
-
+	{ NGAP_ProtocolIE_ID_id_Cause,     &asn_DEF_NGAP_Cause },
+	{ NGAP_ProtocolIE_ID_id_ResetType, &asn_DEF_NGAP_ResetType },
 };
 
 #define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
@@ -462,6 +531,13 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 			ngap_msg->uli_nr_cgi = nr_cgi_take(&user_location->choice.userLocationInformationNR->nR_CGI);
 		break;
 	}
+
+	// [연결 수명]
+	case NGAP_ProtocolIE_ID_id_Cause:
+		ngap_msg->cause = cause_take(ie->value);
+		break;
+	case NGAP_ProtocolIE_ID_id_ResetType:
+		return reset_take(ngap_msg, internal, ie->value);
 	}
 	return NGAP_OK;
 }
