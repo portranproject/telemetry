@@ -1,0 +1,307 @@
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <NR_DL-CCCH-Message.h>
+#include <NR_DL-DCCH-Message.h>
+#include <NR_UL-CCCH-Message.h>
+#include <NR_UL-CCCH1-Message.h>
+#include <NR_UL-DCCH-Message.h>
+#include <constr_CHOICE.h>
+#include <constr_SEQUENCE.h>
+#include <uper_decoder.h>
+
+#include "rrc.h"
+
+// MARK: - 상수
+
+// asn1c 디코드 재귀 스택 상한. 깊게 중첩한 입력으로 스택이 넘치지 않게(넘으면 디코드 실패). F1AP 와 같은 값
+#define DECODE_MAX_STACK_BYTES (256 * 1024)
+
+// SRB 의 PDCP 데이터 PDU 머리: R 4비트 + 일련번호 12비트 (TS 38.323 §6.2.2.1)
+#define PDCP_HEADER_BYTES 2
+// SRB 의 PDCP 데이터 PDU 꼬리 MAC-I. SRB 는 무결성이 꺼져 있어도 칸이 있음 (TS 38.323 §6.3.4)
+#define PDCP_MAC_I_BYTES 4
+// PDCP 모양의 최소 길이: 머리 + RRC 1바이트 이상 + MAC-I. 이보다 짧으면 RRC 가 들어 있을 수 없음
+#define PDCP_MIN_BYTES (PDCP_HEADER_BYTES + 1 + PDCP_MAC_I_BYTES)
+
+// 바이트 하나의 비트 수. UPER 는 마지막 바이트를 채움 비트로 채우므로 남은 비트가 이보다 적으면 채움뿐
+#define BYTE_BITS 8
+
+// 메시지까지 내려가는 CHOICE 겹 수 상한. 가장 깊은 곳은 UL-DCCH 의 MessageType → messageClassExtension → c2 (3겹)
+#define MESSAGE_CHOICE_MAX_DEPTH 3
+// 본문(…-IEs)까지 내려가는 CHOICE 겹 수 상한. criticalExtensions → c1 (2겹, 문법의 11곳)
+#define BODY_CHOICE_MAX_DEPTH 2
+// nonCriticalExtension 사슬을 따라가는 상한. 트리는 끝이 있어 닿지 않으며, 생성 코드가 어긋났을 때 멈추지 않는 일을 막는 안전장치
+#define EXTENSION_CHAIN_MAX_LENGTH 32
+
+// MARK: - 자료구조
+
+// rrc_internal: rrc_msg.internal 이 가리키는 rrc.c 전용 상태. rrc_release 가 해제
+struct rrc_internal {
+    const asn_TYPE_descriptor_t *message_type; // 트리를 푼 최상위 타입(채널마다 다름). 해제할 때 같은 타입으로 풀어야 함
+    void *message;                             // asn1c 가 디코드한 트리. NAS·조각 포인터가 이 트리를 빌림
+};
+
+// body_result: 메시지에서 본문을 찾은 결과
+enum body_result {
+    BODY_FOUND,  // 값이 든 본문(…-IEs)
+    BODY_FUTURE, // criticalExtensionsFuture 나 그 안 spare. 우리 문법으로는 뜻을 알 수 없음
+};
+
+// extension_slot: 본문 끝의 빈 nonCriticalExtension 자리(새 릴리스가 새 필드를 붙이는 곳)의 상태
+enum extension_slot {
+    EXTENSION_SLOT_NONE,    // 사슬이 없음(크기 고정 메시지 등). 남는 비트를 설명할 수 없음
+    EXTENSION_SLOT_ABSENT,  // 사슬 중간이나 끝 자리가 "없음"으로 표시됨
+    EXTENSION_SLOT_PRESENT, // 끝 빈 자리까지 "있음". 뒤에 새 릴리스 필드가 붙을 수 있음
+};
+
+// MARK: - asn1c 설명표 읽기
+
+/* member_by_name: 설명표(type)에서 이름이 name 인 멤버를 찾음. 없으면 NULL.
+ *   이유: 메시지마다 다른 C 타입 대신 문법의 이름("criticalExtensions" 등)으로 찾아, 모든 메시지를 같은 코드로 읽음
+ */
+static const asn_TYPE_member_t *member_by_name(const asn_TYPE_descriptor_t *type, const char *name) {
+    for (unsigned i = 0; i < type->elements_count; i++) {
+        const char *member_name = type->elements[i].name;
+        if (member_name && strcmp(member_name, name) == 0)
+            return &type->elements[i];
+    }
+    return NULL;
+}
+
+/* member_value_ptr: 구조체 안 멤버 값의 위치. 포인터로 담는 멤버(ATF_POINTER)는 따라감(비면 NULL) */
+static const void *member_value_ptr(const asn_TYPE_member_t *member, const void *struct_base) {
+    const void *value_ptr = (const char *)struct_base + member->memb_offset;
+    if (member->flags & ATF_POINTER)
+        value_ptr = *(const void *const *)value_ptr;
+    return value_ptr;
+}
+
+/* choice_selected: CHOICE 에서 고른 갈래와 값 위치. 고른 것이 없으면 NULL 이고 *value_out 도 NULL */
+static const asn_TYPE_member_t *choice_selected(const asn_TYPE_descriptor_t *type, const void *choice_base, const void **value_out) {
+    unsigned present = CHOICE_variant_get_presence(type, choice_base);
+    *value_out = NULL;
+    if (present == 0 || present > type->elements_count)
+        return NULL;
+    const asn_TYPE_member_t *member = &type->elements[present - 1];
+    *value_out = member_value_ptr(member, choice_base);
+    return member;
+}
+
+/* choice_descend: CHOICE 를 고른 갈래대로 max_depth 겹까지 따라 내려감. *type·*value 를 닿은 곳으로 바꿈.
+ *   고른 갈래가 없으면 false. CHOICE 가 아닌 곳에 닿으면 멈추고 true(그곳이 무엇인지는 부르는 쪽이 봄)
+ */
+static bool choice_descend(const asn_TYPE_descriptor_t **type, const void **value, int max_depth) {
+    for (int depth = 0; depth < max_depth && (*type)->op == &asn_OP_CHOICE; depth++) {
+        const void *selected_value = NULL;
+        const asn_TYPE_member_t *selected = choice_selected(*type, *value, &selected_value);
+        if (!selected || !selected_value)
+            return false;
+        *type = selected->type;
+        *value = selected_value;
+    }
+    return true;
+}
+
+/* is_empty_sequence: 멤버가 없는 SEQUENCE {} 인지. 문법의 확장 자리(messageClassExtension, …Future, 끝 nonCriticalExtension)가 이 모양.
+ *   메시지와 본문(…-IEs)은 멤버가 하나 이상이라(문법 조사 2026-11-07: 빈 …-IEs 0곳) 이것으로 가름
+ */
+static bool is_empty_sequence(const asn_TYPE_descriptor_t *type) {
+    return type->op == &asn_OP_SEQUENCE && type->elements_count == 0;
+}
+
+// MARK: - 메시지·본문·확장 자리 찾기
+
+/* channel_message_type: 채널의 문법 최상위 타입(…-Message). 모르는 채널이면 NULL */
+static const asn_TYPE_descriptor_t *channel_message_type(enum rrc_channel channel) {
+    switch (channel) {
+    case RRC_CHANNEL_UL_CCCH:
+        return &asn_DEF_NR_UL_CCCH_Message;
+    case RRC_CHANNEL_UL_CCCH1:
+        return &asn_DEF_NR_UL_CCCH1_Message;
+    case RRC_CHANNEL_UL_DCCH:
+        return &asn_DEF_NR_UL_DCCH_Message;
+    case RRC_CHANNEL_DL_CCCH:
+        return &asn_DEF_NR_DL_CCCH_Message;
+    case RRC_CHANNEL_DL_DCCH:
+        return &asn_DEF_NR_DL_DCCH_Message;
+    case RRC_CHANNEL_NONE:
+        break;
+    }
+    return NULL;
+}
+
+/* message_find: 최상위 …-Message = { message MessageType } 에서 고른 메시지 하나를 찾음.
+ *   MessageType 은 CHOICE { c1 CHOICE {…}, messageClassExtension … }. UL-DCCH 만 messageClassExtension 이 CHOICE { c2 CHOICE {…}, …Future }.
+ *   고른 갈래를 끝까지 따라가 내용 있는 SEQUENCE 에 닿으면 메시지. spare(NULL)·빈 SEQUENCE(확장 자리)면 메시지가 아님.
+ *   반환: 메시지 설명표(이름은 ->name, ASN.1 타입 이름). 값 위치는 *value_out. 메시지가 아니면 NULL
+ */
+static const asn_TYPE_descriptor_t *message_find(const asn_TYPE_descriptor_t *message_type, const void *tree, const void **value_out) {
+    *value_out = NULL;
+    const asn_TYPE_member_t *message_member = member_by_name(message_type, "message");
+    if (!message_member)
+        return NULL;
+    const asn_TYPE_descriptor_t *type = message_member->type;
+    const void *value = member_value_ptr(message_member, tree);
+    if (!value || !choice_descend(&type, &value, MESSAGE_CHOICE_MAX_DEPTH))
+        return NULL;
+    bool is_message = type->op == &asn_OP_SEQUENCE && !is_empty_sequence(type);
+    if (!is_message)
+        return NULL;
+    *value_out = value;
+    return type;
+}
+
+/* body_find: 메시지에서 값이 든 본문(…-IEs)을 찾음. *body_type_out·*body_out 에 본문.
+ *   criticalExtensions 가 있으면 CHOICE 를 따라감(그 안에 c1 이 한 겹 더 있는 메시지 포함). 빈 SEQUENCE(criticalExtensionsFuture)·spare 면 BODY_FUTURE.
+ *   criticalExtensions 가 없는 메시지(RRCSetupRequest 등 = SEQUENCE { …-IEs } 하나)는 그 멤버가 본문. 그 밖의 모양이면 메시지 자체를 본문으로 봄
+ */
+static enum body_result body_find(const asn_TYPE_descriptor_t *message_type, const void *message, const asn_TYPE_descriptor_t **body_type_out,
+                                  const void **body_out) {
+    *body_type_out = message_type;
+    *body_out = message;
+    const asn_TYPE_member_t *extensions_member = member_by_name(message_type, "criticalExtensions");
+    if (!extensions_member) {
+        bool is_single_body = message_type->elements_count == 1 && message_type->elements[0].type->op == &asn_OP_SEQUENCE;
+        const void *single_body = is_single_body ? member_value_ptr(&message_type->elements[0], message) : NULL;
+        if (single_body) {
+            *body_type_out = message_type->elements[0].type;
+            *body_out = single_body;
+        }
+        return BODY_FOUND;
+    }
+
+    const asn_TYPE_descriptor_t *type = extensions_member->type;
+    const void *value = member_value_ptr(extensions_member, message);
+    if (!value || !choice_descend(&type, &value, BODY_CHOICE_MAX_DEPTH))
+        return BODY_FUTURE;
+    bool is_body = type->op == &asn_OP_SEQUENCE && !is_empty_sequence(type);
+    if (!is_body)
+        return BODY_FUTURE;
+    *body_type_out = type;
+    *body_out = value;
+    return BODY_FOUND;
+}
+
+/* extension_slot_find: 본문의 nonCriticalExtension 사슬을 따라가 끝 빈 자리(SEQUENCE {})가 "있음"인지 봄.
+ *   이유: 새 릴리스는 이 빈 자리를 켜고 그 뒤에 새 필드를 붙여, 17.3.0 문법으로 풀면 그 비트가 남음(RRC 지시서 4.5).
+ *   반환: NONE(사슬 없음) / ABSENT(사슬 어딘가가 꺼짐) / PRESENT(끝 빈 자리까지 켜짐)
+ */
+static enum extension_slot extension_slot_find(const asn_TYPE_descriptor_t *body_type, const void *body) {
+    const asn_TYPE_descriptor_t *type = body_type;
+    const void *value = body;
+    for (int i = 0; i < EXTENSION_CHAIN_MAX_LENGTH; i++) {
+        const asn_TYPE_member_t *extension_member = member_by_name(type, "nonCriticalExtension");
+        if (!extension_member)
+            return EXTENSION_SLOT_NONE;
+        const void *extension = member_value_ptr(extension_member, value);
+        if (!extension)
+            return EXTENSION_SLOT_ABSENT;
+        if (is_empty_sequence(extension_member->type))
+            return EXTENSION_SLOT_PRESENT;
+        type = extension_member->type;
+        value = extension;
+    }
+    return EXTENSION_SLOT_NONE;
+}
+
+// MARK: - 해석
+
+/* msg_clear: rrc_msg 를 꺼낸 값이 없는 상태로 만듦. 0 이 올바른 값인 칸(ENUMERATED 순번)은 -1, channel 은 넘겨받은 값 */
+static void msg_clear(struct rrc_msg *rrc_msg, enum rrc_channel channel) {
+    memset(rrc_msg, 0, sizeof(*rrc_msg));
+    rrc_msg->channel = channel;
+    rrc_msg->establishment_cause.value = -1;
+    rrc_msg->ciphering_algorithm.value = -1;
+    rrc_msg->integrity_algorithm.value = -1;
+    rrc_msg->reestablishment_cause.value = -1;
+    rrc_msg->resume_cause.value = -1;
+}
+
+/* rrc_release: 트리 → 내부 상태 순으로 풀고, rrc_msg 의 포인터를 NULL·0 으로. 약속은 rrc.h */
+void rrc_release(struct rrc_msg *rrc_msg) {
+    if (!rrc_msg || !rrc_msg->internal)
+        return;
+    struct rrc_internal *internal = rrc_msg->internal;
+    if (internal->message_type)
+        ASN_STRUCT_FREE(*internal->message_type, internal->message); // message 가 NULL 이어도 됨(asn1c 가 확인)
+    free(internal);
+    rrc_msg->internal = NULL;
+    rrc_msg->nas_pdu_count = 0;
+    rrc_msg->nas_pdus = NULL;
+    rrc_msg->segment_data = NULL;
+    rrc_msg->segment_len = 0;
+}
+
+/* parse_fail: 해석 실패 처리. 잡은 것을 모두 해제하고 rrc_msg 를 값 없는 상태로 되돌림.
+ *   이유: 실패하면 해제할 것이 없고 꺼낸 값도 남지 않는다는 rrc.h 의 약속을 실패하는 곳마다 같은 방법으로 지킴.
+ *   반환: result 그대로
+ */
+static enum rrc_result parse_fail(struct rrc_msg *rrc_msg, enum rrc_result result) {
+    enum rrc_channel channel = rrc_msg->channel;
+    rrc_release(rrc_msg);
+    msg_clear(rrc_msg, channel);
+    return result;
+}
+
+/* rrc_parse: 푸는 방법 검사 → PDCP 떼기 → UPER 디코드 → 메시지 찾기 → 본문 찾기 → 남는 비트 판정(RRC 지시서 4.5).
+ *   내부 상태를 잡은 뒤의 실패는 모두 parse_fail 로 끝냄. 약속(소유권·반환·실패 상태)은 rrc.h
+ */
+enum rrc_result rrc_parse(struct rrc_container_kind kind, const uint8_t *bytes, size_t len, struct rrc_msg *rrc_msg) {
+    if (!rrc_msg)
+        return RRC_DECODE_FAILED;
+    const asn_TYPE_descriptor_t *message_type = channel_message_type(kind.channel);
+    msg_clear(rrc_msg, message_type ? kind.channel : RRC_CHANNEL_NONE);
+
+    // CCCH 는 SRB0 이라 PDCP 를 거치지 않음. CCCH 에 PDCP 모양이면 잘못 고른 것
+    bool is_ccch = kind.channel == RRC_CHANNEL_UL_CCCH || kind.channel == RRC_CHANNEL_UL_CCCH1 || kind.channel == RRC_CHANNEL_DL_CCCH;
+    bool is_plain = kind.encapsulation == RRC_ENCAPSULATION_NONE;
+    bool is_pdcp = kind.encapsulation == RRC_ENCAPSULATION_PDCP && !is_ccch;
+    bool is_valid_kind = message_type && (is_plain || is_pdcp);
+    if (!is_valid_kind || !bytes || len == 0)
+        return RRC_DECODE_FAILED;
+
+    // PDCP 모양이면 머리·꼬리를 떼고 RRC 만. 최소 길이를 먼저 봐서 뺄셈이 0 아래로 내려가지 않게
+    const uint8_t *rrc_bytes = bytes;
+    size_t rrc_len = len;
+    if (is_pdcp) {
+        if (len < PDCP_MIN_BYTES)
+            return RRC_DECODE_FAILED;
+        rrc_bytes = bytes + PDCP_HEADER_BYTES;
+        rrc_len = len - PDCP_HEADER_BYTES - PDCP_MAC_I_BYTES;
+    }
+
+    struct rrc_internal *internal = calloc(1, sizeof(*internal));
+    if (!internal)
+        return RRC_NO_MEMORY;
+    internal->message_type = message_type;
+    rrc_msg->internal = internal;
+
+    // uper_decode 는 다 쓴 양을 비트로 돌려줌. 남은 비트로 4.5 의 판정을 함(uper_decode_complete 는 바이트로 돌려줘 쓰지 않음)
+    const asn_codec_ctx_t decode_ctx = {.max_stack_size = DECODE_MAX_STACK_BYTES};
+    asn_dec_rval_t decoded = uper_decode(&decode_ctx, message_type, &internal->message, rrc_bytes, rrc_len, 0, 0);
+    if (decoded.code != RC_OK || decoded.consumed > rrc_len * BYTE_BITS)
+        return parse_fail(rrc_msg, RRC_DECODE_FAILED);
+    size_t trailing_bits = rrc_len * BYTE_BITS - decoded.consumed;
+
+    const void *message = NULL;
+    const asn_TYPE_descriptor_t *found_type = message_find(message_type, internal->message, &message);
+    if (!found_type)
+        return parse_fail(rrc_msg, RRC_UNKNOWN_MESSAGE);
+    const asn_TYPE_descriptor_t *body_type = NULL;
+    const void *body = NULL;
+    if (body_find(found_type, message, &body_type, &body) == BODY_FUTURE)
+        return parse_fail(rrc_msg, RRC_UNKNOWN_MESSAGE);
+
+    // 채움(8비트 미만)을 넘어 남은 비트는 끝 빈 자리가 켜졌을 때만 새 릴리스 확장으로 받아들임. 그 밖은 의미 없는 바이트가 붙은 것
+    bool has_unexplained_bits = trailing_bits >= BYTE_BITS && extension_slot_find(body_type, body) != EXTENSION_SLOT_PRESENT;
+    if (has_unexplained_bits)
+        return parse_fail(rrc_msg, RRC_DECODE_FAILED);
+
+    rrc_msg->msg_name = found_type->name;
+    rrc_msg->trailing_bits = trailing_bits;
+    return RRC_OK;
+}

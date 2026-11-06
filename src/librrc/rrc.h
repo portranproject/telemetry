@@ -65,7 +65,7 @@ struct rrc_internal;
 //   has_… 가 false 면 짝 값은 0. 메시지별 칸은 그 메시지일 때만 채움
 struct rrc_msg {
     // 메시지 종류
-    enum rrc_channel channel; // 푼 채널(받은 kind 그대로). 방향(UL·DL)도 여기서 앎
+    enum rrc_channel channel; // 푼 채널(받은 kind 그대로, 모르는 채널 값이면 NONE). 방향(UL·DL)도 여기서 앎
     const char *msg_name;     // ASN.1 타입 이름(예 "RRCSetupRequest"). 탐지 명세 msg 철자. 고정 문자열이라 해제 뒤에도 유효
     size_t trailing_bits;     // 진단용: 풀고 남은 비트 수. 8 이상이면 새 릴리스 확장이 붙은 것. 이 값으로 암호문인지 판단하지 않음
 
