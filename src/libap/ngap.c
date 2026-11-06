@@ -63,6 +63,9 @@
 #define AMF_POINTER_BITS 6
 #define FIVEG_TMSI_BYTES 4
 
+// 결과 배열(NAS, TNL 주소, RESET UE)의 첫 칸 수
+#define ARRAY_FIRST_CAPACITY 4
+
 // asn1c 가 모르는 open type 을 버릴 때마다 +1 
 // TODO: libap 밖 의존. 정의는 asn1/asn1_glue.c (libasn1skel.a 에 링크) 확인 가능 
 extern unsigned long asn_portran_opentype_skipped_count;
@@ -295,6 +298,62 @@ static void stmsi48_take(struct ngap_msg *ngap_msg, const NGAP_FiveG_S_TMSI_t *f
 	ngap_msg->has_stmsi48 = true;
 }
 
+// array_grow: 결과 배열을 늘림. 처음이면 ARRAY_FIRST_CAPACITY 칸, 아니면 2배. 실패하면 NULL(array, *capacity 그대로).
+//   개수가 칸 수에 닿았을 때 호출. realloc 으로 자리가 옮겨질 수 있어 호출한 쪽이 포인터를 다시 가리킴
+static void *array_grow(void *array, int *capacity, size_t element_bytes) {
+	if (*capacity > INT_MAX / 2)
+		return NULL;
+	int new_capacity = *capacity == 0 ? ARRAY_FIRST_CAPACITY : *capacity * 2;
+	void *grown = realloc(array, (size_t)new_capacity * element_bytes);
+	if (!grown)
+		return NULL;
+	*capacity = new_capacity;
+	return grown;
+}
+
+// nas_push: NAS-PDU 하나를 nas_ies 끝에 추가. 메모리 부족이면 false
+//   바이트는 복사하지 않고 asn1c 트리 안을 가리킴
+//   길이를 가리지 않고 그대로 넘김. 길이 0 도 한 칸 (개수, 순서 유지). 형식 판정은 libnas (3옥텟 미만은 NAS 메시지 아님, TS 24.501 §9.1.1)
+//   librrc 의 dedicatedNAS-Message 와 같은 규칙
+static bool nas_push(struct ngap_msg *ngap_msg, struct ngap_internal *internal, const OCTET_STRING_t *octets, bool from_pdu_session_item) {
+	if (ngap_msg->nas_ie_count == internal->nas_ie_capacity) {
+		struct ngap_nas *grown = array_grow(internal->nas_ies, &internal->nas_ie_capacity, sizeof(*grown));
+		if (!grown)
+			return false;
+		internal->nas_ies = grown;
+		ngap_msg->nas_ies = grown;
+	}
+	internal->nas_ies[ngap_msg->nas_ie_count] = (struct ngap_nas){
+		.data = octets->size > 0 ? octets->buf : NULL,
+		.len = octets->size,
+		.from_pdu_session_item = from_pdu_session_item,
+	};
+	ngap_msg->nas_ie_count++;
+	return true;
+}
+
+// item_nas_take: PDU 세션 목록(IE 71, 74, 64)의 항목마다 NAS-PDU 를 찾아 nas_ies 에 추가
+//   NAS 멤버는 이름이 아닌 타입으로 고름. 이름이 메시지마다 다름 (nAS-PDU, pDUSessionNAS-PDU)
+//   반환: NGAP_OK / NGAP_NO_MEMORY
+static enum ngap_result item_nas_take(struct ngap_msg *ngap_msg, struct ngap_internal *internal, const struct ie_view *ie) {
+	const asn_anonymous_sequence_ *item_list = _A_CSEQUENCE_FROM_VOID(ie->value);
+	const asn_TYPE_descriptor_t *item_type = ie->type->elements[0].type;
+	for (int i = 0; i < item_list->count; i++) {
+		const void *item = item_list->array[i];
+		if (!item)
+			continue;
+		for (unsigned member_index = 0; member_index < item_type->elements_count; member_index++) {
+			const asn_TYPE_member_t *member = &item_type->elements[member_index];
+			if (member->type != &asn_DEF_NGAP_NAS_PDU)
+				continue;
+			const OCTET_STRING_t *octets = member_value_ptr(member, item);
+			if (octets && !nas_push(ngap_msg, internal, octets, true))
+				return NGAP_NO_MEMORY;
+		}
+	}
+	return NGAP_OK;
+}
+
 // TAKEN_IES: 담는 IE 표. IE 번호 -> 값 타입 (머리 주석 [2] 의 표와 같은 순서)
 static const struct taken_ie {
 	long id;
@@ -305,6 +364,10 @@ static const struct taken_ie {
 	{ NGAP_ProtocolIE_ID_id_UE_NGAP_IDs,       &asn_DEF_NGAP_UE_NGAP_IDs },
 	{ NGAP_ProtocolIE_ID_id_NewAMF_UE_NGAP_ID, &asn_DEF_NGAP_AMF_UE_NGAP_ID },
 	{ NGAP_ProtocolIE_ID_id_FiveG_S_TMSI,      &asn_DEF_NGAP_FiveG_S_TMSI },
+	{ NGAP_ProtocolIE_ID_id_NAS_PDU,                           &asn_DEF_NGAP_NAS_PDU },
+	{ NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListCxtReq, &asn_DEF_NGAP_PDUSessionResourceSetupListCxtReq },
+	{ NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListSUReq,  &asn_DEF_NGAP_PDUSessionResourceSetupListSUReq },
+	{ NGAP_ProtocolIE_ID_id_PDUSessionResourceModifyListModReq, &asn_DEF_NGAP_PDUSessionResourceModifyListModReq },
 };
 
 #define TAKEN_IE_COUNT ((int)(sizeof(TAKEN_IES) / sizeof(TAKEN_IES[0])))
@@ -350,6 +413,14 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 	case NGAP_ProtocolIE_ID_id_FiveG_S_TMSI:
 		stmsi48_take(ngap_msg, ie->value);
 		break;
+	case NGAP_ProtocolIE_ID_id_NAS_PDU:
+		if (!nas_push(ngap_msg, internal, ie->value, false))
+			return NGAP_NO_MEMORY;
+		break;
+	case NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListCxtReq:
+	case NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListSUReq:
+	case NGAP_ProtocolIE_ID_id_PDUSessionResourceModifyListModReq:
+		return item_nas_take(ngap_msg, internal, ie);
 	}
 	return NGAP_OK;
 }
