@@ -4,8 +4,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <BIT_STRING.h>
+#include <INTEGER.h>
+#include <NR_CipheringAlgorithm.h>
 #include <NR_DL-CCCH-Message.h>
 #include <NR_DL-DCCH-Message.h>
+#include <NR_EstablishmentCause.h>
+#include <NR_IntegrityProtAlgorithm.h>
+#include <NR_RRCReconfiguration-IEs.h>
+#include <NR_RRCReject-IEs.h>
+#include <NR_RRCSetupComplete-IEs.h>
+#include <NR_RRCSetupRequest-IEs.h>
+#include <NR_RadioBearerConfig.h>
+#include <NR_SecurityConfig.h>
+#include <NR_SecurityModeCommand-IEs.h>
 #include <NR_UL-CCCH-Message.h>
 #include <NR_UL-CCCH1-Message.h>
 #include <NR_UL-DCCH-Message.h>
@@ -36,6 +48,16 @@
 #define BODY_CHOICE_MAX_DEPTH 2
 // nonCriticalExtension 사슬을 따라가는 상한. 트리는 끝이 있어 닿지 않으며, 생성 코드가 어긋났을 때 멈추지 않는 일을 막는 안전장치
 #define EXTENSION_CHAIN_MAX_LENGTH 32
+
+// RRCSetupRequest ue-Identity(ng-5G-S-TMSI-Part1·randomValue) 비트 수 (문법 nr-rrc-17.3.0.asn1 1393–1394줄 SIZE (39))
+#define UE_IDENTITY_BITS 39
+// RRCSetupComplete ng-5G-S-TMSI 비트 수 (문법 6829줄 NG-5G-S-TMSI ::= BIT STRING (SIZE (48)))
+#define S_TMSI_BITS 48
+// RRCSetupComplete ng-5G-S-TMSI-Part2 비트 수: 5G-S-TMSI 의 왼쪽 9비트. 오른쪽 39비트는 RRCSetupRequest 의 Part1 (TS 38.331 §6.2.2, 문법 1349줄 SIZE (9))
+#define S_TMSI_PART2_BITS 9
+// RRCReject waitTime 범위(초): RejectWaitTime ::= INTEGER (1..16) (문법 9079줄). 디코더가 지키지만 uint8_t 로 옮기기 전에 다시 봄
+#define REJECT_WAIT_TIME_MIN_S 1
+#define REJECT_WAIT_TIME_MAX_S 16
 
 // f1ap_procedure: RRC 컨테이너가 실리는 F1AP 절차 번호 (문법 f1ap-18.8.0.asn 17767–17775줄)
 //   이 7개만 둠. f1ap_msg.procedure_code 는 long 그대로 두고 이 값들과 비교만 함
@@ -228,6 +250,98 @@ static enum extension_slot extension_slot_find(const asn_TYPE_descriptor_t *body
     return EXTENSION_SLOT_NONE;
 }
 
+// MARK: - 값 꺼내기
+
+/* enum_value_take: ENUMERATED 값 → rrc_enum_value. 순번·이름은 asn1c 이름표에서 찾은 것만 씀.
+ *   이유: 출력 층이 탐지 명세 철자("mo-Signalling", "nea0")를 asn1c 없이 만들게 이름까지 넘김.
+ *   이름표에 없는 값(asn1c 가 모르는 확장 값에 넣는 표시 값 등)은 순번으로 믿지 않고 -1·NULL. 이름은 생성 코드의 고정 문자열
+ */
+static struct rrc_enum_value enum_value_take(const asn_TYPE_descriptor_t *type, long value) {
+    struct rrc_enum_value enum_value = {.value = -1, .name = NULL};
+    const asn_INTEGER_enum_map_t *entry = INTEGER_map_value2enum(type->specifics, value);
+    if (!entry)
+        return enum_value;
+    enum_value.value = (int)entry->nat_value;
+    enum_value.name = entry->enum_name;
+    return enum_value;
+}
+
+/* bits_take: 크기가 고정된 BIT STRING → 정수(앞 비트가 높은 자리). 비트 수가 expected_bits 와 같을 때만 *value_out 을 채우고 true.
+ *   이유: 문법의 SIZE 는 디코더가 지키지만, asn1c 판이 바뀌어 담는 모양이 달라져도 버퍼 밖을 읽지 않게 길이부터 봄.
+ *   expected_bits 는 64 이하(ue-Identity 39, S-TMSI 48, Part2 9)
+ */
+static bool bits_take(const BIT_STRING_t *bits, size_t expected_bits, uint64_t *value_out) {
+    size_t expected_bytes = (expected_bits + BYTE_BITS - 1) / BYTE_BITS;
+    int unused_bits = (int)(expected_bytes * BYTE_BITS - expected_bits);
+    bool is_valid = bits->buf
+                 && bits->size == expected_bytes
+                 && bits->bits_unused == unused_bits;
+    if (!is_valid)
+        return false;
+    uint64_t value = 0;
+    for (size_t i = 0; i < expected_bytes; i++)
+        value = (value << BYTE_BITS) | bits->buf[i];
+    *value_out = value >> unused_bits;
+    return true;
+}
+
+/* values_take: 본문 타입으로 메시지를 가려 위 층이 쓰는 값을 rrc_msg 에 꺼냄. 꺼낼 값이 없는 메시지는 그대로 둠.
+ *   이유: 본문은 body_find 가 이미 찾아 다시 내려가지 않고, 본문 타입이 정해지면 asn1c 구조체로 읽어 필드 이름을 컴파일러가 검사.
+ *   값 하나가 문법과 다른 모양이면(비트 수 등) 그 값만 없음으로 둠. body 는 asn1c 트리를 빌림
+ */
+static void values_take(struct rrc_msg *rrc_msg, const asn_TYPE_descriptor_t *body_type, const void *body) {
+    const NR_SecurityAlgorithmConfig_t *security_algorithm_config = NULL;
+    if (body_type == &asn_DEF_NR_RRCSetupRequest_IEs) {
+        const NR_RRCSetupRequest_IEs_t *setup_request = body;
+        rrc_msg->establishment_cause = enum_value_take(&asn_DEF_NR_EstablishmentCause, setup_request->establishmentCause);
+        const NR_InitialUE_Identity_t *ue_identity = &setup_request->ue_Identity;
+        bool is_s_tmsi_part1 = ue_identity->present == NR_InitialUE_Identity_PR_ng_5G_S_TMSI_Part1;
+        bool is_random_value = ue_identity->present == NR_InitialUE_Identity_PR_randomValue;
+        if (is_s_tmsi_part1 && bits_take(&ue_identity->choice.ng_5G_S_TMSI_Part1, UE_IDENTITY_BITS, &rrc_msg->ue_identity))
+            rrc_msg->ue_identity_type = RRC_UE_IDENTITY_NG_5G_S_TMSI_PART1;
+        if (is_random_value && bits_take(&ue_identity->choice.randomValue, UE_IDENTITY_BITS, &rrc_msg->ue_identity))
+            rrc_msg->ue_identity_type = RRC_UE_IDENTITY_RANDOM_VALUE;
+    } else if (body_type == &asn_DEF_NR_RRCSetupComplete_IEs) {
+        const NR_RRCSetupComplete_IEs_t *setup_complete = body;
+        const struct NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value *s_tmsi_value = setup_complete->ng_5G_S_TMSI_Value;
+        bool is_full_s_tmsi = s_tmsi_value && s_tmsi_value->present == NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value_PR_ng_5G_S_TMSI;
+        bool is_s_tmsi_part2 = s_tmsi_value && s_tmsi_value->present == NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value_PR_ng_5G_S_TMSI_Part2;
+        uint64_t s_tmsi_part2 = 0;
+        if (is_full_s_tmsi)
+            rrc_msg->has_s_tmsi = bits_take(&s_tmsi_value->choice.ng_5G_S_TMSI, S_TMSI_BITS, &rrc_msg->s_tmsi);
+        if (is_s_tmsi_part2 && bits_take(&s_tmsi_value->choice.ng_5G_S_TMSI_Part2, S_TMSI_PART2_BITS, &s_tmsi_part2)) {
+            rrc_msg->has_s_tmsi_part2 = true;
+            rrc_msg->s_tmsi_part2 = (uint16_t)s_tmsi_part2; // 9비트라 uint16_t 에 들어감
+        }
+    } else if (body_type == &asn_DEF_NR_RRCReject_IEs) {
+        const NR_RRCReject_IEs_t *reject = body;
+        bool is_wait_time_valid = reject->waitTime
+                               && *reject->waitTime >= REJECT_WAIT_TIME_MIN_S
+                               && *reject->waitTime <= REJECT_WAIT_TIME_MAX_S;
+        if (is_wait_time_valid) {
+            rrc_msg->has_wait_time = true;
+            rrc_msg->wait_time_s = (uint8_t)*reject->waitTime;
+        }
+    } else if (body_type == &asn_DEF_NR_SecurityModeCommand_IEs) {
+        const NR_SecurityModeCommand_IEs_t *security_mode_command = body;
+        security_algorithm_config = &security_mode_command->securityConfigSMC.securityAlgorithmConfig;
+    } else if (body_type == &asn_DEF_NR_RRCReconfiguration_IEs) {
+        // radioBearerConfig.securityConfig.securityAlgorithmConfig 가 모두 있을 때만(셋 다 선택 필드)
+        const NR_RRCReconfiguration_IEs_t *reconfiguration = body;
+        bool has_security_config = reconfiguration->radioBearerConfig && reconfiguration->radioBearerConfig->securityConfig;
+        if (has_security_config)
+            security_algorithm_config = reconfiguration->radioBearerConfig->securityConfig->securityAlgorithmConfig;
+    }
+
+    // SecurityModeCommand·RRCReconfiguration 공통: 같은 SecurityAlgorithmConfig 모양
+    if (!security_algorithm_config)
+        return;
+    rrc_msg->has_security_algorithm = true;
+    rrc_msg->ciphering_algorithm = enum_value_take(&asn_DEF_NR_CipheringAlgorithm, security_algorithm_config->cipheringAlgorithm);
+    if (security_algorithm_config->integrityProtAlgorithm)
+        rrc_msg->integrity_algorithm = enum_value_take(&asn_DEF_NR_IntegrityProtAlgorithm, *security_algorithm_config->integrityProtAlgorithm);
+}
+
 // MARK: - 해석
 
 /* msg_clear: rrc_msg 를 꺼낸 값이 없는 상태로 만듦. 0 이 올바른 값인 칸(ENUMERATED 순번)은 -1, channel 은 넘겨받은 값 */
@@ -267,7 +381,7 @@ static enum rrc_result parse_fail(struct rrc_msg *rrc_msg, enum rrc_result resul
     return result;
 }
 
-/* rrc_parse: 푸는 방법 검사 → PDCP 떼기 → UPER 디코드 → 메시지 찾기 → 본문 찾기 → 남는 비트 판정.
+/* rrc_parse: 푸는 방법 검사 → PDCP 떼기 → UPER 디코드 → 메시지 찾기 → 본문 찾기 → 남는 비트 판정 → 값 꺼내기.
  *   내부 상태를 잡은 뒤의 실패는 모두 parse_fail 로 끝냄. 약속(소유권·반환·실패 상태)은 rrc.h
  */
 enum rrc_result rrc_parse(struct rrc_container_kind kind, const uint8_t *bytes, size_t len, struct rrc_msg *rrc_msg) {
@@ -321,6 +435,7 @@ enum rrc_result rrc_parse(struct rrc_container_kind kind, const uint8_t *bytes, 
     if (has_unexplained_bits)
         return parse_fail(rrc_msg, RRC_DECODE_FAILED);
 
+    values_take(rrc_msg, body_type, body);
     rrc_msg->msg_name = found_type->name;
     rrc_msg->trailing_bits = trailing_bits;
     return RRC_OK;
