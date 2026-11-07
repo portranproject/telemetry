@@ -9,12 +9,15 @@
 #include <NR_CipheringAlgorithm.h>
 #include <NR_DL-CCCH-Message.h>
 #include <NR_DL-DCCH-Message.h>
+#include <NR_DLInformationTransfer-IEs.h>
 #include <NR_EstablishmentCause.h>
 #include <NR_IntegrityProtAlgorithm.h>
 #include <NR_RRCReconfiguration-IEs.h>
+#include <NR_RRCReconfiguration-v1530-IEs.h>
 #include <NR_RRCReestablishmentRequest-IEs.h>
 #include <NR_RRCReject-IEs.h>
 #include <NR_RRCRelease-IEs.h>
+#include <NR_RRCResumeComplete-IEs.h>
 #include <NR_RRCResumeRequest-IEs.h>
 #include <NR_RRCResumeRequest1-IEs.h>
 #include <NR_RRCSetupComplete-IEs.h>
@@ -29,6 +32,7 @@
 #include <NR_UL-CCCH1-Message.h>
 #include <NR_UL-DCCH-Message.h>
 #include <NR_ULDedicatedMessageSegment-r16-IEs.h>
+#include <NR_ULInformationTransfer-IEs.h>
 #include <OCTET_STRING.h>
 #include <constr_CHOICE.h>
 #include <constr_SEQUENCE.h>
@@ -77,6 +81,9 @@
 #define PHYS_CELL_ID_MAX 1007
 // ULDedicatedMessageSegment-r16 segmentNumber-r16 상한: INTEGER (0..15) (문법 2539줄). uint8_t 로 옮기기 전에 봄
 #define SEGMENT_NUMBER_MAX 15
+// RRCReconfiguration dedicatedNAS-MessageList 의 문법 상한 maxDRB (문법 804·18839줄 SIZE(1..maxDRB), maxDRB ::= 29).
+//   asn1c 디코더는 개수를 5비트로 읽어 30~32개도 받아들임(CU 확인) → 넘으면 해석 실패
+#define NAS_PDU_MAX_COUNT 29
 
 // f1ap_procedure: RRC 컨테이너가 실리는 F1AP 절차 번호 (문법 f1ap-18.8.0.asn 17767–17775줄)
 //   이 7개만 둠. f1ap_msg.procedure_code 는 long 그대로 두고 이 값들과 비교만 함
@@ -104,6 +111,7 @@ enum f1ap_procedure {
 struct rrc_internal {
     const asn_TYPE_descriptor_t *message_type; // 트리를 푼 최상위 타입(채널마다 다름). 해제할 때 같은 타입으로 풀어야 함
     void *message;                             // asn1c 가 디코드한 트리. NAS·조각 포인터가 이 트리를 빌림
+    struct rrc_nas_pdu *nas_pdus;              // rrc_msg.nas_pdus 가 가리키는 배열(nas_take 가 할당). 칸이 가리키는 바이트는 트리 소유라 배열만 해제
 };
 
 // body_result: 메시지에서 본문을 찾은 결과
@@ -452,6 +460,58 @@ static void values_take(struct rrc_msg *rrc_msg, const asn_TYPE_descriptor_t *bo
     }
 }
 
+/* nas_take: NAS 를 싣는 메시지 5종에서 NAS 를 찾아 메시지 안 순서대로 nas_pdus 배열을 만듦. NAS 가 없으면(목록 0개도) 0·NULL.
+ *   이유: 메시지마다 NAS 칸의 위치는 달라도 찾은 뒤의 규칙(개수 검사, 한 번 할당, 소유, 실패)은 같아 한곳에 모음.
+ *   0바이트 NAS 도 len 0 항목으로 남김(이상한 입력이 있었다는 사실이 NAS 층에서 사라지지 않게). 바이트는 트리를 가리켜 rrc_release 전까지 유효.
+ *   반환: RRC_OK / RRC_DECODE_FAILED(목록이 문법 상한 초과) / RRC_NO_MEMORY(배열 할당 실패). 배열은 internal 이 소유하고 rrc_release 가 해제
+ */
+static enum rrc_result nas_take(struct rrc_msg *rrc_msg, struct rrc_internal *internal, const asn_TYPE_descriptor_t *body_type, const void *body) {
+    const OCTET_STRING_t *single_nas = NULL;                                                 // NAS 하나를 싣는 칸(4종). 선택 필드면 NULL 일 수 있음
+    const struct NR_RRCReconfiguration_v1530_IEs__dedicatedNAS_MessageList *nas_list = NULL; // RRCReconfiguration 의 목록
+    if (body_type == &asn_DEF_NR_RRCSetupComplete_IEs) {
+        const NR_RRCSetupComplete_IEs_t *setup_complete = body;
+        single_nas = &setup_complete->dedicatedNAS_Message;
+    } else if (body_type == &asn_DEF_NR_RRCResumeComplete_IEs) {
+        const NR_RRCResumeComplete_IEs_t *resume_complete = body;
+        single_nas = resume_complete->dedicatedNAS_Message;
+    } else if (body_type == &asn_DEF_NR_ULInformationTransfer_IEs) {
+        const NR_ULInformationTransfer_IEs_t *ul_information_transfer = body;
+        single_nas = ul_information_transfer->dedicatedNAS_Message;
+    } else if (body_type == &asn_DEF_NR_DLInformationTransfer_IEs) {
+        const NR_DLInformationTransfer_IEs_t *dl_information_transfer = body;
+        single_nas = dl_information_transfer->dedicatedNAS_Message;
+    } else if (body_type == &asn_DEF_NR_RRCReconfiguration_IEs) {
+        const NR_RRCReconfiguration_IEs_t *reconfiguration = body;
+        if (reconfiguration->nonCriticalExtension)
+            nas_list = reconfiguration->nonCriticalExtension->dedicatedNAS_MessageList;
+    }
+
+    int nas_count = 0;
+    if (nas_list)
+        nas_count = nas_list->list.count;
+    else if (single_nas)
+        nas_count = 1;
+    if (nas_count == 0)
+        return RRC_OK; // 할당하지 않음(calloc(0) 은 NULL 을 돌려줄 수 있어 할당 실패와 헷갈림)
+    if (nas_count > NAS_PDU_MAX_COUNT)
+        return RRC_DECODE_FAILED;
+
+    struct rrc_nas_pdu *nas_pdus = calloc((size_t)nas_count, sizeof(*nas_pdus));
+    if (!nas_pdus)
+        return RRC_NO_MEMORY;
+    internal->nas_pdus = nas_pdus;
+    for (int i = 0; i < nas_count; i++) {
+        const OCTET_STRING_t *nas = single_nas;
+        if (nas_list)
+            nas = nas_list->list.array[i];
+        nas_pdus[i].data = nas->buf;
+        nas_pdus[i].len = nas->size;
+    }
+    rrc_msg->nas_pdus = nas_pdus;
+    rrc_msg->nas_pdu_count = nas_count;
+    return RRC_OK;
+}
+
 // MARK: - 해석
 
 /* msg_clear: rrc_msg 를 꺼낸 값이 없는 상태로 만듦. 0 이 올바른 값인 칸(ENUMERATED 순번)은 -1, channel 은 넘겨받은 값 */
@@ -472,6 +532,7 @@ void rrc_release(struct rrc_msg *rrc_msg) {
     struct rrc_internal *internal = rrc_msg->internal;
     if (internal->message_type)
         ASN_STRUCT_FREE(*internal->message_type, internal->message); // message 가 NULL 이어도 됨(asn1c 가 확인)
+    free(internal->nas_pdus);
     free(internal);
     rrc_msg->internal = NULL;
     rrc_msg->nas_pdu_count = 0;
@@ -491,7 +552,7 @@ static enum rrc_result parse_fail(struct rrc_msg *rrc_msg, enum rrc_result resul
     return result;
 }
 
-/* rrc_parse: 푸는 방법 검사 → PDCP 떼기 → UPER 디코드 → 메시지 찾기 → 본문 찾기 → 남는 비트 판정 → 값 꺼내기.
+/* rrc_parse: 푸는 방법 검사 → PDCP 떼기 → UPER 디코드 → 메시지 찾기 → 본문 찾기 → 남는 비트 판정 → 값 꺼내기 → NAS 꺼내기.
  *   내부 상태를 잡은 뒤의 실패는 모두 parse_fail 로 끝냄. 약속(소유권·반환·실패 상태)은 rrc.h
  */
 enum rrc_result rrc_parse(struct rrc_container_kind kind, const uint8_t *bytes, size_t len, struct rrc_msg *rrc_msg) {
@@ -546,6 +607,9 @@ enum rrc_result rrc_parse(struct rrc_container_kind kind, const uint8_t *bytes, 
         return parse_fail(rrc_msg, RRC_DECODE_FAILED);
 
     values_take(rrc_msg, body_type, body);
+    enum rrc_result nas_result = nas_take(rrc_msg, internal, body_type, body);
+    if (nas_result != RRC_OK)
+        return parse_fail(rrc_msg, nas_result); // 앞서 꺼낸 값까지 모두 비움
     rrc_msg->msg_name = found_type->name;
     rrc_msg->trailing_bits = trailing_bits;
     return RRC_OK;
