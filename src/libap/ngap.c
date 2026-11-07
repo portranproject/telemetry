@@ -182,7 +182,9 @@ struct ngap_internal {
 	struct ngap_nas *nas_ies;
 	int nas_ie_capacity;
 	uint32_t *tnla_add_ipv4;
+	int tnla_add_capacity;
 	uint32_t *tnla_remove_ipv4;
+	int tnla_remove_capacity;
 	struct ngap_reset_ue *reset_ues;
 	int reset_ue_capacity;
 	// 이 PDU 에서 이미 본 IE. 비트 n = TAKEN_IES[n]. 중복 판정용
@@ -582,14 +584,12 @@ static enum ngap_result item_nas_take(struct ngap_msg *ngap_msg, struct ngap_int
 //     그 외       IP 주소 아님      rejected_ie_count
 //
 //   폭 = size * 8 - bits_unused. size 만 보면 25비트 주소도 4옥텟이라 IPv4 로 읽힘
-//   capacity 가 지역 변수인 전제: IE 6, IE 7 은 seen_ie_mask 로 PDU 당 한 번만 옴 -> 배열은 이 호출 안에서만 자람
 //   반환: NGAP_OK / NGAP_NO_MEMORY (그때까지 모은 배열은 *ipv4_out 에 남음. 해제는 ngap_release)
-static enum ngap_result tnla_take(struct ngap_msg *ngap_msg, const struct ie_view *ie, uint32_t **ipv4_out, int *count_out) {
+static enum ngap_result tnla_take(struct ngap_msg *ngap_msg, const struct ie_view *ie, uint32_t **ipv4_out, int *count_out, int *capacity_out) {
 	const asn_anonymous_sequence_ *item_list = _A_CSEQUENCE_FROM_VOID(ie->value);
 	const asn_TYPE_member_t *address_member = member_by_name(ie->type->elements[0].type, "aMF-TNLAssociationAddress");
 	if (!address_member || address_member->type != &asn_DEF_NGAP_CPTransportLayerInformation)
 		return NGAP_OK;
-	int capacity = 0;
 	for (int i = 0; i < item_list->count; i++) {
 		const void *item = item_list->array[i];
 		if (!item)
@@ -615,8 +615,8 @@ static enum ngap_result tnla_take(struct ngap_msg *ngap_msg, const struct ie_vie
 			ngap_msg->rejected_ie_count++;
 			continue;
 		}
-		if (*count_out == capacity) {
-			uint32_t *grown = array_grow(*ipv4_out, &capacity, sizeof(*grown));
+		if (*count_out == *capacity_out) {
+			uint32_t *grown = array_grow(*ipv4_out, capacity_out, sizeof(*grown));
 			if (!grown)
 				return NGAP_NO_MEMORY;
 			*ipv4_out = grown;
@@ -797,12 +797,12 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 		ngap_msg->ue_contexts_retained = enum_read(ngap_msg, *(const NGAP_UERetentionInformation_t *)ie->value) == NGAP_UERetentionInformation_ues_retained;
 		break;
 	case NGAP_ProtocolIE_ID_id_AMF_TNLAssociationToAddList: {
-		enum ngap_result result = tnla_take(ngap_msg, ie, &internal->tnla_add_ipv4, &ngap_msg->tnla_add_count);
+		enum ngap_result result = tnla_take(ngap_msg, ie, &internal->tnla_add_ipv4, &ngap_msg->tnla_add_count, &internal->tnla_add_capacity);
 		ngap_msg->tnla_add_ipv4 = internal->tnla_add_ipv4;
 		return result;
 	}
 	case NGAP_ProtocolIE_ID_id_AMF_TNLAssociationToRemoveList: {
-		enum ngap_result result = tnla_take(ngap_msg, ie, &internal->tnla_remove_ipv4, &ngap_msg->tnla_remove_count);
+		enum ngap_result result = tnla_take(ngap_msg, ie, &internal->tnla_remove_ipv4, &ngap_msg->tnla_remove_count, &internal->tnla_remove_capacity);
 		ngap_msg->tnla_remove_ipv4 = internal->tnla_remove_ipv4;
 		return result;
 	}
