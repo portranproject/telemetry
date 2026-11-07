@@ -44,9 +44,14 @@ enum f1ap_pdu_type {
 //   집계는 번호, 출력 층은 이름("radioNetwork:…")을 씀. 이름은 고정 문자열이라 f1ap_release 뒤에도 유효
 struct ap_cause {
     bool is_present;
-    int group;              // 범주 순번(문법 순서, 0부터): 0 radioNetwork, 1 transport, 2 protocol, 3 misc, 4 choice-extension. 없으면 -1(0 은 radioNetwork 라서)
+    // 범주 순번(문법 순서, 0부터). 없으면 -1(0 은 radioNetwork 라서)
+    //   F1AP  0 radioNetwork, 1 transport, 2 protocol, 3 misc, 4 choice-extension
+    //   NGAP  0 radioNetwork, 1 transport, 2 nas, 3 protocol, 4 misc, 5 choice-Extensions
+    //   두 문법의 순번이 다름. 번호로 집계하면 어느 쪽에서 나온 값인지 같이 들고 갈 것
+    int group;
     const char *group_name; // 예: "radioNetwork". 없으면 NULL
-    int value;              // 범주 안 값 순번(예 10 = normal-release). 모르는 값이면 -1
+    // 범주 안 값 순번. 모르는 값이면 -1. 범주마다 다른 열거라 group 없이는 뜻이 없음
+    int value;
     const char *value_name; // 예: "normal-release". value 가 -1 이면 NULL
 };
 
@@ -126,5 +131,149 @@ enum f1ap_result f1ap_parse(const uint8_t *pdu_bytes, size_t len, struct f1ap_ms
  *   f1ap_msg 가 NULL 이거나 해제할 것이 없으면 아무것도 하지 않음. 두 번 불러도 됨.
  */
 void f1ap_release(struct f1ap_msg *f1ap_msg);
+
+// ---- 아래는 NGAP (ngap.c). 위의 nr_cgi, reset_type, ap_cause 공유 ----
+//
+//   읽는 순서    1. ngap_parse 의 반환이 NGAP_OK 인지 확인   2. 필드
+//   없음 표기    has_* = false / 숫자 -1 / 포인터 NULL
+enum ngap_result {
+	NGAP_OK = 0,
+	// 해석 실패, 남는 바이트, 입력 없음(NULL, 길이 0)
+	NGAP_DECODE_FAILED,
+	// APER 로는 풀렸지만 문법(15.8.0)에 없는 (절차, PDU 종류).
+	NGAP_UNKNOWN_MESSAGE,
+	// ngap.c 의 할당 실패. asn1c 안의 할당 실패는 NGAP_DECODE_FAILED
+	NGAP_NO_MEMORY,
+};
+
+// 요청, 성공 응답, 실패 응답. 0 = 값 없음
+enum ngap_pdu_type {
+	NGAP_PDU_INITIATING = 1,
+	NGAP_PDU_SUCCESSFUL,
+	NGAP_PDU_UNSUCCESSFUL,
+};
+
+// NAS-PDU 하나. 바이트는 해석하지 않고 넘김 (해석은 libnas)
+struct ngap_nas {
+	// ngap_release 전까지 유효. len 이 0 이면 NULL (길이 0 NAS-PDU 도 한 칸으로 넘김. len 을 먼저 볼 것)
+	const uint8_t *data;
+	size_t len;
+	// true: PDU 세션 목록의 항목에서 옴. false: 최상위 IE 38
+	bool from_pdu_session_item;
+};
+
+// 일부 NG RESET 목록의 UE 하나 (TS 38.413 §9.3.3.25). 두 번호 모두 선택 필드 -> 둘 다 없는 항목도 그대로 넘김
+struct ngap_reset_ue {
+	bool has_amf_ue_ngap_id;
+	uint64_t amf_ue_ngap_id;
+	bool has_ran_ue_ngap_id;
+	uint32_t ran_ue_ngap_id;
+};
+
+// ngap_internal: ngap.c 전용 상태(트리·배열). asn1c 타입을 헤더에 두지 않으려고 이름만
+struct ngap_internal;
+
+// NGAP PDU 하나에서 꺼낸 값. ngap_parse 가 채우고 ngap_release 가 해제
+//   has_* 가 false 면 짝 값은 0. IE 가 없거나 값이 규격 범위 밖이면 false
+struct ngap_msg {
+	// [메시지 종류] 반환이 NGAP_OK 일 때만 유효
+	// 0..255
+	long procedure_code;
+	enum ngap_pdu_type pdu_type;
+	// 예: "InitialUEMessage". 고정 문자열 -> 해제 뒤에도 유효
+	const char *msg_name;
+
+	// [UE 식별]
+	// IE 85, 또는 UE-NGAP-IDs(IE 114) 짝의 RAN 쪽. gNB 가 UE 에 붙인 번호
+	bool has_ran_ue_ngap_id;
+	uint32_t ran_ue_ngap_id;
+	// IE 10, 또는 IE 114 의 AMF 쪽. AMF 가 붙인 번호 (0..2^40-1)
+	bool has_amf_ue_ngap_id;
+	uint64_t amf_ue_ngap_id;
+	// IE 40. UE CONTEXT MODIFICATION REQUEST 가 AMF 쪽 번호를 바꿈 (TS 38.413 §8.3.4.2)
+	bool has_new_amf_ue_ngap_id;
+	uint64_t new_amf_ue_ngap_id;
+	// IE 26 5G-S-TMSI. AMF Set ID(10비트) << 38 | AMF Pointer(6) << 32 | 5G-TMSI(32)
+	//   RRC 의 ng-5G-S-TMSI 와 같은 값 (TS 23.003 §2.10.1)
+	bool has_stmsi48;
+	uint64_t stmsi48;
+
+	// [F1 쪽과 짝짓기]
+	// IE 38 과 PDU 세션 목록 항목의 NAS-PDU 전부 (메시지 안 순서). 없으면 NULL
+	int nas_ie_count;
+	const struct ngap_nas *nas_ies;
+	// IE 90. 순번 0..10. 없거나 이 문법이 모르는 확장값이면 -1
+	int rrc_establishment_cause;
+	// IE 121 User Location Information 의 NR CGI. NR 위치가 아니면 is_valid false
+	struct nr_cgi uli_nr_cgi;
+
+	// [연결 수명]
+	// IE 15. 해제, 실패 원인
+	struct ap_cause cause;
+	// IE 88. NG RESET 에만 존재
+	enum reset_type reset_type;
+	// 일부 RESET(partOfNG-Interface) 목록의 UE (메시지 안 순서). 없으면 NULL
+	//   NG RESET ACKNOWLEDGE 의 목록(IE 111)은 꺼내지 않음
+	int reset_ue_count;
+	const struct ngap_reset_ue *reset_ues;
+
+	// [AMF 상태]
+	// IE 2 가 있었음. 조치 순번 n -> 1 << n. 조치가 없는 꼴(choice-Extensions)이거나 모르는 확장 조치면 마스크 0
+	bool overload_response_present;
+	uint32_t overload_action_mask;
+	// IE 9. 1..99 (%). 없거나 범위 밖이면 -1
+	int traffic_load_reduction_percent;
+	// IE 49 가 있었음. 항목 안의 슬라이스별 조치, 감축률은 담지 않음
+	bool overload_nssai_list_present;
+	// IE 1. PrintableString 1..150 옥텟. 길이는 amf_name_len. 없으면 NULL
+	const char *amf_name;
+	size_t amf_name_len;
+	// IE 96 Served GUAMI List 의 64비트 요약. 같은 AMF 인지 비교하는 용도
+	bool has_guami_digest;
+	uint64_t guami_digest;
+	// IE 147 이 ues-retained 일 때만 true. NG SETUP REQUEST, RESPONSE 둘 다 실을 수 있음
+	bool ue_contexts_retained;
+	// IE 6, IE 7 의 IPv4 주소 (받은 바이트 순서). '주소만' 꼴과 '주소 + 포트' 꼴(IE 169) 둘 다. IPv6 는 담지 않음. 없으면 NULL
+	int tnla_add_count;
+	const uint32_t *tnla_add_ipv4;
+	int tnla_remove_count;
+	const uint32_t *tnla_remove_ipv4;
+
+	// [RRC INACTIVE 판정]
+	// IE 92. 0 inactive, 1 connected. 없거나 이 문법이 모르는 확장값이면 -1
+	int rrc_state;
+	// IE 18 이 있었음. 실을 수 있는 메시지 4종: INITIAL CONTEXT SETUP REQUEST, UE CONTEXT MODIFICATION REQUEST,
+	//   HANDOVER REQUEST, PATH SWITCH REQUEST ACKNOWLEDGE
+	bool core_network_assistance_present;
+	// IE 91 이 보고를 요청하는 두 값일 때만 true. cancel-report, 모르는 확장값, 없음은 false
+	bool inactive_report_requested;
+
+	// [계수] '없음' 과 '있었지만 담지 않음' 을 가름
+	// 문법이 모르거나 그 메시지에 없어 asn1c 가 버린 IE 수. 최상위, 중첩 IE, PrivateMessage 의 사설 IE 를 합친 수 (어느 층인지는 가르지 않음)
+	int unknown_ie_count;
+	// 값이 규격 범위 밖이거나 이 문법이 모르는 열거 확장값이라 담지 않은 수 (IE 또는 목록 항목 단위)
+	//   열거 확장값을 세는 자리: IE 90, 92, 91, 147, ResetType 의 ResetAll. Cause, Overload Action 은 세지 않음 (있음 표시가 따로 있음)
+	int rejected_ie_count;
+	// 담는 IE 가 두 번째 이후로 온 수 (TS 38.413 §10.3.6). 같은 IE 세 번이면 2. 첫 것만 담음 (첫 것이 거부됐어도)
+	int duplicate_ie_count;
+
+	// ngap.c 전용 (asn1c 트리, 배열)
+	struct ngap_internal *internal;
+};
+
+// ngap_parse: NGAP PDU 하나를 해석해 ngap_msg 를 채움.
+//   pdu_bytes 는 빌려 씀 (돌아온 뒤 안 씀). 남는 바이트가 있으면 NGAP_DECODE_FAILED
+//   반환: NGAP_OK / NGAP_DECODE_FAILED / NGAP_UNKNOWN_MESSAGE / NGAP_NO_MEMORY
+//   실패하면 값 없는 상태 (has_* false, 개수 0, 숫자 -1). 해제할 것 없음. ngap_release 는 결과와 상관없이 불러도 됨
+//   성공한 결과가 든 ngap_msg 는 ngap_release 한 뒤 다시 넘길 것
+//   스레드: 한 번에 한 스레드만. asn1c 가 모르는 IE·ENUMERATED 를 만나면 잠금 없는 전역 계수기를 올리고(asn1/asn1_glue.c),
+//           unknown_ie_count 는 디코드 앞뒤의 그 차로 구함 -> 동시에 부르면 다른 스레드의 증가분이 섞임
+enum ngap_result ngap_parse(const uint8_t *pdu_bytes, size_t len, struct ngap_msg *ngap_msg);
+
+// ngap_release: ngap_parse 가 잡은 asn1c 트리와 배열을 해제
+//   돌아온 뒤 nas_ies, tnla_add_ipv4, tnla_remove_ipv4, reset_ues, amf_name 은 NULL, 개수는 0
+//   msg_name, cause 의 이름은 고정 문자열 -> 그대로 유효
+//   ngap_msg 가 NULL 이거나 해제할 것이 없으면 아무것도 하지 않음. 두 번 불러도 됨
+void ngap_release(struct ngap_msg *ngap_msg);
 
 #endif /* TELEMETRY_AP_H */
