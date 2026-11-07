@@ -44,9 +44,14 @@ enum f1ap_pdu_type {
 //   집계는 번호, 출력 층은 이름("radioNetwork:…")을 씀. 이름은 고정 문자열이라 f1ap_release 뒤에도 유효
 struct ap_cause {
     bool is_present;
-    int group;              // 범주 순번(문법 순서, 0부터): 0 radioNetwork, 1 transport, 2 protocol, 3 misc, 4 choice-extension. 없으면 -1(0 은 radioNetwork 라서)
+    // 범주 순번(문법 순서, 0부터). 없으면 -1(0 은 radioNetwork 라서)
+    //   F1AP  0 radioNetwork, 1 transport, 2 protocol, 3 misc, 4 choice-extension
+    //   NGAP  0 radioNetwork, 1 transport, 2 nas, 3 protocol, 4 misc, 5 choice-Extensions
+    //   두 문법의 순번이 다름. 번호로 집계하면 어느 쪽에서 나온 값인지 같이 들고 갈 것
+    int group;
     const char *group_name; // 예: "radioNetwork". 없으면 NULL
-    int value;              // 범주 안 값 순번(예 10 = normal-release). 모르는 값이면 -1
+    // 범주 안 값 순번. 모르는 값이면 -1. 범주마다 다른 열거라 group 없이는 뜻이 없음
+    int value;
     const char *value_name; // 예: "normal-release". value 가 -1 이면 NULL
 };
 
@@ -128,6 +133,9 @@ enum f1ap_result f1ap_parse(const uint8_t *pdu_bytes, size_t len, struct f1ap_ms
 void f1ap_release(struct f1ap_msg *f1ap_msg);
 
 // ---- 아래는 NGAP (ngap.c). 위의 nr_cgi, reset_type, ap_cause 공유 ----
+//
+//   읽는 순서    1. ngap_parse 의 반환이 NGAP_OK 인지 확인   2. 필드
+//   없음 표기    has_* = false / 숫자 -1 / 포인터 NULL
 enum ngap_result {
 	NGAP_OK = 0,
 	// 해석 실패, 남는 바이트, 입력 없음(NULL, 길이 0)
@@ -161,6 +169,9 @@ struct ngap_reset_ue {
 	bool has_ran_ue_ngap_id;
 	uint32_t ran_ue_ngap_id;
 };
+
+// ngap_internal: ngap.c 전용 상태(트리·배열). asn1c 타입을 헤더에 두지 않으려고 이름만
+struct ngap_internal;
 
 // NGAP PDU 하나에서 꺼낸 값. ngap_parse 가 채우고 ngap_release 가 해제
 //   has_* 가 false 면 짝 값은 0. IE 가 없거나 값이 규격 범위 밖이면 false
@@ -255,6 +266,8 @@ struct ngap_msg {
 //   반환: NGAP_OK / NGAP_DECODE_FAILED / NGAP_UNKNOWN_MESSAGE / NGAP_NO_MEMORY
 //   실패하면 값 없는 상태 (has_* false, 개수 0, 숫자 -1). 해제할 것 없음. ngap_release 는 결과와 상관없이 불러도 됨
 //   성공한 결과가 든 ngap_msg 는 ngap_release 한 뒤 다시 넘길 것
+//   스레드: 한 번에 한 스레드만. asn1c 가 모르는 IE·ENUMERATED 를 만나면 잠금 없는 전역 계수기를 올리고(asn1/asn1_glue.c),
+//           unknown_ie_count 는 디코드 앞뒤의 그 차로 구함 -> 동시에 부르면 다른 스레드의 증가분이 섞임
 enum ngap_result ngap_parse(const uint8_t *pdu_bytes, size_t len, struct ngap_msg *ngap_msg);
 
 // ngap_release: ngap_parse 가 잡은 asn1c 트리와 배열을 해제
