@@ -81,4 +81,61 @@ enum nas_reg_type {
 	NAS_REG_DISASTER_MOBILITY = 6,
 	NAS_REG_DISASTER_INITIAL = 7
 };
+
+/* NAS-PDU 의 두 가지 형태. 보호된 패킷은 안쪽에 평문을 그대로 품음.
+ *
+ *   평문                      보호됨
+ *   +-----+-----+------+      +-----+-----+-------+----+-------------------+
+ *   | EPD | SHT | TYPE |      | EPD | SHT |  MAC  | SN |  평문 (3~n)       |
+ *   +-----+-----+------+      +-----+-----+-------+----+-------------------+
+ *      1     1     1             1     1     4      1   ^ 여기를 다시 읽음
+ *
+ *   SHT  0 = 평문 · 1~4 = 보호됨 · 5~15 = 예약 (표 9.3.1)
+ *        2 · 4 는 암호라 호출자가 알고리즘을 알려 줘야 안쪽을 읽음
+ *
+ *   sht = -1 의 뜻 셋과 가리는 법
+ *        epd == 0x2e           5GSM 이라 보안 머리가 없음 (9.4)
+ *        epd == -1             옥텟 2 를 못 읽음
+ *        reserved_sht_count    예약값이라 담지 않음
+ */
+struct nas_msg {
+	int epd;                        // 옥텟 1
+	int sht;                        // 옥텟 2
+	int msg_type;                   // 옥텟 3
+	enum nas_msg_direction msg_type_direction;
+	bool inner_readable;            // 본문을 읽었나. 5GSM·SHT 0 도 참임
+	int nas_sequence_number;        // 보호된 형태의 SN 옥텟 (8.2.28)
+
+	bool has_sec_alg;               // SMC 의 선택 알고리즘 (9.11.3.34). 0 = NEA0·NIA0 가 정당한
+	int nas_ciph_alg;               //      값이라 센티널만으로는 '골랐다' 와 '안 읽었다' 를 못 가림
+	int nas_integ_alg;
+
+	int mm_cause;                   // 5GMM 원인 (9.11.3.2)
+	bool has_stmsi48;               // 5G-GUTI (형 2) · 5G-S-TMSI (형 4) 에서 얻음
+	uint64_t stmsi48;               //      AMF Set ID 10b | AMF Pointer 6b | 5G-TMSI 32b
+	int reg_type;                   // 등록 유형 (9.11.3.7) 하위 3비트. 범위 검사 없음 -
+					// 	표 9.11.3.7.1 이 3비트 값 전부에 뜻을 줌
+
+	/* 담지 않은 이유. 음수 반환 때는 합이 1 임 (그 자리에서 멈추므로).
+	 *   rc=0 에서는 선택 IE 주사가 IE 마다 올려 1 보다 클 수 있음 */
+	int truncated_count;            // 길이가 모자라 머리조차 못 읽음
+	int epd_mismatch_count;         // EPD 가 5GMM·5GSM 둘 다 아님 (안쪽이 5GSM 인 경우 포함)
+	int reserved_sht_count;         // SHT 5~15 (표 9.3.1 "All other values are reserved.")
+	int unknown_msg_type_count;     // 표 9.7.1·9.7.2 에 없는 타입
+	int missing_mandatory_ie_count; // 필수 IE 가 길이 밖
+	int rejected_ie_count;          // IE 값이나 길이가 규격 밖. 담으면 확신 있는 오값이 됨
+	int ie_scan_aborted_count;      // 선언된 IE 길이가 메시지 끝을 넘어 주사를 못 끝냄
+};
+// 위 필드 중 못 읽은 것은 -1 임. bool 짝이 있는 것 (has_sec_alg · has_stmsi48) 은 그 짝으로 가림
+
+// nas_parse: NAS-PDU 하나에서 값과 '담지 않은 이유' 를 채움.
+// 	known_nas_ciph_alg: 그 단말의 NAS 암호 알고리즘. 0 = NEA0, -1 = 모름 (암호 안쪽을 안 읽음)
+// 	반환: 0 = 해석함, 음수 = 형식 오류. 음수일 때 읽어도 되는 필드는 위 [2]
+// 	힙을 쓰지 않으므로 실패해도 해제할 것 없음
+int nas_parse(const uint8_t *buf, size_t len, int known_nas_ciph_alg, struct nas_msg *nas_msg);
+
+// nas_msg_name: (EPD, 타입) -> 표 9.7.1·9.7.2 의 이름. 모르면 NULL.
+// 	두 표가 '아는 타입' 의 정의라 밖에서 조회할 수단을 하나 둠
+const char *nas_msg_name(int epd, int msg_type);
+
 #endif /* TELEMETRY_NAS_H */
