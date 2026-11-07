@@ -144,7 +144,8 @@
 #define AMF_POINTER_BITS 6
 #define FIVEG_TMSI_BYTES 4
 
-// TransportLayerAddress 가 IP 주소일 때의 폭: IPv4(RFC 791), IPv6(RFC 8200) (TS 38.412 §6), IPv4+IPv6 (TS 38.413 §9.3.2.4 가 TS 38.414 로 넘김)
+// TransportLayerAddress 가 IP 주소일 때의 폭. TS 38.413 §9.3.2.4 가 TS 38.414 로 넘김
+//   TS 38.414 §5.3  a) 32 IPv4(RFC 791)  b) 128 IPv6(RFC 8200)  c) 160 둘 다 — 앞 32비트가 IPv4
 #define IPV4_ADDRESS_BITS      32
 #define IPV6_ADDRESS_BITS      128
 #define IPV4_IPV6_ADDRESS_BITS 160
@@ -580,7 +581,8 @@ static enum ngap_result item_nas_take(struct ngap_msg *ngap_msg, struct ngap_int
 //   주소 = BIT STRING (SIZE(1..160, ...))
 //     폭(비트)    뜻                처리
 //     32          IPv4              담음. 비교 대상 cap_record.src_addr 가 IPv4
-//     128, 160    IPv6, IPv4+IPv6   담지 않음, 세지 않음
+//     160         IPv4+IPv6         앞 32비트가 IPv4 라 그 4옥텟을 담음 (TS 38.414 §5.3 c)
+//     128         IPv6 만           담지 않음. 배열이 uint32_t 라 담을 자리가 없음
 //     그 외       IP 주소 아님      rejected_ie_count
 //
 //   폭 = size * 8 - bits_unused. size 만 보면 25비트 주소도 4옥텟이라 IPv4 로 읽힘
@@ -609,9 +611,9 @@ static enum ngap_result tnla_take(struct ngap_msg *ngap_msg, const struct ie_vie
 		if (!address || !address->buf)
 			continue;
 		size_t address_bits = address->size * 8 - (size_t)address->bits_unused;
-		if (address_bits == IPV6_ADDRESS_BITS || address_bits == IPV4_IPV6_ADDRESS_BITS)
+		if (address_bits == IPV6_ADDRESS_BITS)
 			continue;
-		if (address_bits != IPV4_ADDRESS_BITS) {
+		if (address_bits != IPV4_ADDRESS_BITS && address_bits != IPV4_IPV6_ADDRESS_BITS) {
 			ngap_msg->rejected_ie_count++;
 			continue;
 		}
@@ -621,7 +623,7 @@ static enum ngap_result tnla_take(struct ngap_msg *ngap_msg, const struct ie_vie
 				return NGAP_NO_MEMORY;
 			*ipv4_out = grown;
 		}
-		// 와이어 바이트 순서 그대로 (= cap_record.src_addr)
+		// 앞 4옥텟을 와이어 바이트 순서 그대로 (= cap_record.src_addr). 160비트면 그 뒤 128비트가 IPv6
 		memcpy(&(*ipv4_out)[*count_out], address->buf, sizeof(uint32_t));
 		(*count_out)++;
 	}
