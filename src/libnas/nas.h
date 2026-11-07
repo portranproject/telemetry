@@ -7,7 +7,7 @@
  *       방향    타입이 올 수 있는 방향   -> msg_type_direction 을 호출자가 와이어 방향과 대조
  * [2] nas_parse 반환값과 그때 읽어도 되는 필드
  *       0      전부
- *       음수   이유별 계수기, 그리고 보안 머리에서 읽은 만큼 - epd / sht / nas_sequence_number.
+ *       음수   이유별 계수기, 그리고 보안 헤더에서 읽은 만큼 - epd / sht / nas_sequence_number.
  *              못 읽은 것은 -1 임. 이 셋을 남기는 이유: 호출자가 바이트를 다시 뜯으면 예약 SHT
  *              판정이 두 계층에서 갈림
  * [3] 다루지 않는 것 : 영구 식별자 SUCI / IMEI / IMEISV. 임시 식별자 5G-S-TMSI 만 꺼냄.
@@ -26,7 +26,7 @@ enum nas_epd {
 };
 #define NAS_CIPH_UNKNOWN (-1)
 
-// 보호된 5GS NAS 메시지의 머리 길이. EPD 1 + SHT 1 + MAC 4 + Sequence number 1 (TS 24.501 8.2.28)
+// 보호된 5GS NAS 메시지의 헤더 길이. EPD 1 + SHT 1 + MAC 4 + Sequence number 1 (TS 24.501 8.2.28)
 // 	공개인 이유: 와이어 포맷 사실이고 읽는 쪽이 둘이다 (디코더, 퍼저의 안쪽 메시지 배치)
 #define NAS_PROTECTED_HEADER_BYTES 7
 
@@ -94,7 +94,7 @@ enum nas_reg_type {
  *        2 · 4 는 암호라 호출자가 알고리즘을 알려 줘야 안쪽을 읽음
  *
  *   sht = -1 의 뜻 셋과 가리는 법
- *        epd == 0x2e           5GSM 이라 보안 머리가 없음 (9.4)
+ *        epd == 0x2e           5GSM 이라 보안 헤더가 없음 (9.4)
  *        epd == -1             옥텟 2 를 못 읽음
  *        reserved_sht_count    예약값이라 담지 않음
  */
@@ -111,14 +111,14 @@ struct nas_msg {
 	int nas_integ_alg;
 
 	int mm_cause;                   // 5GMM 원인 (9.11.3.2)
-	bool has_stmsi48;               // 5G-GUTI (형 2) · 5G-S-TMSI (형 4) 에서 얻음
+	bool has_stmsi48;               // 5G-GUTI (타입 2) · 5G-S-TMSI (타입 4) 에서 얻음
 	uint64_t stmsi48;               //      AMF Set ID 10b | AMF Pointer 6b | 5G-TMSI 32b
 	int reg_type;                   // 등록 유형 (9.11.3.7) 하위 3비트. 범위 검사 없음 -
 					// 	표 9.11.3.7.1 이 3비트 값 전부에 뜻을 줌
 
 	/* 담지 않은 이유. 음수 반환 때는 합이 1 임 (그 자리에서 멈추므로).
 	 *   rc=0 에서는 선택 IE 주사가 IE 마다 올려 1 보다 클 수 있음 */
-	int truncated_count;            // 길이가 모자라 머리조차 못 읽음
+	int truncated_count;            // 길이가 모자라 헤더조차 못 읽음
 	int epd_mismatch_count;         // EPD 가 5GMM·5GSM 둘 다 아님 (안쪽이 5GSM 인 경우 포함)
 	int reserved_sht_count;         // SHT 5~15 (표 9.3.1 "All other values are reserved.")
 	int unknown_msg_type_count;     // 표 9.7.1·9.7.2 에 없는 타입
