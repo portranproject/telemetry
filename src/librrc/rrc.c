@@ -12,15 +12,24 @@
 #include <NR_EstablishmentCause.h>
 #include <NR_IntegrityProtAlgorithm.h>
 #include <NR_RRCReconfiguration-IEs.h>
+#include <NR_RRCReestablishmentRequest-IEs.h>
 #include <NR_RRCReject-IEs.h>
+#include <NR_RRCRelease-IEs.h>
+#include <NR_RRCResumeRequest-IEs.h>
+#include <NR_RRCResumeRequest1-IEs.h>
 #include <NR_RRCSetupComplete-IEs.h>
 #include <NR_RRCSetupRequest-IEs.h>
 #include <NR_RadioBearerConfig.h>
+#include <NR_ReestablishmentCause.h>
+#include <NR_ResumeCause.h>
 #include <NR_SecurityConfig.h>
 #include <NR_SecurityModeCommand-IEs.h>
+#include <NR_SuspendConfig.h>
 #include <NR_UL-CCCH-Message.h>
 #include <NR_UL-CCCH1-Message.h>
 #include <NR_UL-DCCH-Message.h>
+#include <NR_ULDedicatedMessageSegment-r16-IEs.h>
+#include <OCTET_STRING.h>
 #include <constr_CHOICE.h>
 #include <constr_SEQUENCE.h>
 #include <uper_decoder.h>
@@ -58,6 +67,16 @@
 // RRCReject waitTime 범위(초): RejectWaitTime ::= INTEGER (1..16) (문법 9079줄). 디코더가 지키지만 uint8_t 로 옮기기 전에 다시 봄
 #define REJECT_WAIT_TIME_MIN_S 1
 #define REJECT_WAIT_TIME_MAX_S 16
+// I-RNTI 비트 수: RRCRelease suspendConfig 의 fullI-RNTI, RRCResumeRequest1 의 resumeIdentity (문법 5604줄 I-RNTI-Value ::= BIT STRING (SIZE(40)))
+#define I_RNTI_BITS 40
+// short I-RNTI 비트 수: RRCRelease suspendConfig 의 shortI-RNTI, RRCResumeRequest 의 resumeIdentity (문법 10372줄 ShortI-RNTI-Value ::= BIT STRING (SIZE(24)))
+#define SHORT_I_RNTI_BITS 24
+// RRCReestablishmentRequest c-RNTI 상한: RNTI-Value ::= INTEGER (0..65535) (문법 9752줄). 디코더가 지키지만 uint16_t 로 옮기기 전에 다시 봄
+#define RNTI_VALUE_MAX 65535
+// RRCReestablishmentRequest physCellId 상한: PhysCellId ::= INTEGER (0..1007) (문법 7685줄). 위와 같은 이유
+#define PHYS_CELL_ID_MAX 1007
+// ULDedicatedMessageSegment-r16 segmentNumber-r16 상한: INTEGER (0..15) (문법 2539줄). uint8_t 로 옮기기 전에 봄
+#define SEGMENT_NUMBER_MAX 15
 
 // f1ap_procedure: RRC 컨테이너가 실리는 F1AP 절차 번호 (문법 f1ap-18.8.0.asn 17767–17775줄)
 //   이 7개만 둠. f1ap_msg.procedure_code 는 long 그대로 두고 이 값들과 비교만 함
@@ -285,61 +304,152 @@ static bool bits_take(const BIT_STRING_t *bits, size_t expected_bits, uint64_t *
     return true;
 }
 
-/* values_take: 본문 타입으로 메시지를 가려 위 층이 쓰는 값을 rrc_msg 에 꺼냄. 꺼낼 값이 없는 메시지는 그대로 둠.
- *   이유: 본문은 body_find 가 이미 찾아 다시 내려가지 않고, 본문 타입이 정해지면 asn1c 구조체로 읽어 필드 이름을 컴파일러가 검사.
- *   값 하나가 문법과 다른 모양이면(비트 수 등) 그 값만 없음으로 둠. body 는 asn1c 트리를 빌림
+/* setup_request_take: RRCSetupRequest → 원인(순번·이름), ue-Identity 종류와 39비트 값.
+ *   고른 갈래와 비트 수가 둘 다 맞을 때만 종류를 정함. 아니면 RRC_UE_IDENTITY_NONE
  */
-static void values_take(struct rrc_msg *rrc_msg, const asn_TYPE_descriptor_t *body_type, const void *body) {
-    const NR_SecurityAlgorithmConfig_t *security_algorithm_config = NULL;
-    if (body_type == &asn_DEF_NR_RRCSetupRequest_IEs) {
-        const NR_RRCSetupRequest_IEs_t *setup_request = body;
-        rrc_msg->establishment_cause = enum_value_take(&asn_DEF_NR_EstablishmentCause, setup_request->establishmentCause);
-        const NR_InitialUE_Identity_t *ue_identity = &setup_request->ue_Identity;
-        bool is_s_tmsi_part1 = ue_identity->present == NR_InitialUE_Identity_PR_ng_5G_S_TMSI_Part1;
-        bool is_random_value = ue_identity->present == NR_InitialUE_Identity_PR_randomValue;
-        if (is_s_tmsi_part1 && bits_take(&ue_identity->choice.ng_5G_S_TMSI_Part1, UE_IDENTITY_BITS, &rrc_msg->ue_identity))
-            rrc_msg->ue_identity_type = RRC_UE_IDENTITY_NG_5G_S_TMSI_PART1;
-        if (is_random_value && bits_take(&ue_identity->choice.randomValue, UE_IDENTITY_BITS, &rrc_msg->ue_identity))
-            rrc_msg->ue_identity_type = RRC_UE_IDENTITY_RANDOM_VALUE;
-    } else if (body_type == &asn_DEF_NR_RRCSetupComplete_IEs) {
-        const NR_RRCSetupComplete_IEs_t *setup_complete = body;
-        const struct NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value *s_tmsi_value = setup_complete->ng_5G_S_TMSI_Value;
-        bool is_full_s_tmsi = s_tmsi_value && s_tmsi_value->present == NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value_PR_ng_5G_S_TMSI;
-        bool is_s_tmsi_part2 = s_tmsi_value && s_tmsi_value->present == NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value_PR_ng_5G_S_TMSI_Part2;
-        uint64_t s_tmsi_part2 = 0;
-        if (is_full_s_tmsi)
-            rrc_msg->has_s_tmsi = bits_take(&s_tmsi_value->choice.ng_5G_S_TMSI, S_TMSI_BITS, &rrc_msg->s_tmsi);
-        if (is_s_tmsi_part2 && bits_take(&s_tmsi_value->choice.ng_5G_S_TMSI_Part2, S_TMSI_PART2_BITS, &s_tmsi_part2)) {
-            rrc_msg->has_s_tmsi_part2 = true;
-            rrc_msg->s_tmsi_part2 = (uint16_t)s_tmsi_part2; // 9비트라 uint16_t 에 들어감
-        }
-    } else if (body_type == &asn_DEF_NR_RRCReject_IEs) {
-        const NR_RRCReject_IEs_t *reject = body;
-        bool is_wait_time_valid = reject->waitTime
-                               && *reject->waitTime >= REJECT_WAIT_TIME_MIN_S
-                               && *reject->waitTime <= REJECT_WAIT_TIME_MAX_S;
-        if (is_wait_time_valid) {
-            rrc_msg->has_wait_time = true;
-            rrc_msg->wait_time_s = (uint8_t)*reject->waitTime;
-        }
-    } else if (body_type == &asn_DEF_NR_SecurityModeCommand_IEs) {
-        const NR_SecurityModeCommand_IEs_t *security_mode_command = body;
-        security_algorithm_config = &security_mode_command->securityConfigSMC.securityAlgorithmConfig;
-    } else if (body_type == &asn_DEF_NR_RRCReconfiguration_IEs) {
-        // radioBearerConfig.securityConfig.securityAlgorithmConfig 가 모두 있을 때만(셋 다 선택 필드)
-        const NR_RRCReconfiguration_IEs_t *reconfiguration = body;
-        bool has_security_config = reconfiguration->radioBearerConfig && reconfiguration->radioBearerConfig->securityConfig;
-        if (has_security_config)
-            security_algorithm_config = reconfiguration->radioBearerConfig->securityConfig->securityAlgorithmConfig;
-    }
+static void setup_request_take(struct rrc_msg *rrc_msg, const NR_RRCSetupRequest_IEs_t *setup_request) {
+    rrc_msg->establishment_cause = enum_value_take(&asn_DEF_NR_EstablishmentCause, setup_request->establishmentCause);
+    const NR_InitialUE_Identity_t *ue_identity = &setup_request->ue_Identity;
+    bool is_s_tmsi_part1 = ue_identity->present == NR_InitialUE_Identity_PR_ng_5G_S_TMSI_Part1;
+    bool is_random_value = ue_identity->present == NR_InitialUE_Identity_PR_randomValue;
+    if (is_s_tmsi_part1 && bits_take(&ue_identity->choice.ng_5G_S_TMSI_Part1, UE_IDENTITY_BITS, &rrc_msg->ue_identity))
+        rrc_msg->ue_identity_type = RRC_UE_IDENTITY_NG_5G_S_TMSI_PART1;
+    if (is_random_value && bits_take(&ue_identity->choice.randomValue, UE_IDENTITY_BITS, &rrc_msg->ue_identity))
+        rrc_msg->ue_identity_type = RRC_UE_IDENTITY_RANDOM_VALUE;
+}
 
-    // SecurityModeCommand·RRCReconfiguration 공통: 같은 SecurityAlgorithmConfig 모양
+/* setup_complete_take: RRCSetupComplete → ng-5G-S-TMSI 48비트 또는 Part2 9비트(CHOICE 라 둘 중 하나). ng-5G-S-TMSI-Value 가 없으면 둘 다 없음 */
+static void setup_complete_take(struct rrc_msg *rrc_msg, const NR_RRCSetupComplete_IEs_t *setup_complete) {
+    const struct NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value *s_tmsi_value = setup_complete->ng_5G_S_TMSI_Value;
+    bool is_full_s_tmsi = s_tmsi_value && s_tmsi_value->present == NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value_PR_ng_5G_S_TMSI;
+    bool is_s_tmsi_part2 = s_tmsi_value && s_tmsi_value->present == NR_RRCSetupComplete_IEs__ng_5G_S_TMSI_Value_PR_ng_5G_S_TMSI_Part2;
+    uint64_t s_tmsi_part2 = 0;
+    if (is_full_s_tmsi)
+        rrc_msg->has_s_tmsi = bits_take(&s_tmsi_value->choice.ng_5G_S_TMSI, S_TMSI_BITS, &rrc_msg->s_tmsi);
+    if (is_s_tmsi_part2 && bits_take(&s_tmsi_value->choice.ng_5G_S_TMSI_Part2, S_TMSI_PART2_BITS, &s_tmsi_part2)) {
+        rrc_msg->has_s_tmsi_part2 = true;
+        rrc_msg->s_tmsi_part2 = (uint16_t)s_tmsi_part2; // 9비트라 uint16_t 에 들어감
+    }
+}
+
+/* reject_take: RRCReject → waitTime(있을 때만). 디코더가 1~16 만 돌려주지만 uint8_t 로 옮기기 전에 범위를 다시 봄 */
+static void reject_take(struct rrc_msg *rrc_msg, const NR_RRCReject_IEs_t *reject) {
+    bool is_wait_time_valid = reject->waitTime
+                           && *reject->waitTime >= REJECT_WAIT_TIME_MIN_S
+                           && *reject->waitTime <= REJECT_WAIT_TIME_MAX_S;
+    if (is_wait_time_valid) {
+        rrc_msg->has_wait_time = true;
+        rrc_msg->wait_time_s = (uint8_t)*reject->waitTime;
+    }
+}
+
+/* security_algorithm_take: SecurityAlgorithmConfig → 암호·무결성 순번·이름. 무결성은 선택 필드(Need R)라 없으면 -1·NULL.
+ *   이유: SecurityModeCommand 와 RRCReconfiguration 이 같은 모양을 실어 함께 씀. NULL 이면 아무것도 하지 않음
+ */
+static void security_algorithm_take(struct rrc_msg *rrc_msg, const NR_SecurityAlgorithmConfig_t *security_algorithm_config) {
     if (!security_algorithm_config)
         return;
     rrc_msg->has_security_algorithm = true;
     rrc_msg->ciphering_algorithm = enum_value_take(&asn_DEF_NR_CipheringAlgorithm, security_algorithm_config->cipheringAlgorithm);
     if (security_algorithm_config->integrityProtAlgorithm)
         rrc_msg->integrity_algorithm = enum_value_take(&asn_DEF_NR_IntegrityProtAlgorithm, *security_algorithm_config->integrityProtAlgorithm);
+}
+
+/* reconfiguration_take: RRCReconfiguration → radioBearerConfig.securityConfig.securityAlgorithmConfig(셋 다 선택 필드라 모두 있을 때만) */
+static void reconfiguration_take(struct rrc_msg *rrc_msg, const NR_RRCReconfiguration_IEs_t *reconfiguration) {
+    bool has_security_config = reconfiguration->radioBearerConfig && reconfiguration->radioBearerConfig->securityConfig;
+    if (has_security_config)
+        security_algorithm_take(rrc_msg, reconfiguration->radioBearerConfig->securityConfig->securityAlgorithmConfig);
+}
+
+/* release_take: RRCRelease → suspendConfig 있음 여부, 있으면 fullI-RNTI 40비트·shortI-RNTI 24비트(문법상 둘 다 필수).
+ *   suspendConfig 가 있으면 INACTIVE 로 보낸 사실이라 has_suspend_config 는 true. I-RNTI 는 비트 수가 맞을 때만 채움(디코더가 고정 크기를
+ *   지켜 어긋나지 않음). short 를 full 의 하위 24비트로 가정하지 않고 각자 읽음
+ */
+static void release_take(struct rrc_msg *rrc_msg, const NR_RRCRelease_IEs_t *release) {
+    const NR_SuspendConfig_t *suspend_config = release->suspendConfig;
+    if (!suspend_config)
+        return;
+    rrc_msg->has_suspend_config = true;
+    uint64_t full_i_rnti = 0;
+    uint64_t short_i_rnti = 0;
+    if (bits_take(&suspend_config->fullI_RNTI, I_RNTI_BITS, &full_i_rnti))
+        rrc_msg->suspend_full_i_rnti = full_i_rnti;
+    if (bits_take(&suspend_config->shortI_RNTI, SHORT_I_RNTI_BITS, &short_i_rnti))
+        rrc_msg->suspend_short_i_rnti = (uint32_t)short_i_rnti; // 24비트라 uint32_t 에 들어감
+}
+
+/* reestablishment_request_take: RRCReestablishmentRequest → 원인, 옛 연결의 C-RNTI·PCI.
+ *   C-RNTI·PCI 는 옛 연결을 찾는 단서일 뿐(셀마다 다시 씀). 둘 다 문법 범위 안일 때만 has_old_ue_identity
+ */
+static void reestablishment_request_take(struct rrc_msg *rrc_msg, const NR_RRCReestablishmentRequest_IEs_t *reestablishment_request) {
+    rrc_msg->reestablishment_cause = enum_value_take(&asn_DEF_NR_ReestablishmentCause, reestablishment_request->reestablishmentCause);
+    const NR_ReestabUE_Identity_t *old_identity = &reestablishment_request->ue_Identity;
+    bool is_old_identity_valid = old_identity->c_RNTI >= 0
+                              && old_identity->c_RNTI <= RNTI_VALUE_MAX
+                              && old_identity->physCellId >= 0
+                              && old_identity->physCellId <= PHYS_CELL_ID_MAX;
+    if (!is_old_identity_valid)
+        return;
+    rrc_msg->has_old_ue_identity = true;
+    rrc_msg->old_crnti = (uint16_t)old_identity->c_RNTI;
+    rrc_msg->old_pci = (uint16_t)old_identity->physCellId;
+}
+
+/* resume_request_take: RRCResumeRequest(UL-CCCH) → 재개 원인, I-RNTI 24비트(short). 비트 수가 맞을 때만 has_resume_i_rnti */
+static void resume_request_take(struct rrc_msg *rrc_msg, const NR_RRCResumeRequest_IEs_t *resume_request) {
+    rrc_msg->resume_cause = enum_value_take(&asn_DEF_NR_ResumeCause, resume_request->resumeCause);
+    rrc_msg->has_resume_i_rnti = bits_take(&resume_request->resumeIdentity, SHORT_I_RNTI_BITS, &rrc_msg->resume_i_rnti);
+}
+
+/* resume_request1_take: RRCResumeRequest1(UL-CCCH1) → 재개 원인, I-RNTI 40비트(full). 비트 수가 맞을 때만 has_resume_i_rnti */
+static void resume_request1_take(struct rrc_msg *rrc_msg, const NR_RRCResumeRequest1_IEs_t *resume_request1) {
+    rrc_msg->resume_cause = enum_value_take(&asn_DEF_NR_ResumeCause, resume_request1->resumeCause);
+    rrc_msg->has_resume_i_rnti = bits_take(&resume_request1->resumeIdentity, I_RNTI_BITS, &rrc_msg->resume_i_rnti);
+    rrc_msg->is_full_resume_i_rnti = rrc_msg->has_resume_i_rnti;
+}
+
+/* segment_take: ULDedicatedMessageSegment-r16 → 조각 번호(0~15), 마지막 여부, 조각 바이트.
+ *   조각 바이트는 트리를 가리켜 rrc_release 전까지 유효(모으는 집계 층이 복사). 번호가 문법 범위 밖이면 조각 전체를 없음으로
+ */
+static void segment_take(struct rrc_msg *rrc_msg, const NR_ULDedicatedMessageSegment_r16_IEs_t *segment) {
+    bool is_number_valid = segment->segmentNumber_r16 >= 0 && segment->segmentNumber_r16 <= SEGMENT_NUMBER_MAX;
+    if (!is_number_valid)
+        return;
+    rrc_msg->has_segment = true;
+    rrc_msg->segment_number = (uint8_t)segment->segmentNumber_r16;
+    rrc_msg->is_last_segment = segment->rrc_MessageSegmentType_r16 == NR_ULDedicatedMessageSegment_r16_IEs__rrc_MessageSegmentType_r16_lastSegment;
+    rrc_msg->segment_data = segment->rrc_MessageSegmentContainer_r16.buf;
+    rrc_msg->segment_len = segment->rrc_MessageSegmentContainer_r16.size;
+}
+
+/* values_take: 본문 타입으로 메시지를 가려 메시지별 함수로 위 층이 쓰는 값을 꺼냄. 꺼낼 값이 없는 메시지는 그대로 둠.
+ *   이유: 본문은 body_find 가 이미 찾아 다시 내려가지 않고, 본문 타입이 정해지면 asn1c 구조체로 읽어 필드 이름을 컴파일러가 검사.
+ *   값 하나가 문법과 다른 모양이면(비트 수 등) 그 값만 없음으로 둠. body 는 asn1c 트리를 빌림
+ */
+static void values_take(struct rrc_msg *rrc_msg, const asn_TYPE_descriptor_t *body_type, const void *body) {
+    if (body_type == &asn_DEF_NR_RRCSetupRequest_IEs) {
+        setup_request_take(rrc_msg, body);
+    } else if (body_type == &asn_DEF_NR_RRCSetupComplete_IEs) {
+        setup_complete_take(rrc_msg, body);
+    } else if (body_type == &asn_DEF_NR_RRCReject_IEs) {
+        reject_take(rrc_msg, body);
+    } else if (body_type == &asn_DEF_NR_SecurityModeCommand_IEs) {
+        const NR_SecurityModeCommand_IEs_t *security_mode_command = body;
+        security_algorithm_take(rrc_msg, &security_mode_command->securityConfigSMC.securityAlgorithmConfig);
+    } else if (body_type == &asn_DEF_NR_RRCReconfiguration_IEs) {
+        reconfiguration_take(rrc_msg, body);
+    } else if (body_type == &asn_DEF_NR_RRCRelease_IEs) {
+        release_take(rrc_msg, body);
+    } else if (body_type == &asn_DEF_NR_RRCReestablishmentRequest_IEs) {
+        reestablishment_request_take(rrc_msg, body);
+    } else if (body_type == &asn_DEF_NR_RRCResumeRequest_IEs) {
+        resume_request_take(rrc_msg, body);
+    } else if (body_type == &asn_DEF_NR_RRCResumeRequest1_IEs) {
+        resume_request1_take(rrc_msg, body);
+    } else if (body_type == &asn_DEF_NR_ULDedicatedMessageSegment_r16_IEs) {
+        segment_take(rrc_msg, body);
+    }
 }
 
 // MARK: - 해석
