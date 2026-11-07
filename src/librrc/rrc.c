@@ -37,6 +37,26 @@
 // nonCriticalExtension 사슬을 따라가는 상한. 트리는 끝이 있어 닿지 않으며, 생성 코드가 어긋났을 때 멈추지 않는 일을 막는 안전장치
 #define EXTENSION_CHAIN_MAX_LENGTH 32
 
+// f1ap_procedure: RRC 컨테이너가 실리는 F1AP 절차 번호 (문법 f1ap-18.8.0.asn 17767–17775줄)
+//   이 7개만 둠. f1ap_msg.procedure_code 는 long 그대로 두고 이 값들과 비교만 함
+enum f1ap_procedure {
+    F1AP_PROCEDURE_UE_CONTEXT_SETUP = 5,
+    F1AP_PROCEDURE_UE_CONTEXT_RELEASE = 6,
+    F1AP_PROCEDURE_UE_CONTEXT_MODIFICATION = 7,
+    F1AP_PROCEDURE_UE_CONTEXT_MODIFICATION_REQUIRED = 8, // 성공 응답이 UE CONTEXT MODIFICATION CONFIRM
+    F1AP_PROCEDURE_INITIAL_UL_RRC_MESSAGE_TRANSFER = 11,
+    F1AP_PROCEDURE_DL_RRC_MESSAGE_TRANSFER = 12,
+    F1AP_PROCEDURE_UL_RRC_MESSAGE_TRANSFER = 13,
+};
+
+// SRB ID 0 = SRB0 = CCCH 를 쓰는 유일한 SRB
+#define SRB_ID_CCCH 0
+// DCCH 를 쓰는 SRB ID 의 끝: SRB1~5. F1AP 문법 SRBID ::= INTEGER (0..3, ..., 4 | 5)
+#define SRB_ID_DCCH_MAX 5
+
+// UL-CCCH1 메시지(RRCResumeRequest1) 바이트 수: CCCH1 은 64비트, CCCH 는 48비트
+#define UL_CCCH1_MESSAGE_BYTES 8
+
 // MARK: - 자료구조
 
 // rrc_internal: rrc_msg.internal 이 가리키는 rrc.c 전용 상태. rrc_release 가 해제
@@ -187,7 +207,7 @@ static enum body_result body_find(const asn_TYPE_descriptor_t *message_type, con
 }
 
 /* extension_slot_find: 본문의 nonCriticalExtension 사슬을 따라가 끝 빈 자리(SEQUENCE {})가 "있음"인지 봄.
- *   이유: 새 릴리스는 이 빈 자리를 켜고 그 뒤에 새 필드를 붙여, 17.3.0 문법으로 풀면 그 비트가 남음(RRC 지시서 4.5).
+ *   이유: 새 릴리스는 이 빈 자리를 켜고 그 뒤에 새 필드를 붙여, 17.3.0 문법으로 풀면 그 비트가 남음.
  *   반환: NONE(사슬 없음) / ABSENT(사슬 어딘가가 꺼짐) / PRESENT(끝 빈 자리까지 켜짐)
  */
 static enum extension_slot extension_slot_find(const asn_TYPE_descriptor_t *body_type, const void *body) {
@@ -247,7 +267,7 @@ static enum rrc_result parse_fail(struct rrc_msg *rrc_msg, enum rrc_result resul
     return result;
 }
 
-/* rrc_parse: 푸는 방법 검사 → PDCP 떼기 → UPER 디코드 → 메시지 찾기 → 본문 찾기 → 남는 비트 판정(RRC 지시서 4.5).
+/* rrc_parse: 푸는 방법 검사 → PDCP 떼기 → UPER 디코드 → 메시지 찾기 → 본문 찾기 → 남는 비트 판정.
  *   내부 상태를 잡은 뒤의 실패는 모두 parse_fail 로 끝냄. 약속(소유권·반환·실패 상태)은 rrc.h
  */
 enum rrc_result rrc_parse(struct rrc_container_kind kind, const uint8_t *bytes, size_t len, struct rrc_msg *rrc_msg) {
@@ -304,4 +324,65 @@ enum rrc_result rrc_parse(struct rrc_container_kind kind, const uint8_t *bytes, 
     rrc_msg->msg_name = found_type->name;
     rrc_msg->trailing_bits = trailing_bits;
     return RRC_OK;
+}
+
+// MARK: - 채널 고르기 (F1AP)
+
+/* rrc_kind_for_f1ap: F1AP 절차·PDU 종류·IE 번호·SRB ID·길이에서 채널과 바이트 모양을 고름. 약속은 rrc.h
+ *   이유: 채널이 컨테이너 바이트에 적혀 있지 않음. SRB0 만 CCCH(평문)이고 SRB1~5 는 DCCH(PDCP PDU) (TS 38.331 §4.2.2, TS 38.473 §9.2.3)
+ *   CU 가 받아들이는지, 메시지와 SRB 가 맞는지는 보지 않음(집계 층). 표 밖은 모두 NONE
+ */
+struct rrc_container_kind rrc_kind_for_f1ap(const struct f1ap_msg *f1ap_msg, const struct f1ap_rrc_container *container) {
+    const struct rrc_container_kind none = {.channel = RRC_CHANNEL_NONE, .encapsulation = RRC_ENCAPSULATION_NONE};
+    if (!f1ap_msg || !container)
+        return none;
+
+    // 절차 8 은 성공 응답(UE CONTEXT MODIFICATION CONFIRM)에, 나머지는 요청에만 RRC 메시지를 실음
+    bool is_initiating = f1ap_msg->pdu_type == F1AP_PDU_INITIATING;
+    bool is_modification_confirm = f1ap_msg->procedure_code == F1AP_PROCEDURE_UE_CONTEXT_MODIFICATION_REQUIRED
+                                && f1ap_msg->pdu_type == F1AP_PDU_SUCCESSFUL;
+    bool is_initial_ul = is_initiating && f1ap_msg->procedure_code == F1AP_PROCEDURE_INITIAL_UL_RRC_MESSAGE_TRANSFER;
+
+    // IE 241 은 INITIAL UL RRC 의 PDCP 없는 RRCSetupComplete (TS 38.473 §9.2.3.1)
+    const struct rrc_container_kind ul_dcch_plain = {.channel = RRC_CHANNEL_UL_DCCH, .encapsulation = RRC_ENCAPSULATION_NONE};
+    if (container->ie_id == F1AP_IE_ID_RRC_CONTAINER_RRC_SETUP_COMPLETE)
+        return is_initial_ul ? ul_dcch_plain : none;
+    if (container->ie_id != F1AP_IE_ID_RRC_CONTAINER)
+        return none;
+
+    // CCCH 메시지는 크기 고정이라 8바이트만 UL-CCCH1. 그 밖 길이도 UL-CCCH 로 넘겨 rrc_parse 가 해석 실패로 남김(NONE 이면 흔적이 사라짐)
+    enum rrc_channel ul_ccch_channel = container->len == UL_CCCH1_MESSAGE_BYTES ? RRC_CHANNEL_UL_CCCH1 : RRC_CHANNEL_UL_CCCH;
+    const struct rrc_container_kind ul_ccch = {.channel = ul_ccch_channel, .encapsulation = RRC_ENCAPSULATION_NONE};
+    const struct rrc_container_kind ul_dcch = {.channel = RRC_CHANNEL_UL_DCCH, .encapsulation = RRC_ENCAPSULATION_PDCP};
+    const struct rrc_container_kind dl_ccch = {.channel = RRC_CHANNEL_DL_CCCH, .encapsulation = RRC_ENCAPSULATION_NONE};
+    const struct rrc_container_kind dl_dcch = {.channel = RRC_CHANNEL_DL_DCCH, .encapsulation = RRC_ENCAPSULATION_PDCP};
+
+    // SRB ID 가 있어야 하는 세 절차(UL·DL RRC MESSAGE TRANSFER, UE CONTEXT RELEASE COMMAND)용. 없음(-1)·0~5 밖은 둘 다 false
+    bool is_ccch_srb = container->srb_id == SRB_ID_CCCH;
+    bool is_dcch_srb = container->srb_id > SRB_ID_CCCH && container->srb_id <= SRB_ID_DCCH_MAX;
+
+    if (is_modification_confirm)
+        return dl_dcch;
+    if (!is_initiating)
+        return none;
+    switch (f1ap_msg->procedure_code) {
+    case F1AP_PROCEDURE_INITIAL_UL_RRC_MESSAGE_TRANSFER:
+        return ul_ccch;
+    case F1AP_PROCEDURE_UL_RRC_MESSAGE_TRANSFER:
+        // SRB0 은 CG-SDT 의 RRCResumeRequest·RRCResumeRequest1
+        if (is_ccch_srb)
+            return ul_ccch;
+        return is_dcch_srb ? ul_dcch : none;
+    case F1AP_PROCEDURE_DL_RRC_MESSAGE_TRANSFER:
+    case F1AP_PROCEDURE_UE_CONTEXT_RELEASE:
+        // RELEASE COMMAND 는 컨테이너가 있으면 SRB ID 필수라 없으면 SRB1 로 짐작하지 않음
+        if (is_ccch_srb)
+            return dl_ccch;
+        return is_dcch_srb ? dl_dcch : none;
+    case F1AP_PROCEDURE_UE_CONTEXT_SETUP:
+    case F1AP_PROCEDURE_UE_CONTEXT_MODIFICATION:
+        return dl_dcch;
+    default:
+        return none;
+    }
 }

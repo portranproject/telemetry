@@ -9,7 +9,7 @@
 
 // rrc_channel: RRC 메시지를 실은 논리 채널. 어느 문법 최상위 타입(UL-CCCH-Message 등)으로 풀지 정함
 enum rrc_channel {
-    RRC_CHANNEL_NONE = 0, // 고르지 못함(RRC 메시지가 아닌 컨테이너, 규칙에 없는 조합). 풀지 않음
+    RRC_CHANNEL_NONE = 0, // 풀 채널·입력 형식을 정할 수 없음(RRC 메시지가 아닌 컨테이너, 규칙에 없는 조합, SRB ID 없음·범위 밖). 풀지 않음
     RRC_CHANNEL_UL_CCCH,  // SRB0 상향: RRCSetupRequest·RRCResumeRequest·RRCReestablishmentRequest(6바이트)
     RRC_CHANNEL_UL_CCCH1, // SRB0 상향 8바이트: RRCResumeRequest1
     RRC_CHANNEL_UL_DCCH,  // SRB1·2 상향: RRCSetupComplete·SecurityModeComplete·ULInformationTransfer 등
@@ -121,8 +121,11 @@ struct rrc_msg {
 };
 
 /* rrc_kind_for_f1ap: F1AP 메시지에 실린 RRC 컨테이너를 어떻게 풀지(채널·바이트 모양) 정함.
- *   이유: 채널은 컨테이너 바이트에 적혀 있지 않고, 실어 나른 F1AP 메시지·IE·SRB ID 로 정해짐 (TS 38.473 §9.2.3).
- *   규칙은 RRC 지시서 4.4 표. 표에 없는 조합, RRC 메시지가 아닌 컨테이너(IE 128), NULL 인자면 channel 이 RRC_CHANNEL_NONE.
+ *   이유: 채널은 컨테이너 바이트에 적혀 있지 않고, 실어 나른 F1AP 메시지·IE·SRB ID 로 정해짐
+ *   고르는 규칙에 없는 조합, RRC 메시지가 아닌 컨테이너(IE 128), NULL 인자,
+ *   UL·DL RRC MESSAGE TRANSFER·UE CONTEXT RELEASE COMMAND 에서 SRB ID 없음·0~5 밖이면 channel 이 RRC_CHANNEL_NONE.
+ *   CCCH 길이(6·8바이트)는 보지 않고 8바이트만 UL-CCCH1 로 고름. 다른 길이는 rrc_parse 가 해석 실패로 남김.
+ *   풀 방법만 고름: CU 가 받아들이는지, 메시지와 SRB 가 맞는지(예 RRCRelease 는 SRB1)는 보장하지 않음.
  *   f1ap_msg·container 는 빌려 씀.
  */
 struct rrc_container_kind rrc_kind_for_f1ap(const struct f1ap_msg *f1ap_msg, const struct f1ap_rrc_container *container);
