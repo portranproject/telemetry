@@ -278,7 +278,7 @@ static void take_mobile_id_lve(const uint8_t *bytes, size_t bytes_len, struct na
 // 	비트 8 로 가르는 근거는 두 대상 메시지의 IEI 전수 분류임 (표 8.2.7.1.1 · 8.2.19.1.1) -
 // 	IE 타입 1 TV 는 전부 비트 8 = 1, TLV-E 는 0x70~0x7C 뿐, 비트 8 이 0 인 TV 는 CUC 의 둘뿐
 //
-// 	부작용: 선언된 길이가 메시지 끝을 넘으면 ie_scan_aborted_count 를 올림. 안 남기면 뒤에 있던
+// 	부작용: 선언된 길이나 TV 의 표가 정한 크기가 메시지 끝을 넘으면 ie_scan_aborted_count 를 올림.
 // 	5G-GUTI 를 못 본 것이 "GUTI 가 없었다" 와 같아짐
 static void scan_guti(const uint8_t *bytes, size_t bytes_len, size_t offset_bytes, int msg_type, struct nas_msg *nas_msg) {
 	while (offset_bytes < bytes_len) {
@@ -302,8 +302,16 @@ static void scan_guti(const uint8_t *bytes, size_t bytes_len, size_t offset_byte
 				return;
 			offset_bytes += 3 + ie_len;
 		} else if (msg_type == NAS_MM_CONFIG_UPDATE_COMMAND && iei == NAS_IEI_LOCAL_TIME_ZONE) {
+			if (offset_bytes + NAS_IE_BYTES_LOCAL_TIME_ZONE > bytes_len) {
+				nas_msg->ie_scan_aborted_count++;
+				return;
+			}
 			offset_bytes += NAS_IE_BYTES_LOCAL_TIME_ZONE;
 		} else if (msg_type == NAS_MM_CONFIG_UPDATE_COMMAND && iei == NAS_IEI_UNIVERSAL_TIME_AND_TIME_ZONE) {
+			if (offset_bytes + NAS_IE_BYTES_UNIVERSAL_TIME_AND_TIME_ZONE > bytes_len) {
+				nas_msg->ie_scan_aborted_count++;
+				return;
+			}
 			offset_bytes += NAS_IE_BYTES_UNIVERSAL_TIME_AND_TIME_ZONE;
 		} else {
 			if (offset_bytes + 2 > bytes_len) {
