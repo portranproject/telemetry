@@ -355,8 +355,8 @@ static void scan_guti(const uint8_t *bytes, size_t bytes_len, size_t offset_byte
 }
 
 // parse_plain: 평문 5GMM / 5GSM 메시지 하나. 배치는 파일 헤더 [1]
-// 	inner=true 는 보호된 메시지의 안쪽. 옥텟 2 는 두 경우 모두 읽지 않음 - 타입이 옥텟 3 이라
-// 	옥텟 2 의 값이 타입 판정을 바꾸지 않음
+// 	inner=true 는 보호된 메시지의 안쪽. 그때만 옥텟 2 의 보안 헤더 타입을 봄 - 0 이 아니면
+// 	inner_not_plain_count 를 올리되 해석은 이어감. 바깥 호출에선 옥텟 2 를 읽지 않음
 // 	반환: 0 = 해석함, -EBADMSG = 형식 오류 (이유 계수기 하나를 올린 뒤)
 static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, bool inner) {
 	if (len < 3) {
@@ -383,6 +383,13 @@ static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, 
 		nas_msg->epd_mismatch_count++;
 		return -EBADMSG;
 	}
+	// 8.2.28.1 은 안쪽을 "a plain 5GS NAS message" 로 정하고 표 9.3.1 에서 평문의 보안 헤더 타입은
+	// 	0000 뿐임. 버리지는 않음 - 실측 캡처에서 OAI 가 DEREGISTRATION REQUEST (UE originating)
+	// 	의 그 자리에 0x04 를 싣는데 옥텟 3 부터는 멀쩡히 풀려, 버리면 실제 메시지를 잃음
+	// 	남기는 이유: 안쪽이 또 보호된 것이면 옥텟 3 은 타입이 아니라 MAC 첫 옥텟임 (실측: 안쪽
+	// 	SHT 1~4 x MAC 첫 옥텟 전수 1,024건 중 148건에 이름이 붙음). 바이트로는 둘을 가릴 수 없음
+	if (inner && (buf[1] & 0x0f) != 0)
+		nas_msg->inner_not_plain_count++;
 	// 이름표가 관문임. 두 표의 값 구간이 겹치지 않아 (5GMM 0x41~0x6d, 5GSM 0xc1~0xdb) 표 밖의 값을
 	// 	담으면 소비자가 반대쪽 표로 조회해 다른 이름이 붙음
 	struct nas_msg_info info = mm_info(buf[2]);
