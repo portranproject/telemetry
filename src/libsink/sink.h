@@ -14,6 +14,9 @@
 #define SINK_DEFAULT_SOCKET_PATH "/run/ran-detect/kpm.sock" // 탐지 명세 §2 의 통로. cfg.socket_path 가 NULL 일 때
 #define SINK_LINE_MAX_BYTES 65536                           // 탐지 명세 §2: 한 줄 상한. 넘는 줄은 내지 않고 셈 — 탐지 엔진이 버릴 줄을 만들지 않음
 #define SINK_RECONNECT_INTERVAL_MS 1000                     // 탐지 명세 §2: 끊기면 1초 간격 재접속. 콜백 안에서 connect 하므로 더 짧으면 처리 시간만 먹음
+#define SINK_SEND_TIMEOUT_MS 100                            // 한 줄 보내기 상한(SO_SNDTIMEO). 탐지 엔진이 읽기를 멈춰 커널 송신 버퍼(기본 약 208 KB ≈ 셀 하나 33초어치)가 찬 뒤에만 걸림.
+                                                            //   칸 길이(period_ms)와 같은 값 — 그 이상 기다려도 그 줄이 속한 칸은 지나감. 걸리면 줄을 버리고 소켓을 닫아(반쪽 줄을 엔진이 버리게)
+                                                            //   1초 뒤 재접속하므로 최악에도 캡처 처리는 10 % 만 멈춤
 
 // sink_cfg: 생성 설정. 문자열은 sink_new 가 복사하므로 돌아온 뒤 해제해도 됨. record_file 은 빌려 씀(sink 가 닫지 않음)
 struct sink_cfg {
