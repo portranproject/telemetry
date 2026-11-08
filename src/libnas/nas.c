@@ -457,7 +457,12 @@ static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, 
 		// 첫 선택 IE 만 봄. 7.6.2 : "The UE shall ignore all out of sequence IEs in a message
 		// 	which are not encoded as "comprehension required" ... The network should take the
 		// 	same approach."
-		if (bytes_len >= 3 && bytes[1] == NAS_IEI_5GMM_CAUSE)
+		// 표 8.2.14.1.1 은 5GMM 원인을 `O TV 2` 로 둠. 길이 옥텟이 없어 표가 정한 2 옥텟을 씀
+		// 	IEI 는 왔는데 값 옥텟이 없으면 scan_guti 의 TV 분기와 같이 주사 중단을 남김
+		// 	안 남기면 "상대가 원인을 안 보냈다" 와 같은 모양이 되어 지표에서 가릴 수 없음
+		if (bytes_len == 2 && bytes[1] == NAS_IEI_5GMM_CAUSE)
+			nas_msg->ie_scan_aborted_count++;
+		else if (bytes_len >= 3 && bytes[1] == NAS_IEI_5GMM_CAUSE)
 			nas_msg->mm_cause = bytes[2];
 		break;
 	case NAS_MM_REGISTRATION_ACCEPT:	// 8.2.7 : 5GS 등록 결과 (LV 2) 뒤 선택 IE 중 5G-GUTI
