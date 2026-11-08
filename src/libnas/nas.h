@@ -116,6 +116,9 @@ struct nas_msg {
 	int id_type;                    // 5GS mobile identity 의 신원 종류 (표 9.11.3.4.1 옥텟 4 비트 3~1).
 					// 	48비트를 못 꺼내는 종류(SUCI, IMEI, IMEISV)도 종류는 담음 -
 					// 	'어떤 신원으로 왔나' 가 stmsi48 과 다른 관측이기 때문
+	int switch_off;                 // 해제 유형의 Switch off 비트 (표 9.11.3.20.1 옥텟 1 비트 4).
+					// 	UE 발신 DEREGISTRATION REQUEST 에서만 읽음 - 같은 표가
+					// 	"In the network to UE direction bit 4 is spare" 라고 정함
 	int reg_type;                   // 등록 유형 (9.11.3.7) 하위 3비트. 범위 검사 없음 -
 					// 	표 9.11.3.7.1 이 3비트 값 전부에 뜻을 줌
 

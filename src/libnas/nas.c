@@ -427,13 +427,29 @@ static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, 
 		take_mobile_id_lve(bytes + 1, bytes_len - 1, nas_msg);
 		break;
 	case NAS_MM_DEREG_REQ_UE_ORIG:		// 8.2.12 : ngKSI|해제 유형 (V 1), 5GS mobile identity (LV-E)
+		// 관문을 IE 마다 나눔(위 8.2.6 과 같은 이유). 표 8.2.12.1.1 이 해제 유형을 `M V 1/2`,
+		// 	5GS mobile identity 를 `M LV-E 6-n` 으로 둔 별개 IE 라, 신원이 없어도 해제 유형은 읽힘
+		if (bytes_len < 1) {
+                        nas_msg->missing_mandatory_ie_count++;
+                        break;
+                }
+		// Switch off 는 표 9.11.3.20.1 의 "Switch off (octet 1, bit 4)". 반옥텟 두 개가 한 옥텟을
+		// 	나눌 때 표에 먼저 적힌 쪽이 낮은 비트임 - 바로 위 8.2.6 의 등록 유형이 같은 관례이고
+		// 	실 캡처에서 initial(1) 로 읽히는 것으로 확인됨
+		nas_msg->switch_off = (bytes[0] >> 3) & 0x01;
+		if (bytes_len < 3) {
+                        nas_msg->missing_mandatory_ie_count++;
+                        break;
+                }
+		take_mobile_id_lve(bytes + 1, bytes_len - 1, nas_msg);
+                break;
 	case NAS_MM_SERVICE_REQUEST:		// 8.2.16 : 서비스 유형|ngKSI (V 1), 5G-S-TMSI (LV-E)
 		if (bytes_len < 3) {
-			nas_msg->missing_mandatory_ie_count++;
-			break;
-		}
+                        nas_msg->missing_mandatory_ie_count++;
+                        break;
+                }
 		take_mobile_id_lve(bytes + 1, bytes_len - 1, nas_msg);
-		break;
+                break;
 	case NAS_MM_IDENTITY_RESPONSE:		// 8.2.22 : 5GS mobile identity (LV-E) 가 타입 바로 뒤
 		take_mobile_id_lve(bytes, bytes_len, nas_msg);
 		break;
@@ -469,7 +485,14 @@ static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, 
 		// 	treated as 0110 1111, "protocol error, unspecified"." - 256개 값 전부에 해석이 있음
 		nas_msg->mm_cause = bytes[0];
 		break;
-	case NAS_MM_DEREG_REQ_UE_TERM:		// 8.2.14 : 해제 유형|spare (V 1), 5GMM 원인은 선택 (TV 2)
+	case NAS_MM_DEREG_REQ_UE_TERM:		// 8.2.14 : 해제 유형|spare (V 1), 5GMM 원인은 선택 (TV 2
+		// 표 8.2.14.1.1 이 해제 유형과 spare 반옥텟을 `M V 1/2` 둘로 둬 필수 1 옥텟임. 그 방향에선
+		// 	비트 4 가 spare 라 값은 안 읽지만(표 9.11.3.20.1 "In the network to UE direction bit 4
+		// 	is spare"), 없다는 사실은 세야 기형과 정상이 같은 모양이 되지 않음
+		if (bytes_len < 1) {
+                        nas_msg->missing_mandatory_ie_count++;
+                        break;
+                }
 		// 첫 선택 IE 만 봄. 7.6.2 : "The UE shall ignore all out of sequence IEs in a message
 		// 	which are not encoded as "comprehension required" ... The network should take the
 		// 	same approach."
@@ -517,6 +540,7 @@ int nas_parse(const uint8_t *buf, size_t len, int known_nas_ciph_alg, struct nas
 	nas_msg->mm_cause = -1;
 	nas_msg->reg_type = -1;
 	nas_msg->id_type = -1;
+	nas_msg->switch_off = -1;
 	nas_msg->nas_ciph_alg = -1;
 	nas_msg->nas_integ_alg = -1;
 	// 0 을 그대로 두면 '평문 (SHT 0)' 과 '해당 없음' 이 같아짐. epd 도 같다 - 0 은 EPD 값이 아니지만
