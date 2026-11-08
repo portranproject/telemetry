@@ -38,6 +38,10 @@
 // sht(바깥 보안 헤더 유형, TS 24.501 9.3.1)의 최댓값. 0 평문 ~ 4 새 보안 문맥·암호. 엔진은 4 를 넘으면 줄을 버림
 #define NAS_SHT_MAX 4
 
+// 줄에 쓰는 정수의 상한. 탐지 엔진은 모든 정수를 int64 로 읽어(req_int) 2^63 이상이면 "out of range" 로 줄을 버림.
+//   실제 값(epoch ms·번호)은 이 근처에 못 가므로 넘으면 상위 버그 — 엔진이 버릴 줄은 내지 않고 셈
+#define JSON_INT_MAX ((uint64_t)INT64_MAX)
+
 // MARK: - 자료구조
 
 // line_buf: JSON 한 줄을 만드는 버퍼. 넘치면 is_overflowed 만 켜고 더 쓰지 않아, 다 만든 뒤 한 번만 검사하면 됨
@@ -526,7 +530,14 @@ enum sink_result sink_on_f1_event(struct sink *sink, const struct report_f1_even
     bool is_cells_valid = event && (!event->cells_known || event->cell_count == 0 || event->cell_ids);
     bool is_du_ue_ids_valid = event && (event->du_ue_id_count == 0 || event->du_ue_ids);
     bool is_count_valid = event && event->cell_count >= 0 && event->du_ue_id_count >= 0;
-    if (!msg_name || !is_cells_valid || !is_du_ue_ids_valid || !is_count_valid) {
+    bool is_range_valid = event && event->t_ms <= JSON_INT_MAX;
+    bool has_cell_list = is_cells_valid && is_count_valid && event->cells_known;
+    for (int i = 0; has_cell_list && i < event->cell_count; i++) {
+        if (event->cell_ids[i] > JSON_INT_MAX) {
+            is_range_valid = false;
+        }
+    }
+    if (!msg_name || !is_cells_valid || !is_du_ue_ids_valid || !is_count_valid || !is_range_valid) {
         sink->stats.invalid_drop_count++;
         return SINK_DROPPED_INVALID;
     }
@@ -566,7 +577,8 @@ enum sink_result sink_on_f1_event(struct sink *sink, const struct report_f1_even
 // MARK: - kpm2
 
 /* line_real: 실수 값. 정수면 정수로 찍음(탐지 명세 §5.3 "정수도 됨", 참조 샘플도 정수), 아니면 소수 3자리.
- *   유한하지 않은 값(nan·무한대)은 JSON 에 없어 부르는 쪽이 null 로 — 여기에 오면 안 됨
+ *   유한하지 않은 값(nan·무한대)은 JSON 에 없어 부르는 쪽이 null 로 — 여기에 오면 안 됨.
+ *   버퍼는 %.3f 의 최악(DBL_MAX: 정수부 309자리 + ".000" + 부호)을 담는 크기 — 모자라면 snprintf 가 자르고 길이만 돌려줘 버퍼 밖을 읽게 됨(퍼저가 찾음)
  */
 static void line_real(struct line_buf *line, double value) {
     bool is_integral = value >= 0 && value < 1e15 && (double)(uint64_t)value == value;
@@ -574,8 +586,12 @@ static void line_real(struct line_buf *line, double value) {
         line_u64(line, (uint64_t)value);
         return;
     }
-    char digits[64];
+    char digits[340];
     int n = snprintf(digits, sizeof digits, "%.3f", value);
+    if (n < 0 || (size_t)n >= sizeof digits) {
+        line_null(line); // 생길 수 없음(위 크기) — 생기면 깨진 숫자 대신 null
+        return;
+    }
     line_value_start(line);
     line_put_bytes(line, digits, (size_t)n);
 }
@@ -760,9 +776,9 @@ enum sink_result sink_on_period(struct sink *sink, const struct report_period *p
             has_warning = true;
         }
     }
-    // 엔진이 줄을 버리는 모양: t_end ≤ t_start, 음수 평균. 경고만 내고 받는 모양(원인 합 ≠ total, 칸 길이 ≠ period_ms)은 보내고 셈 —
+    // 엔진이 줄을 버리는 모양: t_end ≤ t_start, int64 밖 번호·시각, 음수 평균. 경고만 내고 받는 모양(원인 합 ≠ total, 칸 길이 ≠ period_ms)은 보내고 셈 —
     //   줄을 버리면 칸이 비어 엔진이 그 구간을 보류하므로(탐지 명세 §5.6) 경고 하나보다 손해가 큼
-    bool is_time_valid = period->t_end_ms > period->t_start_ms;
+    bool is_time_valid = period->t_end_ms > period->t_start_ms && period->t_end_ms <= JSON_INT_MAX && period->cell_id <= JSON_INT_MAX;
     bool is_mean_valid = !(period->has_conn_si && period->conn_mean < 0) && !(period->has_inactive_si && period->inactive_mean < 0);
     if (!is_time_valid || !is_mean_valid || !is_counter_valid) {
         sink->stats.invalid_drop_count++;
@@ -952,9 +968,10 @@ static const char *ue_msg_name(const struct report_ue_event *event) {
 }
 
 /* ue_event_check: 공통 필드가 엔진이 버리는 모양인지(탐지 명세 §6.3, parse_ue_evt): dir·proto 없음, NAS 인데 via 없음·sht 범위 밖,
- *   du_ue_id 없음(NGAP 에서만 본 NAS 줄은 됨). 반환: 낼 수 있으면 true
+ *   du_ue_id 없음(NGAP 에서만 본 NAS 줄은 됨), 시각·셀 번호가 int64 밖. 반환: 낼 수 있으면 true
  */
 static bool ue_event_check(const struct report_ue_event *event) {
+    bool is_range_valid = event->t_ms <= JSON_INT_MAX && event->cell_id <= JSON_INT_MAX;
     bool is_direction_valid = event->direction == REPORT_DIRECTION_UL || event->direction == REPORT_DIRECTION_DL;
     bool is_proto_valid = event->proto == REPORT_PROTO_RRC || event->proto == REPORT_PROTO_NAS || event->proto == REPORT_PROTO_F1AP;
     bool is_nas = event->proto == REPORT_PROTO_NAS;
@@ -962,7 +979,7 @@ static bool ue_event_check(const struct report_ue_event *event) {
     bool is_sht_valid = !is_nas || (event->sht >= 0 && event->sht <= NAS_SHT_MAX);
     bool is_ngap_nas = is_nas && event->via == REPORT_NAS_VIA_NGAP;
     bool is_du_ue_id_valid = event->has_du_ue_id || is_ngap_nas;
-    return is_direction_valid && is_proto_valid && is_via_valid && is_sht_valid && is_du_ue_id_valid;
+    return is_range_valid && is_direction_valid && is_proto_valid && is_via_valid && is_sht_valid && is_du_ue_id_valid;
 }
 
 // ue_f_keys: 이 줄의 f 에 실제로 쓸 키와 이름표를 거친 값. 쓰기 전에 정하는 이유: 하나도 없으면 f 키 자체를 빼야 하고(탐지 명세 §6.3),
