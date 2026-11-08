@@ -26,6 +26,18 @@
 // 줄 안 중첩 깊이 상한(객체·배열). 탐지 줄은 kpm2 의 {cc:{카운터:{}}} 로 깊이 3 이 최대 — 넘으면 코드 버그라 줄을 버림
 #define LINE_DEPTH_MAX 8
 
+// NAS 확장 프로토콜 판별자 5GMM(TS 24.501 9.2). ue_evt 이름표의 키 — 5GSM(0x2e)은 탐지 명세 §6.4 에 없어 줄을 내지 않음.
+//   libnas 에 같은 상수가 있지만 sink 는 해석기 헤더를 include 하지 않음(공용 헤더 규칙)
+#define NAS_EPD_5GMM 0x7e
+
+// S-TMSI 값의 비트 폭(TS 23.003 2.10.1: 5G-S-TMSI 48 = AMF Set ID 10 + AMF Pointer 6 + 5G-TMSI 32). 탐지 명세 §6.4 의 hex 자릿수 12·10·3 의 근거
+#define S_TMSI_BITS 48
+#define S_TMSI_PART1_BITS 39 // RRCSetupRequest ng-5G-S-TMSI-Part1(TS 38.331 6.2.2) — 하위 39비트
+#define S_TMSI_PART2_BITS 9  // RRCSetupComplete ng-5G-S-TMSI-Part2 — 상위 9비트
+
+// sht(바깥 보안 헤더 유형, TS 24.501 9.3.1)의 최댓값. 0 평문 ~ 4 새 보안 문맥·암호. 엔진은 4 를 넘으면 줄을 버림
+#define NAS_SHT_MAX 4
+
 // MARK: - 자료구조
 
 // line_buf: JSON 한 줄을 만드는 버퍼. 넘치면 is_overflowed 만 켜고 더 쓰지 않아, 다 만든 뒤 한 번만 검사하면 됨
@@ -149,12 +161,11 @@ static void line_put_char(struct line_buf *line, char c) {
     line_put_bytes(line, &c, 1);
 }
 
-/* line_put_quoted: 문자열을 따옴표로 싸서 이스케이프해 붙임.
+/* line_put_escaped: 문자열을 따옴표 없이 이스케이프해 붙임. 따옴표 안에 여러 조각을 이어 쓸 때(F1AP cause "<범주>:<값>") 씀.
  *   탐지 명세 부록 B: "·\·제어 문자. \n·\r·\t 는 그 이름으로, 나머지 제어 문자는 \u00XX. 0x20 이상은 그대로(UTF-8 은 설정 때 검사함)
  */
-static void line_put_quoted(struct line_buf *line, const char *text) {
+static void line_put_escaped(struct line_buf *line, const char *text) {
     static const char hex_digits[] = "0123456789abcdef";
-    line_put_char(line, '"');
     for (const unsigned char *cursor = (const unsigned char *)text; *cursor; cursor++) {
         unsigned char c = *cursor;
         if (c == '"') {
@@ -174,6 +185,12 @@ static void line_put_quoted(struct line_buf *line, const char *text) {
             line_put_char(line, (char)c);
         }
     }
+}
+
+/* line_put_quoted: 문자열을 따옴표로 싸서 이스케이프해 붙임 */
+static void line_put_quoted(struct line_buf *line, const char *text) {
+    line_put_char(line, '"');
+    line_put_escaped(line, text);
     line_put_char(line, '"');
 }
 
@@ -797,4 +814,357 @@ enum sink_result sink_on_period(struct sink *sink, const struct report_period *p
         }
     }
     return result;
+}
+
+// MARK: - ue_evt
+
+/* line_hex: "0x" + 소문자 16진수 문자열. bits 비트를 담는 자릿수로 앞을 0 으로 채움(48 → 12자리, 39 → 10자리, 9 → 3자리 — 탐지 명세 §6.4).
+ *   JSON 숫자로 보내면 엔진이 줄을 버림(opt_hex 는 문자열만)
+ */
+static void line_hex(struct line_buf *line, uint64_t value, int bits) {
+    int digits = (bits + 3) / 4;
+    char text[2 + 16 + 1]; // "0x" + 64비트 최대 16자리 + NUL
+    int n = snprintf(text, sizeof text, "0x%0*llx", digits, (unsigned long long)value);
+    line_value_start(line);
+    line_put_char(line, '"');
+    line_put_bytes(line, text, (size_t)n);
+    line_put_char(line, '"');
+}
+
+/* nas_msg_detect_name: 5GMM 메시지 타입(TS 24.501 표 9.7.1) → 탐지 명세 §6.4 철자. 명세에 없는 메시지는 같은 꼴(띄어쓰기 없는 CamelCase)로 —
+ *   엔진은 모르는 이름도 받아 이력에만 남김(parse_ue_evt). 발신 쪽이 다른 같은 메시지(0x45·0x47)는 한 이름 — 명세가 dir 로 가름.
+ *   반환: 표에 없는 타입이면 NULL(줄을 버림 — "ProtectedNAS" 로 뭉개면 엔진이 인증 응답으로 인정해 버림)
+ */
+static const char *nas_msg_detect_name(int msg_type) {
+    static const struct {
+        int msg_type;
+        const char *name;
+    } names[] = {
+        {0x41, "RegistrationRequest"},
+        {0x42, "RegistrationAccept"},
+        {0x43, "RegistrationComplete"},
+        {0x44, "RegistrationReject"},
+        {0x45, "DeregistrationRequest"}, // UE 발신
+        {0x46, "DeregistrationAccept"},  // UE 발신에 대한 수락
+        {0x47, "DeregistrationRequest"}, // 망 발신
+        {0x48, "DeregistrationAccept"},  // 망 발신에 대한 수락
+        {0x4c, "ServiceRequest"},
+        {0x4d, "ServiceReject"},
+        {0x4e, "ServiceAccept"},
+        {0x4f, "ControlPlaneServiceRequest"},
+        {0x50, "NetworkSliceSpecificAuthenticationCommand"},
+        {0x51, "NetworkSliceSpecificAuthenticationComplete"},
+        {0x52, "NetworkSliceSpecificAuthenticationResult"},
+        {0x54, "ConfigurationUpdateCommand"},
+        {0x55, "ConfigurationUpdateComplete"},
+        {0x56, "AuthenticationRequest"},
+        {0x57, "AuthenticationResponse"},
+        {0x58, "AuthenticationReject"},
+        {0x59, "AuthenticationFailure"},
+        {0x5a, "AuthenticationResult"},
+        {0x5b, "IdentityRequest"},
+        {0x5c, "IdentityResponse"},
+        {0x5d, "SecurityModeCommand"},
+        {0x5e, "SecurityModeComplete"},
+        {0x5f, "SecurityModeReject"},
+        {0x64, "5GMMStatus"},
+        {0x65, "Notification"},
+        {0x66, "NotificationResponse"},
+        {0x67, "ULNASTransport"},
+        {0x68, "DLNASTransport"},
+        {0x69, "RelayKeyRequest"},
+        {0x6a, "RelayKeyAccept"},
+        {0x6b, "RelayKeyReject"},
+        {0x6c, "RelayAuthenticationRequest"},
+        {0x6d, "RelayAuthenticationResponse"},
+    };
+    for (size_t i = 0; i < NELEM(names); i++) {
+        if (names[i].msg_type == msg_type) {
+            return names[i].name;
+        }
+    }
+    return NULL;
+}
+
+/* reg_type_name: 5GS registration type 값(TS 24.501 9.11.3.7 하위 3비트) → 탐지 명세 §6.4 철자.
+ *   표 9.11.3.7.1: 1 initial·2 mobility·3 periodic·4 emergency, 7 예약, 그 밖(0·5·6)은 "망이 받으면 initial 로 해석" → initial.
+ *   반환: 예약·범위 밖이면 NULL(키 뺌)
+ */
+static const char *reg_type_name(int reg_type) {
+    switch (reg_type) {
+    case 0:
+    case 1:
+    case 5:
+    case 6:
+        return "initial";
+    case 2:
+        return "mobility";
+    case 3:
+        return "periodic";
+    case 4:
+        return "emergency";
+    default:
+        return NULL;
+    }
+}
+
+/* id_type_name: 5GS mobile identity 종류(TS 24.501 표 9.11.3.4.1) → 탐지 명세 §6.4 의 넷. 그 밖(0 없음·4 5G-S-TMSI·6 MAC·7 EUI-64·-1 못 읽음)은 NULL(키 뺌) */
+static const char *id_type_name(int id_type) {
+    switch (id_type) {
+    case 1:
+        return "SUCI";
+    case 2:
+        return "5G-GUTI";
+    case 3:
+        return "IMEI";
+    case 5:
+        return "IMEISV";
+    default:
+        return NULL;
+    }
+}
+
+/* nas_algorithm_name: NAS 보안 알고리즘 니블(TS 24.501 9.11.3.34) → "5G-EA0"~"5G-EA3" / "5G-IA0"~"5G-IA3". 4~7 은 예약이라 NULL(키 뺌) */
+static const char *nas_algorithm_name(bool is_ciphering, int algorithm) {
+    static const char *const ciphering_names[] = {"5G-EA0", "5G-EA1", "5G-EA2", "5G-EA3"};
+    static const char *const integrity_names[] = {"5G-IA0", "5G-IA1", "5G-IA2", "5G-IA3"};
+    if (algorithm < 0 || algorithm > 3) {
+        return NULL;
+    }
+    return is_ciphering ? ciphering_names[algorithm] : integrity_names[algorithm];
+}
+
+/* ue_msg_name: 줄의 msg. RRC·F1AP 는 해석기 이름 그대로(탐지 철자와 같고, 엔진은 명세 표 밖 이름도 받음). NAS 는 안쪽을 못 읽었으면
+ *   "ProtectedNAS"(탐지 명세 §6.2), 아니면 5GMM 이름표. 반환: 이름이 없으면 NULL(msg 는 필수라 줄을 버림)
+ */
+static const char *ue_msg_name(const struct report_ue_event *event) {
+    if (event->proto == REPORT_PROTO_NAS) {
+        if (event->nas_msg_type < 0) {
+            return "ProtectedNAS";
+        }
+        if (event->nas_epd != NAS_EPD_5GMM) {
+            return NULL;
+        }
+        return nas_msg_detect_name(event->nas_msg_type);
+    }
+    bool has_name = event->msg_name && event->msg_name[0] != '\0';
+    return has_name ? event->msg_name : NULL;
+}
+
+/* ue_event_check: 공통 필드가 엔진이 버리는 모양인지(탐지 명세 §6.3, parse_ue_evt): dir·proto 없음, NAS 인데 via 없음·sht 범위 밖,
+ *   du_ue_id 없음(NGAP 에서만 본 NAS 줄은 됨). 반환: 낼 수 있으면 true
+ */
+static bool ue_event_check(const struct report_ue_event *event) {
+    bool is_direction_valid = event->direction == REPORT_DIRECTION_UL || event->direction == REPORT_DIRECTION_DL;
+    bool is_proto_valid = event->proto == REPORT_PROTO_RRC || event->proto == REPORT_PROTO_NAS || event->proto == REPORT_PROTO_F1AP;
+    bool is_nas = event->proto == REPORT_PROTO_NAS;
+    bool is_via_valid = !is_nas || event->via == REPORT_NAS_VIA_F1 || event->via == REPORT_NAS_VIA_NGAP;
+    bool is_sht_valid = !is_nas || (event->sht >= 0 && event->sht <= NAS_SHT_MAX);
+    bool is_ngap_nas = is_nas && event->via == REPORT_NAS_VIA_NGAP;
+    bool is_du_ue_id_valid = event->has_du_ue_id || is_ngap_nas;
+    return is_direction_valid && is_proto_valid && is_via_valid && is_sht_valid && is_du_ue_id_valid;
+}
+
+// ue_f_keys: 이 줄의 f 에 실제로 쓸 키와 이름표를 거친 값. 쓰기 전에 정하는 이유: 하나도 없으면 f 키 자체를 빼야 하고(탐지 명세 §6.3),
+//   메시지별 규칙(s_tmsi 는 네 메시지만, id_type 은 RegistrationRequest 만)이 한 곳에 보이게. 포인터는 event 의 것을 빌림
+struct ue_f_keys {
+    bool has_est_cause;
+    bool has_ue_identity;
+    bool has_wait_time;
+    const char *cipher_name;    // RRC 는 해석기 이름 그대로, NAS 는 이름표. NULL 이면 키 뺌
+    const char *integrity_name; // 같음
+    bool has_suspend;
+    const char *reg_type_name; // NULL 이면 키 뺌
+    const char *id_type_name;  // 같음
+    bool has_s_tmsi;
+    bool has_s_tmsi_part2;
+    bool has_nas_cause;
+    bool has_f1ap_cause;
+    bool has_switch_off;
+};
+
+/* ue_f_keys_decide: f 에 쓸 키를 정함. 값이 없거나(has_ 거짓, 포인터 NULL·빈 문자열, 이름표 밖 번호, 음수 원인) 그 메시지에 쓰지 않는 키면 뺌 —
+ *   엔진은 없는 키를 받지만 타입이 틀린 값은 줄 전체를 버리므로, 애매한 값은 키를 빼는 쪽이 상태 추적을 지킴(탐지 명세 §6.3·§6.4).
+ *   반환: 쓸 hex 값이 비트 폭을 넘으면 false(엔진 opt_hex 가 줄을 버림 — 해석기가 폭을 지키므로 생기면 상위 버그)
+ */
+static bool ue_f_keys_decide(const struct report_ue_event *event, const char *msg_name, struct ue_f_keys *keys) {
+    const struct report_ue_fields *f = &event->fields;
+    bool is_rrc = event->proto == REPORT_PROTO_RRC;
+    bool is_nas = event->proto == REPORT_PROTO_NAS;
+    bool is_f1ap = event->proto == REPORT_PROTO_F1AP;
+    bool is_ul = event->direction == REPORT_DIRECTION_UL;
+    bool is_setup_complete = is_rrc && is_ul && strcmp(msg_name, "RRCSetupComplete") == 0;
+    bool is_registration_request = is_nas && is_ul && strcmp(msg_name, "RegistrationRequest") == 0;
+    bool is_service_request = is_nas && is_ul && strcmp(msg_name, "ServiceRequest") == 0;
+    bool is_registration_accept = is_nas && !is_ul && strcmp(msg_name, "RegistrationAccept") == 0;
+    // 탐지 명세 §6.4: s_tmsi 는 이 네 메시지에서만 읽음. Part2 는 RRCSetupComplete 의 폴백
+    bool reads_s_tmsi = is_setup_complete || is_registration_request || is_service_request || is_registration_accept;
+    bool has_f1ap_cause_names = f->f1ap_cause_group && f->f1ap_cause_group[0] && f->f1ap_cause_value && f->f1ap_cause_value[0];
+
+    *keys = (struct ue_f_keys){0};
+    keys->has_est_cause = f->has_est_cause && f->est_cause && f->est_cause[0];
+    keys->has_ue_identity = f->has_ue_identity;
+    keys->has_wait_time = f->has_wait_time;
+    if (is_rrc && f->has_rrc_algorithm) {
+        keys->cipher_name = f->cipher && f->cipher[0] ? f->cipher : NULL;
+        keys->integrity_name = f->integrity && f->integrity[0] ? f->integrity : NULL;
+    }
+    if (is_nas && f->has_nas_algorithm) {
+        keys->cipher_name = nas_algorithm_name(true, f->nas_ciphering_algorithm);
+        keys->integrity_name = nas_algorithm_name(false, f->nas_integrity_algorithm);
+    }
+    keys->has_suspend = f->has_suspend;
+    keys->reg_type_name = f->has_reg_type ? reg_type_name(f->reg_type) : NULL;
+    keys->id_type_name = is_registration_request ? id_type_name(f->id_type) : NULL;
+    keys->has_s_tmsi = reads_s_tmsi && f->has_s_tmsi;
+    keys->has_s_tmsi_part2 = is_setup_complete && f->has_s_tmsi_part2;
+    keys->has_nas_cause = is_nas && f->has_nas_cause && f->nas_cause >= 0;
+    keys->has_f1ap_cause = is_f1ap && f->has_f1ap_cause && has_f1ap_cause_names;
+    keys->has_switch_off = f->has_switch_off;
+
+    bool is_part1_too_wide = keys->has_ue_identity && f->is_ue_identity_part1 && (f->ue_identity_part1 >> S_TMSI_PART1_BITS) != 0;
+    bool is_s_tmsi_too_wide = keys->has_s_tmsi && (f->s_tmsi >> S_TMSI_BITS) != 0;
+    bool is_part2_too_wide = keys->has_s_tmsi_part2 && (f->s_tmsi_part2 >> S_TMSI_PART2_BITS) != 0;
+    return !is_part1_too_wide && !is_s_tmsi_too_wide && !is_part2_too_wide;
+}
+
+static bool ue_f_keys_has_any(const struct ue_f_keys *keys) {
+    return keys->has_est_cause || keys->has_ue_identity || keys->has_wait_time || keys->cipher_name || keys->integrity_name || keys->has_suspend || keys->reg_type_name || keys->id_type_name || keys->has_s_tmsi || keys->has_s_tmsi_part2 || keys->has_nas_cause || keys->has_f1ap_cause || keys->has_switch_off;
+}
+
+/* ue_f_write: "f":{…}. 키 순서는 탐지 명세 §6.4 표의 메시지 순서(참조 샘플과 같게 — 엔진은 순서를 안 봄) */
+static void ue_f_write(struct line_buf *line, const struct report_ue_event *event, const struct ue_f_keys *keys) {
+    const struct report_ue_fields *f = &event->fields;
+    line_key(line, "f");
+    line_open(line, '{');
+    if (keys->has_est_cause) {
+        line_key(line, "est_cause");
+        line_string(line, f->est_cause);
+    }
+    if (keys->has_ue_identity) {
+        line_key(line, "ue_identity");
+        line_open(line, '{');
+        line_key(line, "type");
+        if (f->is_ue_identity_part1) {
+            line_string(line, "ng-5G-S-TMSI-Part1");
+            line_key(line, "value");
+            line_hex(line, f->ue_identity_part1, S_TMSI_PART1_BITS);
+        } else {
+            line_string(line, "randomValue"); // 값은 보내지 않음 — 엔진이 읽지 않고, 무작위 값은 UE 를 잇는 데 못 씀
+        }
+        line_close(line, '}');
+    }
+    if (keys->has_wait_time) {
+        line_key(line, "wait_time");
+        line_u64(line, f->wait_time_s);
+    }
+    if (keys->cipher_name) {
+        line_key(line, "cipher");
+        line_string(line, keys->cipher_name);
+    }
+    if (keys->integrity_name) {
+        line_key(line, "integrity");
+        line_string(line, keys->integrity_name);
+    }
+    if (keys->has_suspend) {
+        line_key(line, "suspend");
+        line_bool(line, f->suspend);
+    }
+    if (keys->reg_type_name) {
+        line_key(line, "reg_type");
+        line_string(line, keys->reg_type_name);
+    }
+    if (keys->id_type_name) {
+        line_key(line, "id_type");
+        line_string(line, keys->id_type_name);
+    }
+    if (keys->has_s_tmsi) {
+        line_key(line, "s_tmsi");
+        line_hex(line, f->s_tmsi, S_TMSI_BITS);
+    }
+    if (keys->has_s_tmsi_part2) {
+        line_key(line, "s_tmsi_part2");
+        line_hex(line, f->s_tmsi_part2, S_TMSI_PART2_BITS);
+    }
+    if (keys->has_nas_cause) {
+        line_key(line, "cause"); // NAS 는 5GMM 원인 정수(AuthenticationFailure 21 = 동기 실패)
+        line_u64(line, (uint64_t)f->nas_cause);
+    }
+    if (keys->has_f1ap_cause) {
+        line_key(line, "cause"); // F1AP 는 "<선택지>:<값 이름>" 한 문자열(탐지 명세 §6.4)
+        line_value_start(line);
+        line_put_char(line, '"');
+        line_put_escaped(line, f->f1ap_cause_group);
+        line_put_char(line, ':');
+        line_put_escaped(line, f->f1ap_cause_value);
+        line_put_char(line, '"');
+    }
+    if (keys->has_switch_off) {
+        line_key(line, "switch_off");
+        line_bool(line, f->switch_off);
+    }
+    line_close(line, '}');
+}
+
+enum sink_result sink_on_ue_event(struct sink *sink, const struct report_ue_event *event) {
+    if (!sink) {
+        return SINK_DROPPED_INVALID;
+    }
+    const char *msg_name = event ? ue_msg_name(event) : NULL;
+    struct ue_f_keys keys;
+    bool is_valid = msg_name && ue_event_check(event) && ue_f_keys_decide(event, msg_name, &keys);
+    if (!is_valid) {
+        sink->stats.invalid_drop_count++;
+        return SINK_DROPPED_INVALID;
+    }
+    bool is_nas = event->proto == REPORT_PROTO_NAS;
+    const char *proto_name = "F1AP";
+    if (is_nas) {
+        proto_name = "NAS";
+    } else if (event->proto == REPORT_PROTO_RRC) {
+        proto_name = "RRC";
+    }
+    bool is_connected = connection_ensure(sink);
+    struct line_buf line = {.data = sink->line, .cap = sizeof sink->line};
+    line_reset(&line);
+    sink->seq++;
+    line_open(&line, '{');
+    line_common_head(&line, sink, "ue_evt", sink->seq);
+    line_key(&line, "t_ms");
+    line_u64(&line, event->t_ms);
+    line_key(&line, "cell_id");
+    line_u64(&line, event->cell_id);
+    line_key(&line, "du_ue_id"); // null 은 NGAP 에서만 본 NAS 줄만(ue_event_check 가 확인). 0 도 정상 ID 라 0 으로 채우지 않음
+    if (event->has_du_ue_id) {
+        line_u64(&line, event->du_ue_id);
+    } else {
+        line_null(&line);
+    }
+    line_key(&line, "crnti"); // 키는 늘 — 없으면 엔진이 줄을 버림. 모르면 null
+    if (event->has_crnti) {
+        line_u64(&line, event->crnti);
+    } else {
+        line_null(&line);
+    }
+    if (event->has_cu_ue_id) { // CU 가 정하기 전(RRCSetupRequest 줄)에는 키를 뺌
+        line_key(&line, "cu_ue_id");
+        line_u64(&line, event->cu_ue_id);
+    }
+    line_key(&line, "dir");
+    line_string(&line, event->direction == REPORT_DIRECTION_UL ? "UL" : "DL");
+    line_key(&line, "proto");
+    line_string(&line, proto_name);
+    line_key(&line, "msg");
+    line_string(&line, msg_name);
+    if (is_nas) { // NAS 줄만: 본 경로와 바깥 보안 헤더 유형(탐지 명세 §6.3)
+        line_key(&line, "via");
+        line_string(&line, event->via == REPORT_NAS_VIA_F1 ? "F1" : "NGAP");
+        line_key(&line, "sht");
+        line_u64(&line, (uint64_t)event->sht);
+    }
+    if (ue_f_keys_has_any(&keys)) {
+        ue_f_write(&line, event, &keys);
+    }
+    line_finish(&line);
+    return line_emit(sink, &line, is_connected);
 }

@@ -70,7 +70,8 @@ struct report_ue_fields {
     bool suspend; // RRCRelease 에 suspendConfig 가 있는지
 
     bool has_reg_type;
-    int reg_type; // RegistrationRequest 등록 유형(TS 24.501 9.11.3.7 하위 3비트). sink 가 1~4 → "initial"·"mobility"·"periodic"·"emergency", 0 은 initial 로
+    int reg_type; // RegistrationRequest 등록 유형(TS 24.501 9.11.3.7 하위 3비트). sink 가 1~4 → "initial"·"mobility"·"periodic"·"emergency",
+                  //   0·5·6 은 표 9.11.3.7.1 대로 initial, 7(예약)·범위 밖은 키 뺌
 
     int id_type; // 5GS mobile identity 종류(TS 24.501 표 9.11.3.4.1 의 3비트 값 0~7). 못 읽었으면 -1
                  //   has_ 짝 없이 정수인 이유: 표의 여덟 값 전부에 뜻이 있어 '못 읽음(-1)' 과 'No identity(0)' 를 나눠야 함
