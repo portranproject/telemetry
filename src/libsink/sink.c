@@ -1,6 +1,7 @@
 #include "libsink/sink.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -9,6 +10,8 @@
 #include <unistd.h>
 
 // MARK: - 상수
+
+#define NELEM(array) (sizeof(array) / sizeof((array)[0]))
 
 #define JSON_VERSION 1 // 탐지 명세 §3 의 ver. 다른 값이면 줄을 버림
 
@@ -541,4 +544,257 @@ enum sink_result sink_on_f1_event(struct sink *sink, const struct report_f1_even
     }
     line_finish(&line);
     return line_emit(sink, &line, is_connected);
+}
+
+// MARK: - kpm2
+
+/* line_real: 실수 값. 정수면 정수로 찍음(탐지 명세 §5.3 "정수도 됨", 참조 샘플도 정수), 아니면 소수 3자리.
+ *   유한하지 않은 값(nan·무한대)은 JSON 에 없어 부르는 쪽이 null 로 — 여기에 오면 안 됨
+ */
+static void line_real(struct line_buf *line, double value) {
+    bool is_integral = value >= 0 && value < 1e15 && (double)(uint64_t)value == value;
+    if (is_integral) {
+        line_u64(line, (uint64_t)value);
+        return;
+    }
+    char digits[64];
+    int n = snprintf(digits, sizeof digits, "%.3f", value);
+    line_value_start(line);
+    line_put_bytes(line, digits, (size_t)n);
+}
+
+// counter_check 결과. INVALID 는 엔진이 줄을 버리는 모양, WARNING 은 엔진이 경고만 내고 받는 모양(원인 합 ≠ total)
+enum counter_check_result { COUNTER_OK,
+                            COUNTER_WARNING,
+                            COUNTER_INVALID };
+
+/* counter_check: 원인별 카운터 입력 검사. 원인 이름이 없거나 "total" 이면 줄이 깨지므로 INVALID(엔진: "total" 을 뺀 모든 키를 원인으로 봄).
+ *   0 인 원인은 쓰지 않으므로 합에서도 뺌 — 엔진은 받은 원인만 더해 total 과 대조하고, 다르면 경고 뒤 total 을 씀
+ */
+static enum counter_check_result counter_check(const struct report_counter *counter) {
+    if (!counter->is_counted) {
+        return COUNTER_OK;
+    }
+    bool is_array_valid = counter->cause_count >= 0 && (counter->cause_count == 0 || counter->causes);
+    if (!is_array_valid) {
+        return COUNTER_INVALID;
+    }
+    uint64_t sum = 0;
+    bool has_nonzero_cause = false;
+    for (int i = 0; i < counter->cause_count; i++) {
+        const struct report_cause_count *cause = &counter->causes[i];
+        bool is_name_valid = cause->name && cause->name[0] != '\0' && strcmp(cause->name, "total") != 0;
+        if (!is_name_valid) {
+            return COUNTER_INVALID;
+        }
+        if (cause->count == 0) {
+            continue;
+        }
+        has_nonzero_cause = true;
+        sum += cause->count;
+    }
+    if (has_nonzero_cause && sum != counter->total) {
+        return COUNTER_WARNING;
+    }
+    return COUNTER_OK;
+}
+
+/* counter_write: "키":{"total":n,"<원인>":m,…} 또는 null. 0 인 원인은 쓰지 않음(탐지 명세 §5.1: 0 이 아닌 원인만, 합 = total) */
+static void counter_write(struct line_buf *line, const char *key, const struct report_counter *counter) {
+    line_key(line, key);
+    if (!counter->is_counted) {
+        line_null(line);
+        return;
+    }
+    line_open(line, '{');
+    line_key(line, "total");
+    line_u64(line, counter->total);
+    for (int i = 0; i < counter->cause_count; i++) {
+        if (counter->causes[i].count == 0) {
+            continue;
+        }
+        line_key(line, counter->causes[i].name);
+        line_u64(line, counter->causes[i].count);
+    }
+    line_close(line, '}');
+}
+
+/* inferred_write: "키":n 또는 null — 그 카운터의 추정분. 세지 못한 카운터는 추정분도 없음 */
+static void inferred_write(struct line_buf *line, const char *key, const struct report_counter *counter) {
+    line_key(line, key);
+    if (counter->is_counted) {
+        line_u64(line, counter->inferred);
+    } else {
+        line_null(line);
+    }
+}
+
+/* optional_u64_write: "키":n 또는 null. 세지 못한 지표는 null(0 은 '셌고 0건' 이라 따로 — 탐지 명세 §5.3) */
+static void optional_u64_write(struct line_buf *line, const char *key, bool has_value, uint64_t value) {
+    line_key(line, key);
+    if (has_value) {
+        line_u64(line, value);
+    } else {
+        line_null(line);
+    }
+}
+
+/* optional_real_write: 위와 같되 실수. 유한하지 않으면 null(JSON 에 nan 이 없어 줄 전체가 깨짐) */
+static void optional_real_write(struct line_buf *line, const char *key, bool has_value, double value) {
+    line_key(line, key);
+    if (has_value && isfinite(value)) {
+        line_real(line, value);
+    } else {
+        line_null(line);
+    }
+}
+
+/* kpm2_cc_write: cc 객체. 키 순서는 탐지 명세 §5 참조 샘플과 같게(엔진은 순서를 안 보지만 사람이 diff 로 보게) */
+static void kpm2_cc_write(struct line_buf *line, const struct report_period *period) {
+    line_key(line, "cc");
+    line_open(line, '{');
+    counter_write(line, "RRC.ConnEstabAtt", &period->conn_estab_att);
+    counter_write(line, "RRC.ConnEstabSucc", &period->conn_estab_succ);
+    line_key(line, "RRC.ConnEstabFailCause"); // 셋을 한 객체로, 탐지 명세 §5.1 은 셋 다 넣음. NoReply 가 없으면 1단계가 축소 판정
+    if (period->has_fail_cause) {
+        line_open(line, '{');
+        line_key(line, "NetworkReject");
+        line_u64(line, period->network_reject);
+        line_key(line, "NoReply");
+        line_u64(line, period->no_reply);
+        line_key(line, "Other");
+        line_u64(line, period->other);
+        line_close(line, '}');
+    } else {
+        line_null(line);
+    }
+    optional_u64_write(line, "RRC.RelWithoutSuspendConfig", period->has_rel_without_suspend, period->rel_without_suspend);
+    counter_write(line, "UECNTX.ConnEstabAtt", &period->uectx_estab_att);
+    counter_write(line, "UECNTX.ConnEstabSucc", &period->uectx_estab_succ);
+    optional_u64_write(line, "RRC.ReEstabAtt", period->has_reestab, period->reestab_att);
+    optional_u64_write(line, "RRC.ReEstabSuccWithUeContext", period->has_reestab, period->reestab_succ);
+    counter_write(line, "RRC.ResumeAtt", &period->resume_att);
+    counter_write(line, "RRC.ResumeSucc", &period->resume_succ);
+    line_close(line, '}');
+}
+
+/* kpm2_si_write: si 객체. 주기 안 축출로 상한이 유효하지 않으면 Mean·Max 를 null — 최댓값이 실제보다 작게 나가면 유령 정리 기준이 틀림 */
+static void kpm2_si_write(struct line_buf *line, const struct report_period *period) {
+    bool has_conn = period->has_conn_si && period->is_conn_upper_valid;
+    bool has_inactive = period->has_inactive_si && period->is_inactive_upper_valid;
+    line_key(line, "si");
+    line_open(line, '{');
+    optional_real_write(line, "RRC.ConnMean", has_conn, period->conn_mean);
+    optional_u64_write(line, "RRC.ConnMax", has_conn, period->conn_max);
+    optional_real_write(line, "RRC.InactiveConnMean", has_inactive, period->inactive_mean);
+    optional_u64_write(line, "RRC.InactiveConnMax", has_inactive, period->inactive_max);
+    line_close(line, '}');
+}
+
+/* kpm2_ext_write: ext 객체(탐지 명세 §5.4). UeCtxMax 는 경보 심각도에 씀 */
+static void kpm2_ext_write(struct line_buf *line, const struct report_period *period) {
+    line_key(line, "ext");
+    line_open(line, '{');
+    optional_u64_write(line, "UeCtxMax", period->has_ue_ctx_max, period->ue_ctx_max);
+    optional_u64_write(line, "DuCannotServe", period->has_du_cannot_serve, period->du_cannot_serve);
+    optional_u64_write(line, "CrntiAlloc", period->has_crnti_alloc, period->crnti_alloc);
+    line_close(line, '}');
+}
+
+/* kpm2_inferred_write: cc 의 형제 칸 "inferred" — 카운터마다 추정으로 메운 수.
+ *   cc 안(원인별 객체)에 넣으면 엔진이 원인으로 더해 total ≠ 합 경고가 남. 맨 위 모르는 키는 엔진이 무시(탐지 명세 §5.3·§6.3 계약) — 기록용
+ */
+static void kpm2_inferred_write(struct line_buf *line, const struct report_period *period) {
+    line_key(line, "inferred");
+    line_open(line, '{');
+    inferred_write(line, "RRC.ConnEstabAtt", &period->conn_estab_att);
+    inferred_write(line, "RRC.ConnEstabSucc", &period->conn_estab_succ);
+    inferred_write(line, "UECNTX.ConnEstabAtt", &period->uectx_estab_att);
+    inferred_write(line, "UECNTX.ConnEstabSucc", &period->uectx_estab_succ);
+    inferred_write(line, "RRC.ResumeAtt", &period->resume_att);
+    inferred_write(line, "RRC.ResumeSucc", &period->resume_succ);
+    line_close(line, '}');
+}
+
+enum sink_result sink_on_period(struct sink *sink, const struct report_period *period) {
+    if (!sink) {
+        return SINK_DROPPED_INVALID;
+    }
+    if (!period) {
+        sink->stats.invalid_drop_count++;
+        return SINK_DROPPED_INVALID;
+    }
+    const struct report_counter *counters[] = {
+        &period->conn_estab_att,
+        &period->conn_estab_succ,
+        &period->uectx_estab_att,
+        &period->uectx_estab_succ,
+        &period->resume_att,
+        &period->resume_succ,
+    };
+    bool is_counter_valid = true;
+    bool has_warning = false;
+    for (size_t i = 0; i < NELEM(counters); i++) {
+        enum counter_check_result check = counter_check(counters[i]);
+        if (check == COUNTER_INVALID) {
+            is_counter_valid = false;
+        }
+        if (check == COUNTER_WARNING) {
+            has_warning = true;
+        }
+    }
+    // 엔진이 줄을 버리는 모양: t_end ≤ t_start, 음수 평균. 경고만 내고 받는 모양(원인 합 ≠ total, 칸 길이 ≠ period_ms)은 보내고 셈 —
+    //   줄을 버리면 칸이 비어 엔진이 그 구간을 보류하므로(탐지 명세 §5.6) 경고 하나보다 손해가 큼
+    bool is_time_valid = period->t_end_ms > period->t_start_ms;
+    bool is_mean_valid = !(period->has_conn_si && period->conn_mean < 0) && !(period->has_inactive_si && period->inactive_mean < 0);
+    if (!is_time_valid || !is_mean_valid || !is_counter_valid) {
+        sink->stats.invalid_drop_count++;
+        return SINK_DROPPED_INVALID;
+    }
+    bool is_period_mismatch = period->t_end_ms - period->t_start_ms != sink->period_ms;
+    if (has_warning || is_period_mismatch) {
+        sink->stats.spec_warning_count++;
+    }
+    bool is_connected = connection_ensure(sink);
+    struct line_buf line = {.data = sink->line, .cap = sizeof sink->line};
+    line_reset(&line);
+    sink->seq++;
+    line_open(&line, '{');
+    line_common_head(&line, sink, "kpm2", sink->seq);
+    line_key(&line, "cell_id");
+    line_u64(&line, period->cell_id);
+    line_key(&line, "t_start_ms");
+    line_u64(&line, period->t_start_ms);
+    line_key(&line, "t_end_ms");
+    line_u64(&line, period->t_end_ms);
+    if (period->is_capture_alive) {
+        kpm2_cc_write(&line, period);
+        kpm2_si_write(&line, period);
+        kpm2_ext_write(&line, period);
+        kpm2_inferred_write(&line, period);
+    } else {
+        // 캡처가 멈췄거나 살아 있는지 확인되지 않은 칸: 0 으로 채우면 엔진이 조용한 정상 셀로 봄(탐지 명세 §5.3)
+        line_key(&line, "cc");
+        line_null(&line);
+        line_key(&line, "si");
+        line_null(&line);
+        line_key(&line, "ext");
+        line_null(&line);
+        line_key(&line, "inferred");
+        line_null(&line);
+    }
+    line_key(&line, "ue_evt_lost"); // 늘 빈 배열 — 없으면 엔진이 그 칸을 양방향 로스로 봐 2·3단계 판정을 보류(탐지 명세 §5.5)
+    line_open(&line, '[');
+    line_close(&line, ']');
+    line_finish(&line);
+    enum sink_result result = line_emit(sink, &line, is_connected);
+    if (result != SINK_OK || !period->is_capture_alive) {
+        return result;
+    }
+    for (size_t i = 0; i < NELEM(counters); i++) {
+        if (counters[i]->is_counted) {
+            sink->stats.inferred_count += counters[i]->inferred;
+        }
+    }
+    return result;
 }
