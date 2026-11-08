@@ -125,6 +125,10 @@ struct nas_msg {
 	int missing_mandatory_ie_count; // 필수 IE 가 길이 밖
 	int rejected_ie_count;          // IE 값이나 길이가 규격 밖. 담으면 확신 있는 오값이 됨
 	int ie_scan_aborted_count;      // 선언된 IE 길이가 메시지 끝을 넘어 주사를 못 끝냄
+
+	// 담지 않은 이유가 아니라 별도 관측이라 위 블록 밖임. 값을 담은 채로도 올라감
+	int unknown_tlve_iei_count;     // 0x70~0x7F 번호대인데 그 메시지 표에 TLV-E 로 없어 9.11.1 의
+				// 	타입 4 로 건너뜀. 상대가 더 새 판이면 걸음이 어긋남
 };
 // 위 필드 중 못 읽은 것은 -1 임. bool 짝이 있는 것 (has_sec_alg · has_stmsi48) 은 그 짝으로 가림
 

@@ -53,6 +53,21 @@
 #define NAS_IE_BYTES_LOCAL_TIME_ZONE		2
 #define NAS_IE_BYTES_UNIVERSAL_TIME_AND_TIME_ZONE 8
 
+// 메시지별 TLV-E IEI 집합. 9.11.1 이 IEI 를 "an IEI known in the message" 로 정의하므로 같은
+// 	번호가 메시지마다 다른 IE 를 가리킴. 전역으로 0x7X = TLV-E 라고 보면 그 메시지 표에 없는
+// 	번호에서 길이를 2옥텟으로 읽어 걸음이 어긋남
+//
+// 	            70 71 72 73 74 75 76 77 78 79 7A 7B 7C    표            개수
+// 	RA          O  O  O  O  O  O  O  O  O  O  O  O  O     8.2.7.1.1     13
+// 	CUC         O  O  O  O  -  O  O  O  -  O  -  -  -     8.2.19.1.1    8
+//
+// 	0x73 은 RA 에서 SOR transparent container, CUC 에서 NSAG information 임. 두 표에서 뜻이
+// 	같은 것은 0x77 (5GS mobile identity) 하나이고 그것이 이 주사의 대상임
+// 	비트 n = IEI (0x70 + n) 이 그 메시지 표에 TLV-E 로 있음
+#define NAS_IEI_TLVE_FIRST			0x70
+#define NAS_IEI_TLVE_SET_REGISTRATION_ACCEPT	0x1fff
+#define NAS_IEI_TLVE_SET_CONFIG_UPDATE_COMMAND	0x02ef
+
 struct nas_msg_info {
 	const char *name;
 	enum nas_msg_direction msg_type_direction;
@@ -260,7 +275,7 @@ static void take_mobile_id_lve(const uint8_t *bytes, size_t bytes_len, struct na
 // scan_guti: 선택 IE 를 건너뛰며 5G-GUTI (IEI 0x77) 를 찾음. 같은 IE 가 또 오면 첫 것만 씀 (7.6.3)
 //
 // 	IEI 비트 8 = 1            -> 1 옥텟            IE 타입 1, 2
-// 	IEI 0x7X                  -> 1 + 2 + 길이      TLV-E
+// 	그 메시지의 TLV-E 집합    -> 1 + 2 + 길이      TLV-E. 위 NAS_IEI_TLVE_SET_*
 // 	0x46, 0x47 (CUC 에서만)   -> 2, 8 옥텟         TV. 표 8.2.19.1.1
 // 	그 밖                     -> 1 + 1 + 길이      TLV
 //
@@ -271,23 +286,32 @@ static void take_mobile_id_lve(const uint8_t *bytes, size_t bytes_len, struct na
 // 	모르는 IEI 를 TLV 로 보는 근거. 9.11.1 : "If this octet does not correspond to an IEI known in
 // 	the message, the receiver shall determine whether this IE is of type 1 or 2 ... or an IE of
 // 	type 4 (i.e. that the next octet is the length indicator ...)".
+// 	열거가 닫혀 있어 TLV-E 는 선택지에 없음. 그래서 그 메시지 표에 TLV-E 로 없는 번호는 TLV 로 봄.
+// 	2 옥텟 길이로 읽으면 걸음이 어긋나 공격자가 고른 48비트가 5G-S-TMSI 로 올라감
 //
 // 	0x46 · 0x47 을 메시지로 가르는 이유: REGISTRATION ACCEPT 표에는 그 IEI 가 없음. 거기서 TV 로
 // 	추측하면 걸음이 어긋나 공격자가 고른 바이트를 5G-S-TMSI 로 읽음
 //
-// 	비트 8 로 가르는 근거는 두 대상 메시지의 IEI 전수 분류임 (표 8.2.7.1.1 · 8.2.19.1.1) -
-// 	IE 타입 1 TV 는 전부 비트 8 = 1, TLV-E 는 0x70~0x7C 뿐, 비트 8 이 0 인 TV 는 CUC 의 둘뿐
+// 	비트 8 로 가르는 근거는 두 대상 메시지의 IEI 전수 분류임 (표 8.2.7.1.1 및 8.2.19.1.1) -
+// 	IE 타입 1 TV 는 전부 비트 8 = 1 이고, 비트 8 이 0 인 TV 는 CUC 의 둘뿐
 //
 // 	부작용: 선언된 길이나 TV 의 표가 정한 크기가 메시지 끝을 넘으면 ie_scan_aborted_count 를 올림.
-// 	5G-GUTI 를 못 본 것이 "GUTI 가 없었다" 와 같아짐
+// 	5G-GUTI 를 못 본 것이 "GUTI 가 없었다" 와 같아짐. 표에 없는 0x70~0x7F 번호를 TLV 로
+// 	건너뛰면 unknown_tlve_iei_count 를 올림
 static void scan_guti(const uint8_t *bytes, size_t bytes_len, size_t offset_bytes, int msg_type, struct nas_msg *nas_msg) {
+	uint16_t tlve_iei_set = NAS_IEI_TLVE_SET_REGISTRATION_ACCEPT;
+	if (msg_type == NAS_MM_CONFIG_UPDATE_COMMAND)
+		tlve_iei_set = NAS_IEI_TLVE_SET_CONFIG_UPDATE_COMMAND;
 	while (offset_bytes < bytes_len) {
 		uint8_t iei = bytes[offset_bytes];
 		if (iei & 0x80) {
 			offset_bytes++;
 			continue;
 		}
-		if ((iei & 0xf0) == 0x70) {
+		// 비트 8 이 0 이라 0x70 이상이면 0x70~0x7F 번호대임
+		bool in_tlve_block = iei >= NAS_IEI_TLVE_FIRST;
+		bool is_tlve_iei = in_tlve_block && ((tlve_iei_set >> (iei - NAS_IEI_TLVE_FIRST)) & 1);
+		if (is_tlve_iei) {
 			if (offset_bytes + 3 > bytes_len) {
 				nas_msg->ie_scan_aborted_count++;
 				return;
@@ -314,6 +338,8 @@ static void scan_guti(const uint8_t *bytes, size_t bytes_len, size_t offset_byte
 			}
 			offset_bytes += NAS_IE_BYTES_UNIVERSAL_TIME_AND_TIME_ZONE;
 		} else {
+			if (in_tlve_block)
+				nas_msg->unknown_tlve_iei_count++;
 			if (offset_bytes + 2 > bytes_len) {
 				nas_msg->ie_scan_aborted_count++;
 				return;
