@@ -113,6 +113,9 @@ struct nas_msg {
 	int mm_cause;                   // 5GMM 원인 (9.11.3.2)
 	bool has_stmsi48;               // 5G-GUTI (타입 2) · 5G-S-TMSI (타입 4) 에서 얻음
 	uint64_t stmsi48;               //      AMF Set ID 10b | AMF Pointer 6b | 5G-TMSI 32b
+	int id_type;                    // 5GS mobile identity 의 신원 종류 (표 9.11.3.4.1 옥텟 4 비트 3~1).
+					// 	48비트를 못 꺼내는 종류(SUCI, IMEI, IMEISV)도 종류는 담음 -
+					// 	'어떤 신원으로 왔나' 가 stmsi48 과 다른 관측이기 때문
 	int reg_type;                   // 등록 유형 (9.11.3.7) 하위 3비트. 범위 검사 없음 -
 					// 	표 9.11.3.7.1 이 3비트 값 전부에 뜻을 줌
 

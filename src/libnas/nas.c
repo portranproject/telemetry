@@ -226,16 +226,19 @@ enum mobile_id_result { MOBILE_ID_TAKEN, MOBILE_ID_NOT_EXTRACTED, MOBILE_ID_MALF
 // 	                                                      \___________  ___________/
 // 	                                                                  48비트
 //
-// 	길이가 표와 다르면 거부함. 앞부분만 읽으면 공격자가 덧붙인 바이트에서 신원을 꺼낸 셈이 됨
-// 	타입 1, 3, 5 는 영구 식별자라 안 꺼냄. 기형이 아니므로 세지 않음
-// 	부작용: 기형이면 rejected_ie_count 를 올림
-static enum mobile_id_result take_mobile_id(const uint8_t *id_bytes, size_t len, struct nas_msg *nas_msg) {
-	if (len < 1) {			// 타입 옥텟이 없음. 표가 최소 3 옥텟 (LV-E 3-n) 을 정했으므로 규격 밖
-		nas_msg->rejected_ie_count++;
+//      길이가 표와 다르면 거부함. 앞부분만 읽으면 공격자가 덧붙인 바이트에서 신원을 꺼낸 셈이 됨
+//
+//      반환: TAKEN(48비트까지 담음) / NOT_EXTRACTED(종류만 담음 - 타입 1, 3, 5 는 영구 식별자라
+//      48비트가 없음) / MALFORMED(길이가 표와 다름)
+//      부작용: 종류는 셋 다 아닌 기형일 때만 빼고 id_type 에 담음. 48비트는 stmsi48 과 has_stmsi48 에
+//      담음. 기형이면 rejected_ie_count 를 올림
+static enum mobile_id_result take_mobile_id(const uint8_t *id_bytes, size_t id_bytes_len, struct nas_msg *nas_msg) {
+	if (id_bytes_len < 1) {			// 타입 옥텟이 없음. 표가 최소 3 옥텟 (LV-E 3-n) 을 정했으므로 규격 밖
+                nas_msg->rejected_ie_count++;
 		return MOBILE_ID_MALFORMED;
-	}
+        }
 	int identity_type = id_bytes[0] & 0x07;
-	size_t required_len = 0;
+	size_t required_len = 0;		// 0 = 48비트를 싣지 않는 종류라 길이가 표에 고정되지 않음
 	size_t cursor_offset_bytes = 0;
 	if (identity_type == 2) {
 		required_len = 11;
@@ -243,13 +246,17 @@ static enum mobile_id_result take_mobile_id(const uint8_t *id_bytes, size_t len,
 	} else if (identity_type == 4) {
 		required_len = 7;
 		cursor_offset_bytes = 1;
-	} else {
-		return MOBILE_ID_NOT_EXTRACTED;
-	}
-	if (len != required_len) {
-		nas_msg->rejected_ie_count++;
+        }
+	bool carries_stmsi48 = required_len != 0;
+	if (carries_stmsi48 && id_bytes_len != required_len) {
+                nas_msg->rejected_ie_count++;
 		return MOBILE_ID_MALFORMED;
-	}
+        }
+	// 종류는 표 9.11.3.4.1 이 3비트 값 여덟 개 전부에 뜻을 줘 범위 검사가 없음. 48비트를 안 꺼내는
+	// 	종류도 담는 이유: 하류가 '5G-GUTI 로 왔나' 를 보므로 SUCI 를 안 올리면 '안 읽음' 과 같아짐
+	nas_msg->id_type = identity_type;
+	if (!carries_stmsi48)
+		return MOBILE_ID_NOT_EXTRACTED;
 	const uint8_t *cursor = id_bytes + cursor_offset_bytes;
 	uint64_t amf_set_id_and_pointer = read_be16(cursor);
 	uint64_t tmsi = (uint64_t)cursor[2] << 24 | (uint64_t)cursor[3] << 16 | (uint64_t)cursor[4] << 8 | cursor[5];
@@ -259,6 +266,8 @@ static enum mobile_id_result take_mobile_id(const uint8_t *id_bytes, size_t len,
 }
 
 // take_mobile_id_lve: LV-E 로 실린 5GS mobile identity 하나. 길이 2 옥텟 뒤에 값이 옴
+//      반환 없음. 값 부분은 take_mobile_id 에 넘기므로 그쪽 부작용이 그대로 적용됨
+//      부작용: 길이 2 옥텟이 없거나 선언된 길이가 메시지 끝을 넘으면 missing_mandatory_ie_count 를 올림
 static void take_mobile_id_lve(const uint8_t *bytes, size_t bytes_len, struct nas_msg *nas_msg) {
 	if (bytes_len < 2) {
 		nas_msg->missing_mandatory_ie_count++;
@@ -507,6 +516,7 @@ int nas_parse(const uint8_t *buf, size_t len, int known_nas_ciph_alg, struct nas
 	nas_msg->nas_sequence_number = -1;
 	nas_msg->mm_cause = -1;
 	nas_msg->reg_type = -1;
+	nas_msg->id_type = -1;
 	nas_msg->nas_ciph_alg = -1;
 	nas_msg->nas_integ_alg = -1;
 	// 0 을 그대로 두면 '평문 (SHT 0)' 과 '해당 없음' 이 같아짐. epd 도 같다 - 0 은 EPD 값이 아니지만
