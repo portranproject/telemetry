@@ -119,7 +119,9 @@ struct nas_msg {
 	/* 담지 않은 이유. 음수 반환 때는 합이 1 임 (그 자리에서 멈추므로).
 	 *   rc=0 에서는 선택 IE 주사가 IE 마다 올려 1 보다 클 수 있음 */
 	int truncated_count;            // 길이가 모자라 헤더조차 못 읽음
-	int epd_mismatch_count;         // EPD 가 5GMM·5GSM 둘 다 아님 (안쪽이 5GSM 인 경우 포함)
+	int epd_mismatch_count;         // 바깥 EPD 가 5GMM 과 5GSM 둘 다 아님, 또는 보호된 메시지의
+				// 	안쪽 EPD 가 5GMM 이 아님. 안쪽은 규격상 항상 5GMM 이라
+				// 	5GSM 만이 아니라 비-5GMM 전부를 잡음 (8.2.28.1)
 	int reserved_sht_count;         // SHT 5~15 (표 9.3.1 "All other values are reserved.")
 	int unknown_msg_type_count;     // 표 9.7.1·9.7.2 에 없는 타입
 	int missing_mandatory_ie_count; // 필수 IE 가 길이 밖
