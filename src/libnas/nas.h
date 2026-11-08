@@ -60,7 +60,7 @@ enum nas_mm_type {
 // TS 24.501 표 8.2.14.1.1 의 선택 IE 번호. 값이 NAS_MM_AUTH_REJECT 와 같지만 다른 이름공간임
 #define NAS_IEI_5GMM_CAUSE 0x58
 
-// TS 24.501 표 9.11.3.2.1 의 5GMM 원인값. 거절이 영구인지(단말·가입 자체가 거부) 가리는 셋만 둠 -
+// TS 24.501 표 9.11.3.2.1 의 5GMM 원인값. 거절이 영구인지(단말이나 가입 자체가 거부) 가리는 셋만 둠 -
 // 	그 셋만 5GMM 주상태를 DEREGISTERED 로 확정하는 근거이기 때문임
 enum nas_mm_cause {
 	NAS_CAUSE_ILLEGAL_UE = 3,
@@ -90,8 +90,8 @@ enum nas_reg_type {
  *   +-----+-----+------+      +-----+-----+-------+----+-------------------+
  *      1     1     1             1     1     4      1   ^ 여기를 다시 읽음
  *
- *   SHT  0 = 평문 · 1~4 = 보호됨 · 5~15 = 예약 (표 9.3.1)
- *        2 · 4 는 암호라 호출자가 알고리즘을 알려 줘야 안쪽을 읽음
+ *   SHT  0 = 평문 / 1~4 = 보호됨 / 5~15 = 예약 (표 9.3.1)
+ *        2 와 4 는 암호라 호출자가 알고리즘을 알려 줘야 안쪽을 읽음
  *
  *   sht = -1 의 뜻 셋과 가리는 법
  *        epd == 0x2e           5GSM 이라 보안 헤더가 없음 (9.4)
@@ -103,15 +103,15 @@ struct nas_msg {
 	int sht;                        // 옥텟 2
 	int msg_type;                   // 옥텟 3
 	enum nas_msg_direction msg_type_direction;
-	bool inner_readable;            // 본문을 읽었나. 5GSM·SHT 0 도 참임
+	bool inner_readable;            // 본문을 읽었나. 5GSM 과 SHT 0 도 참임
 	int nas_sequence_number;        // 보호된 형태의 SN 옥텟 (8.2.28)
 
-	bool has_sec_alg;               // SMC 의 선택 알고리즘 (9.11.3.34). 0 = NEA0·NIA0 가 정당한
+	bool has_sec_alg;               // SMC 의 선택 알고리즘 (9.11.3.34). 0 = NEA0 와 NIA0 가 정당한
 	int nas_ciph_alg;               //      값이라 센티널만으로는 '골랐다' 와 '안 읽었다' 를 못 가림
 	int nas_integ_alg;
 
 	int mm_cause;                   // 5GMM 원인 (9.11.3.2)
-	bool has_stmsi48;               // 5G-GUTI (타입 2) · 5G-S-TMSI (타입 4) 에서 얻음
+	bool has_stmsi48;               // 5G-GUTI (타입 2) 와 5G-S-TMSI (타입 4) 에서 얻음
 	uint64_t stmsi48;               //      AMF Set ID 10b | AMF Pointer 6b | 5G-TMSI 32b
 	int id_type;                    // 5GS mobile identity 의 신원 종류 (표 9.11.3.4.1 옥텟 4 비트 3~1).
 					// 	48비트를 못 꺼내는 종류(SUCI, IMEI, IMEISV)도 종류는 담음 -
@@ -129,7 +129,7 @@ struct nas_msg {
 				// 	안쪽 EPD 가 5GMM 이 아님. 안쪽은 규격상 항상 5GMM 이라
 				// 	5GSM 만이 아니라 비-5GMM 전부를 잡음 (8.2.28.1)
 	int reserved_sht_count;         // SHT 5~15 (표 9.3.1 "All other values are reserved.")
-	int unknown_msg_type_count;     // 표 9.7.1·9.7.2 에 없는 타입
+	int unknown_msg_type_count;     // 표 9.7.1 / 9.7.2 에 없는 타입
 	int missing_mandatory_ie_count; // 필수 IE 가 길이 밖
 	int rejected_ie_count;          // IE 값이나 길이가 규격 밖. 담으면 확신 있는 오값이 됨
 	int ie_scan_aborted_count;      // 선언된 IE 길이가 메시지 끝을 넘어 주사를 못 끝냄
@@ -141,7 +141,7 @@ struct nas_msg {
 				// 	0000 으로 정함). 또 보호된 것이면 옥텟 3 이 MAC 첫 옥텟이므로
 				// 	msg_type 을 믿기 전에 이 값을 볼 것
 };
-// 위 필드 중 못 읽은 것은 -1 임. bool 짝이 있는 것 (has_sec_alg · has_stmsi48) 은 그 짝으로 가림
+// 위 필드 중 못 읽은 것은 -1 임. bool 짝이 있는 것 (has_sec_alg, has_stmsi48) 은 그 짝으로 가림
 
 // nas_parse: NAS-PDU 하나에서 값과 '담지 않은 이유' 를 채움.
 // 	known_nas_ciph_alg: 그 단말의 NAS 암호 알고리즘. 0 = NEA0, -1 = 모름 (암호 안쪽을 안 읽음)
@@ -149,7 +149,7 @@ struct nas_msg {
 // 	힙을 쓰지 않으므로 실패해도 해제할 것 없음
 int nas_parse(const uint8_t *buf, size_t len, int known_nas_ciph_alg, struct nas_msg *nas_msg);
 
-// nas_msg_name: (EPD, 타입) -> 표 9.7.1·9.7.2 의 이름. 모르면 NULL.
+// nas_msg_name: (EPD, 타입) -> 표 9.7.1 / 9.7.2 의 이름. 모르면 NULL.
 // 	두 표가 '아는 타입' 의 정의라 밖에서 조회할 수단을 하나 둠
 const char *nas_msg_name(int epd, int msg_type);
 

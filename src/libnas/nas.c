@@ -226,17 +226,17 @@ enum mobile_id_result { MOBILE_ID_TAKEN, MOBILE_ID_NOT_EXTRACTED, MOBILE_ID_MALF
 // 	                                                      \___________  ___________/
 // 	                                                                  48비트
 //
-//      길이가 표와 다르면 거부함. 앞부분만 읽으면 공격자가 덧붙인 바이트에서 신원을 꺼낸 셈이 됨
+// 	길이가 표와 다르면 거부함. 앞부분만 읽으면 공격자가 덧붙인 바이트에서 신원을 꺼낸 셈이 됨
 //
-//      반환: TAKEN(48비트까지 담음) / NOT_EXTRACTED(종류만 담음 - 타입 1, 3, 5 는 영구 식별자라
-//      48비트가 없음) / MALFORMED(길이가 표와 다름)
-//      부작용: 종류는 셋 다 아닌 기형일 때만 빼고 id_type 에 담음. 48비트는 stmsi48 과 has_stmsi48 에
-//      담음. 기형이면 rejected_ie_count 를 올림
+// 	반환: TAKEN(48비트까지 담음) / NOT_EXTRACTED(종류만 담음 - 타입 1, 3, 5 는 영구 식별자라
+// 	48비트가 없음) / MALFORMED(길이가 표와 다름)
+// 	부작용: 종류는 셋 다 아닌 기형일 때만 빼고 id_type 에 담음. 48비트는 stmsi48 과 has_stmsi48 에
+// 	담음. 기형이면 rejected_ie_count 를 올림
 static enum mobile_id_result take_mobile_id(const uint8_t *id_bytes, size_t id_bytes_len, struct nas_msg *nas_msg) {
 	if (id_bytes_len < 1) {			// 타입 옥텟이 없음. 표가 최소 3 옥텟 (LV-E 3-n) 을 정했으므로 규격 밖
-                nas_msg->rejected_ie_count++;
+		nas_msg->rejected_ie_count++;
 		return MOBILE_ID_MALFORMED;
-        }
+	}
 	int identity_type = id_bytes[0] & 0x07;
 	size_t required_len = 0;		// 0 = 48비트를 싣지 않는 종류라 길이가 표에 고정되지 않음
 	size_t cursor_offset_bytes = 0;
@@ -246,12 +246,12 @@ static enum mobile_id_result take_mobile_id(const uint8_t *id_bytes, size_t id_b
 	} else if (identity_type == 4) {
 		required_len = 7;
 		cursor_offset_bytes = 1;
-        }
+	}
 	bool carries_stmsi48 = required_len != 0;
 	if (carries_stmsi48 && id_bytes_len != required_len) {
-                nas_msg->rejected_ie_count++;
+		nas_msg->rejected_ie_count++;
 		return MOBILE_ID_MALFORMED;
-        }
+	}
 	// 종류는 표 9.11.3.4.1 이 3비트 값 여덟 개 전부에 뜻을 줘 범위 검사가 없음. 48비트를 안 꺼내는
 	// 	종류도 담는 이유: 하류가 '5G-GUTI 로 왔나' 를 보므로 SUCI 를 안 올리면 '안 읽음' 과 같아짐
 	nas_msg->id_type = identity_type;
@@ -266,8 +266,8 @@ static enum mobile_id_result take_mobile_id(const uint8_t *id_bytes, size_t id_b
 }
 
 // take_mobile_id_lve: LV-E 로 실린 5GS mobile identity 하나. 길이 2 옥텟 뒤에 값이 옴
-//      반환 없음. 값 부분은 take_mobile_id 에 넘기므로 그쪽 부작용이 그대로 적용됨
-//      부작용: 길이 2 옥텟이 없거나 선언된 길이가 메시지 끝을 넘으면 missing_mandatory_ie_count 를 올림
+// 	반환 없음. 값 부분은 take_mobile_id 에 넘기므로 그쪽 부작용이 그대로 적용됨
+// 	부작용: 길이 2 옥텟이 없거나 선언된 길이가 메시지 끝을 넘으면 missing_mandatory_ie_count 를 올림
 static void take_mobile_id_lve(const uint8_t *bytes, size_t bytes_len, struct nas_msg *nas_msg) {
 	if (bytes_len < 2) {
 		nas_msg->missing_mandatory_ie_count++;
@@ -298,7 +298,7 @@ static void take_mobile_id_lve(const uint8_t *bytes, size_t bytes_len, struct na
 // 	열거가 닫혀 있어 TLV-E 는 선택지에 없음. 그래서 그 메시지 표에 TLV-E 로 없는 번호는 TLV 로 봄.
 // 	2 옥텟 길이로 읽으면 걸음이 어긋나 공격자가 고른 48비트가 5G-S-TMSI 로 올라감
 //
-// 	0x46 · 0x47 을 메시지로 가르는 이유: REGISTRATION ACCEPT 표에는 그 IEI 가 없음. 거기서 TV 로
+// 	0x46 과 0x47 을 메시지로 가르는 이유: REGISTRATION ACCEPT 표에는 그 IEI 가 없음. 거기서 TV 로
 // 	추측하면 걸음이 어긋나 공격자가 고른 바이트를 5G-S-TMSI 로 읽음
 //
 // 	비트 8 로 가르는 근거는 두 대상 메시지의 IEI 전수 분류임 (표 8.2.7.1.1 및 8.2.19.1.1) -
@@ -430,26 +430,26 @@ static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, 
 		// 관문을 IE 마다 나눔(위 8.2.6 과 같은 이유). 표 8.2.12.1.1 이 해제 유형을 `M V 1/2`,
 		// 	5GS mobile identity 를 `M LV-E 6-n` 으로 둔 별개 IE 라, 신원이 없어도 해제 유형은 읽힘
 		if (bytes_len < 1) {
-                        nas_msg->missing_mandatory_ie_count++;
-                        break;
-                }
+			nas_msg->missing_mandatory_ie_count++;
+			break;
+		}
 		// Switch off 는 표 9.11.3.20.1 의 "Switch off (octet 1, bit 4)". 반옥텟 두 개가 한 옥텟을
 		// 	나눌 때 표에 먼저 적힌 쪽이 낮은 비트임 - 바로 위 8.2.6 의 등록 유형이 같은 관례이고
 		// 	실 캡처에서 initial(1) 로 읽히는 것으로 확인됨
 		nas_msg->switch_off = (bytes[0] >> 3) & 0x01;
 		if (bytes_len < 3) {
-                        nas_msg->missing_mandatory_ie_count++;
-                        break;
-                }
+			nas_msg->missing_mandatory_ie_count++;
+			break;
+		}
 		take_mobile_id_lve(bytes + 1, bytes_len - 1, nas_msg);
-                break;
+		break;
 	case NAS_MM_SERVICE_REQUEST:		// 8.2.16 : 서비스 유형|ngKSI (V 1), 5G-S-TMSI (LV-E)
 		if (bytes_len < 3) {
-                        nas_msg->missing_mandatory_ie_count++;
-                        break;
-                }
+			nas_msg->missing_mandatory_ie_count++;
+			break;
+		}
 		take_mobile_id_lve(bytes + 1, bytes_len - 1, nas_msg);
-                break;
+		break;
 	case NAS_MM_IDENTITY_RESPONSE:		// 8.2.22 : 5GS mobile identity (LV-E) 가 타입 바로 뒤
 		take_mobile_id_lve(bytes, bytes_len, nas_msg);
 		break;
@@ -460,17 +460,15 @@ static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, 
 			nas_msg->missing_mandatory_ie_count++;
 			break;
 		}
-		{
-			int ciph_alg = (bytes[0] >> 4) & 0x0f;
-			int integ_alg = bytes[0] & 0x0f;
-			if (ciph_alg > 7 || integ_alg > 7) {
-				nas_msg->rejected_ie_count++;
-				break;
-			}
-			nas_msg->has_sec_alg = true;
-			nas_msg->nas_ciph_alg = ciph_alg;
-			nas_msg->nas_integ_alg = integ_alg;
+		int ciph_alg = (bytes[0] >> 4) & 0x0f;
+		int integ_alg = bytes[0] & 0x0f;
+		if (ciph_alg > 7 || integ_alg > 7) {
+			nas_msg->rejected_ie_count++;
+			break;
 		}
+		nas_msg->has_sec_alg = true;
+		nas_msg->nas_ciph_alg = ciph_alg;
+		nas_msg->nas_integ_alg = integ_alg;
 		break;
 	case NAS_MM_REGISTRATION_REJECT:	// 8.2.9
 	case NAS_MM_SERVICE_REJECT:		// 8.2.18
@@ -485,14 +483,14 @@ static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, 
 		// 	treated as 0110 1111, "protocol error, unspecified"." - 256개 값 전부에 해석이 있음
 		nas_msg->mm_cause = bytes[0];
 		break;
-	case NAS_MM_DEREG_REQ_UE_TERM:		// 8.2.14 : 해제 유형|spare (V 1), 5GMM 원인은 선택 (TV 2
+	case NAS_MM_DEREG_REQ_UE_TERM:		// 8.2.14 : 해제 유형|spare (V 1), 5GMM 원인은 선택 (TV 2)
 		// 표 8.2.14.1.1 이 해제 유형과 spare 반옥텟을 `M V 1/2` 둘로 둬 필수 1 옥텟임. 그 방향에선
 		// 	비트 4 가 spare 라 값은 안 읽지만(표 9.11.3.20.1 "In the network to UE direction bit 4
 		// 	is spare"), 없다는 사실은 세야 기형과 정상이 같은 모양이 되지 않음
 		if (bytes_len < 1) {
-                        nas_msg->missing_mandatory_ie_count++;
-                        break;
-                }
+			nas_msg->missing_mandatory_ie_count++;
+			break;
+		}
 		// 첫 선택 IE 만 봄. 7.6.2 : "The UE shall ignore all out of sequence IEs in a message
 		// 	which are not encoded as "comprehension required" ... The network should take the
 		// 	same approach."
@@ -530,7 +528,7 @@ static int parse_plain(const uint8_t *buf, size_t len, struct nas_msg *nas_msg, 
 // nas_parse: NAS-PDU 하나를 해석해 nas_msg 를 채움. 분기는 파일 헤더 [2]
 // 	known_nas_ciph_alg 가 0 (NEA0) 이 아니면 암호된 안쪽을 읽지 않음 - 가시성은 호출자가 정함
 // 	반환: 0 = 해석함, -EBADMSG = 형식 오류, -EINVAL = 호출자 버그 (계수기를 올리지 않음)
-// 	buf 는 빌려 읽기만 하고 nas_msg 밖으로 포인터를 남기지 않음. 힙·전역 상태 없음
+// 	buf 는 빌려 읽기만 하고 nas_msg 밖으로 포인터를 남기지 않음. 힙이나 전역 상태 없음
 int nas_parse(const uint8_t *buf, size_t len, int known_nas_ciph_alg, struct nas_msg *nas_msg) {
 	if (!nas_msg)
 		return -EINVAL;
