@@ -3387,7 +3387,6 @@ void tr_on_event(struct tr *tr, const struct obs_event *event)
 	case TR_EVENT_NG_SETUP:
 		on_ng_setup(tr, event);
 		break;
-	case TR_EVENT_NAS_F1:
 	case TR_EVENT_NG_NAS:
 		on_nas(tr, event);
 		break;

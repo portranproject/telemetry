@@ -113,7 +113,9 @@ enum tr_event_kind {
 	TR_EVENT_RRC_RELEASE                = 14,
 	TR_EVENT_RRC_DCCH_OPAQUE            = 15,
 	TR_EVENT_RRC_OTHER                  = 16,
-	TR_EVENT_NAS_F1                     = 17,
+	/* 17 은 비어 있음: F1 의 NAS 를 따로 내는 이벤트였는데 내보내는 곳을 끝내 두지 않았음.
+	 *   보안 전 초기 NAS 는 RRCSetupComplete 이벤트가 payload.setup_complete.nas 로 같이 올리고,
+	 *   보안 뒤의 F1 NAS 는 암호문이라 읽지 않음. 번호를 당기지 않는 이유는 42 와 같음. */
 	TR_EVENT_F1_UE_CTX_SETUP            = 18,
 	TR_EVENT_F1_UE_CTX_RELEASE_REQ      = 19,
 	TR_EVENT_F1_UE_CTX_RELEASE_CMD      = 20,
