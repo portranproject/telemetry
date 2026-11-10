@@ -1403,3 +1403,301 @@ static void advance_to(struct tr *tr, uint64_t target_ns)
 	}
 }
 
+// ---- 표 I 줄 ----
+static void emit_ue_line(struct tr *tr, struct tr_ue_record *ue_record, const struct obs_event *event,
+			 uint32_t changed, int closed)
+{
+	if (!tr->sink_ops.on_ue_line) return;
+	/* 이 이벤트가 디코드된 RRC 면 그 통로와 메시지 이름으로 마지막 RRC 를 갱신함. 일찍 돌아가는
+	 * 분기보다 위에 두는 이유: 바뀐 칸이 없는 RRC 이벤트도 마지막 RRC 를 남겨야 뒤따르는 줄이
+	 * 올바른 값을 읽음. 메시지 이름을 핸들러마다 상수로 박으면 그 핸들러가 다루는 두어 개만 기록됨 */
+	if (event->rrc_chan > 0) {
+		ue_record->last_rrc_chan = event->rrc_chan;
+		ue_record->last_rrc_msg_name = event->rrc_msg_name;
+		ue_record->has_last_rrc = 1;
+	}
+	if (!changed && !closed) return;
+	struct tr_ue_line ue_line; memset(&ue_line, 0, sizeof ue_line);
+	ue_line.wallclock_ns = event->wallclock_ns; ue_line.trigger_event = event->kind;
+	ue_line.f1ue = event->f1ue; ue_line.n2ue = event->n2ue;
+	if (ue_record->req_cell_index >= 0) ue_line.cell = tr->cell_records[ue_record->req_cell_index].cell;
+	else if (event->cell.valid) ue_line.cell = event->cell;
+	ue_line.changed_mask = changed; ue_line.closed = closed ? true : false;
+	/* 등급은 값을 실제로 관측하거나 판정했을 때만 EXACT 임. 관측하지 못했으면 UNKNOWN 으로 내림.
+	 * 안 그러면 모르는 값(알고리즘 -1, C-RNTI 0, 미상 상태)에 EXACT 가 붙어 읽는 쪽이 그것을
+	 * 측정값으로 받음 */
+	ue_line.crnti = ue_record->crnti;
+	ue_line.crnti_quality = ue_record->has_crnti ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
+	ue_line.has_stmsi48 = ue_record->has_stmsi48 ? true : false;
+	ue_line.stmsi48 = ue_record->stmsi48;
+	ue_line.stmsi48_quality = ue_record->has_stmsi48 ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
+	ue_line.ciph_alg = ue_record->ciph_alg; ue_line.integ_alg = ue_record->integ_alg;
+	ue_line.alg_quality = ue_record->has_alg ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
+	ue_line.ciph_alg_now = ue_record->ciph_alg_now; ue_line.integ_alg_now = ue_record->integ_alg_now;
+	ue_line.alg_changed_after_smc = ue_record->alg_changed_after_smc ? true : false;
+	ue_line.alg_change_opportunity_count = ue_record->alg_change_opportunity_count;
+	ue_line.rrc_state = ue_record->rrc_state;
+	/* 등급을 현 rrc_state 로 걸러 읽음. 각 플래그는 그 상태에서만 뜻이 있음
+	 *   CONNECTED             -> conn_inferred. 추론이면 STRUCT, 직접 본 complete 면 EXACT
+	 *   RELEASED / INACTIVE   -> rel_inferred.  추론이면 CROSS, 평문으로 봤으면 EXACT
+	 *   IDLE_PENDING(요청 관측) -> EXACT
+	 *   UNKNOWN               -> UNKNOWN
+	 * 상태로 걸러야 하는 이유: 종전에는 rel_inferred 를 상태와 무관하게 먼저 봤음. RELEASED 나
+	 * INACTIVE 에서 재개나 재수립이나 전사로 CONNECTED 로 돌아오면 이전 에피소드에 남은
+	 * rel_inferred 가 conn_inferred 를 가려 CONNECTED 가 CROSS 로 잘못 등급됐음(실측).
+	 * 그 플래그를 지우는 곳이 레코드 리셋 한 곳뿐이라 생긴 일임 */
+	ue_line.rrc_state_quality =
+		(ue_record->rrc_state == RS_UNKNOWN) ? TR_QUALITY_UNKNOWN :
+		(ue_record->rrc_state == RS_CONNECTED)
+			? (ue_record->conn_inferred ? TR_QUALITY_STRUCT : TR_QUALITY_EXACT) :
+		((ue_record->rrc_state == RS_RELEASED || ue_record->rrc_state == RS_INACTIVE)
+			? (ue_record->rel_inferred ? TR_QUALITY_CROSS : TR_QUALITY_EXACT) : TR_QUALITY_EXACT);
+	/* NAS 상태 세 줄은 이 계층이 유도한 값임 - 5GMM 주상태는 NAS 메시지에서, AS 보안 상태는 F1 의
+	 * SMC 와 Complete 와 Failure 에서, NAS 보안 상태는 SHT 에서 유도함. NAS 암호 알고리즘만은
+	 * 관측 층이 하행 SMC 에서 읽어 준 값을 그대로 실음 */
+	ue_line.nas_reg_state = ue_record->nas_reg_state; ue_line.nas_conn_mode = ue_record->nas_conn_mode;
+	ue_line.nas_state_quality = ue_record->nas_state_quality;
+	ue_line.rrc_sec_state = ue_record->rrc_sec_state; ue_line.rrc_sec_quality = ue_record->rrc_sec_quality;
+	ue_line.nas_sec_state = ue_record->nas_sec_state; ue_line.nas_sec_quality = ue_record->nas_sec_quality;
+	ue_line.nas_ciph_alg = ue_record->nas_ciph_alg;
+	ue_line.rrc_chan = ue_record->last_rrc_chan; ue_line.rrc_msg_name = ue_record->last_rrc_msg_name;
+	ue_line.rrc_msg_quality = ue_record->has_last_rrc ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
+	ue_line.nas_epd = ue_record->last_nas_epd; ue_line.nas_sht = ue_record->last_nas_sht;
+	ue_line.nas_msg_type = ue_record->last_nas_msg_type;
+	// 교차 귀속으로 얻은 값이면 그 등급을 그대로 유지함
+	ue_line.nas_msg_quality = ue_record->has_last_nas ? ue_record->nas_msg_quality : TR_QUALITY_UNKNOWN;
+	tr->sink_ops.on_ue_line(tr->user_ctx, &ue_line);
+}
+
+// ---- AMF 과부하 ----
+static struct tr_amf_record *amf_lookup(struct tr *tr, uint64_t amf_key, int create_if_missing)
+{
+	struct amf_key amf_key_probe = { amf_key };
+	uint64_t hash = mix64(amf_key);
+	uint32_t idx = hash_map_get(&tr->amf_map, hash, amf_eq, tr, &amf_key_probe);
+	if (idx != UINT32_MAX) return &tr->amf_records[idx];
+	if (!create_if_missing) return NULL;
+	if (tr->amf_count == tr->amf_capacity) {
+		uint32_t new_amf_capacity = tr->amf_capacity ? tr->amf_capacity * 2 : 8;
+		struct tr_amf_record *amf_record =
+			realloc(tr->amf_records, (size_t)new_amf_capacity * sizeof *amf_record);
+		if (!amf_record) return NULL;
+		memset(amf_record + tr->amf_capacity, 0,
+			   (size_t)(new_amf_capacity - tr->amf_capacity) * sizeof *amf_record);
+		tr->amf_records = amf_record; tr->amf_capacity = new_amf_capacity;
+	}
+	uint32_t new_index = tr->amf_count++;
+	tr->amf_records[new_index].used = 1; tr->amf_records[new_index].amf_key = amf_key;
+	tr->amf_records[new_index].state = AMF_NONE;
+	tr->amf_records[new_index].traffic_load_reduction_pct = -1;   // 감축 지시 기본은 없음
+	if (hash_map_put(&tr->amf_map, hash, amf_eq, tr, &amf_key_probe, new_index) < 0) {
+		// 맵에 못 넣었으면 레코드도 되돌림. 안 되돌리면 레코드는 있는데 맵엔 없어 뒤에 중복 생성됨
+		tr->amf_records[new_index].used = 0;
+		tr->amf_count--;
+		return NULL;
+	}
+	return &tr->amf_records[new_index];
+}
+/* AMF 레코드 하나를 지움. 마지막 원소를 구멍으로 옮겨 배열과 맵의 크기를 같이 줄임. N2 assoc 이
+ * 끝날 때 부름(N2 레코드 제거와 대칭).
+ * 지우지 않으면 두 가지가 생김
+ *   (1) AMF ID 가 없을 때 키가 assoc_id 이고 assoc 번호는 단조증가하므로 표가 계속 늘어남
+ *   (2) 끊긴 assoc 의 과부하 레코드가 영구히 남아, 사라진 AMF 를 계속 과부하로 세어 이후 수립을
+ *       잘못 제외하거나 미상으로 떨어뜨림
+ * 끊긴 AMF 는 '있지만 미상' 이 아니라 '없음' 이 맞음. 새 연결은 NG Setup 이나 Overload 에서
+ * 레코드를 다시 만듦 */
+static void amf_remove_at(struct tr *tr, uint32_t idx)
+{
+	if (idx >= tr->amf_count) return;
+	struct amf_key amf_key_probe = { tr->amf_records[idx].amf_key };
+	hash_map_del(&tr->amf_map, mix64(tr->amf_records[idx].amf_key), amf_eq, tr, &amf_key_probe);
+	uint32_t last = tr->amf_count - 1;
+	if (idx != last) {
+		struct amf_key moved_amf_key_probe = { tr->amf_records[last].amf_key };
+		uint64_t moved_hash = mix64(tr->amf_records[last].amf_key);
+		tr->amf_records[idx] = tr->amf_records[last];   // 마지막 원소를 구멍으로 옮김
+		// 옮긴 원소의 옛 매핑을 지우고 새 위치로 다시 넣음
+		hash_map_del(&tr->amf_map, moved_hash, amf_eq, tr, &moved_amf_key_probe);
+		hash_map_put(&tr->amf_map, moved_hash, amf_eq, tr, &moved_amf_key_probe, idx);
+	}
+	tr->amf_records[last].used = 0;
+	tr->amf_count = last;
+}
+/* 이 assoc 에 딸린 AMF 레코드를 전부 회수함. AMF 레코드는 N2 의 SCTP assoc 으로 키를 매기므로
+ * (AMF ID 를 못 봤으면 키가 assoc_id) 반드시 N2 쪽 assoc 종료에서 불러야 함. F1 쪽 경로에서
+ * 부르면 assoc 번호가 맞지 않아 아무것도 지우지 못함.
+ * 남는 경우: UE 레코드가 하나도 없던 N2 assoc 은 관측 층이 레코드별 종료를 내보내지 않아 여기
+ * 도달하지 못함. 그 드문 경우의 레코드 한 건은 같은 키를 쓰는 다음 NG Setup 이나 tr_free 까지
+ * 남을 수 있음. 수량은 묶여 있고, AMF ID 가 없는 한 N2 경로에 끼어든 공격자만 늘릴 수 있음 */
+static void amf_drop_assoc(struct tr *tr, uint32_t assoc_id)
+{
+	for (uint32_t i = 0; i < tr->amf_count; )
+		// 지우면 그 위치에 마지막 원소가 들어오므로 i 를 올리지 않고 다시 봄
+		if (tr->amf_records[i].used && tr->amf_records[i].last_assoc == assoc_id) amf_remove_at(tr, i);
+		else i++;
+}
+/* Overload Action 값에서 거부되는 수립 원인 집합을 냄(TS 38.413 §8.7.7.2).
+ *   action_mask = 1u << overloadAction 이고, 값의 뜻은
+ *     0 = 비응급 발신 데이터 거부, 1 = 신호용 연결 거부,
+ *     2 = 응급과 착신만 허용,     3 = 고우선과 착신만 허용
+ *   종전에는 이 값을 무시하고 모든 action 에 같은 원인 집합을 적용했음. 넷 중 하나만 우연히
+ *   맞고 나머지 셋이 틀렸는데, 0 은 신호용 연결을 과잉 거부하고 '만 허용' 두 값은 대부분을
+ *   과소 거부했음.
+ *   원인 칸 번호: emergency 0, highPriorityAccess 1, mtAccess 2, moSignalling 3, moData 4,
+ *   moVoiceCall 5, moVideoCall 6, moSMS 7, mpsPriorityAccess 8, mcsPriorityAccess 9, spare 10~15 */
+static int action_covers(uint32_t mask, int est_cause)
+{
+	// 비응급 발신 데이터
+	if (mask & (1u << 0)) return est_cause == 4 || est_cause == 5 || est_cause == 6 || est_cause == 7;
+	// 위에 신호용 연결을 더함
+	if (mask & (1u << 1))
+		return est_cause == 3 || est_cause == 4 || est_cause == 5 || est_cause == 6 || est_cause == 7;
+	// 응급과 착신만 허용이므로 그 둘 외 전부 거부
+	if (mask & (1u << 2)) return !(est_cause == 0 || est_cause == 2);
+	// 고우선과 우선순위 둘, 착신만 허용
+	if (mask & (1u << 3))
+		return !(est_cause == 1 || est_cause == 8 || est_cause == 9 || est_cause == 2);
+	// 빈 마스크나 모르는 값이면 거부 목록을 알 수 없음. 부르는 쪽이 미상으로 처리함
+	return 0;
+}
+/* 과부하 판정. 위에서부터 처음 맞는 줄을 씀. '살아 있는 AMF' 는 떨어져 나가지 않은 AMF 임
+ *   1  살아 있는 AMF 가 없거나 모두 정상        -> 셈
+ *   2  살아 있는 AMF 가 둘 이상이고 그중 하나라도 과부하거나 미상 -> 미상
+ *   3  살아 있는 AMF 가 하나이고 그것이 미상    -> 미상
+ *   4  action 이 있고 감축 지시가 없고 원인이 거부 목록에 있음    -> 뺌
+ *   5  action 이 있고 감축 지시가 있고 원인이 거부 목록에 있음    -> 미상
+ *   6  슬라이스 목록이 있음                     -> 미상
+ *   7  action 이 없거나 모르는 값               -> 미상
+ *   8  그 밖                                    -> 셈 */
+static enum overload_decision decide_overload(struct tr *tr, int est_cause)
+{
+	int live_amf_count = 0, overload_or_unknown_count = 0;
+	struct tr_amf_record *amf_record = NULL;
+	for (uint32_t i = 0; i < tr->amf_count; i++) {
+		if (!tr->amf_records[i].used || tr->amf_records[i].state == AMF_DETACHED) continue;
+		live_amf_count++;
+		if (tr->amf_records[i].state != AMF_NONE) {
+			overload_or_unknown_count++;
+			amf_record = &tr->amf_records[i];
+		}
+	}
+	if (live_amf_count == 0 || overload_or_unknown_count == 0) return OVERLOAD_COUNT;   // 1
+	if (live_amf_count >= 2) return OVERLOAD_UNKNOWN;                 // 2. 경고는 부르는 쪽이 셈
+	if (amf_record->state == AMF_UNKNOWN) return OVERLOAD_UNKNOWN;    // 3. 지금 이 상태는 대입되지 않음
+	// 여기부터는 살아 있는 AMF 가 하나이고 그것이 과부하인 경우임
+	int in_list = amf_record->has_action && amf_record->action_mask != 0
+			&& action_covers(amf_record->action_mask, est_cause);
+	// 감축 지시가 1 이상이면 얼마나 줄이는지 모르므로 미상(5), 없으면 전부 거부로 보고 뺌(4)
+	if (in_list) return amf_record->traffic_load_reduction_pct > 0 ? OVERLOAD_UNKNOWN : OVERLOAD_EXCLUDE;
+	if (amf_record->nssai_list_present) return OVERLOAD_UNKNOWN;      // 6
+	if (!amf_record->has_action || amf_record->action_mask == 0) return OVERLOAD_UNKNOWN;   // 7
+	return OVERLOAD_COUNT;                                            // 8. action 이 있고 원인이 거부 목록 밖
+}
+
+// ---- N2 레코드 ----
+static struct tr_n2_record *n2_lookup(struct tr *tr, uint32_t assoc_id, uint64_t ran_ue_ngap_id,
+				      int create_if_missing)
+{
+	struct n2_key n2_key_probe = { assoc_id, ran_ue_ngap_id };
+	uint64_t hash = n2_hash(assoc_id, ran_ue_ngap_id);
+	uint32_t idx = hash_map_get(&tr->n2_map, hash, n2_eq, tr, &n2_key_probe);
+	if (idx != UINT32_MAX) return &tr->n2_records[idx];
+	if (!create_if_missing) return NULL;
+	if (tr->n2_count == tr->n2_capacity) {
+		uint32_t new_n2_capacity = tr->n2_capacity ? tr->n2_capacity * 2 : 32;
+		struct tr_n2_record *n2_record =
+			realloc(tr->n2_records, (size_t)new_n2_capacity * sizeof *n2_record);
+		if (!n2_record) return NULL;
+		memset(n2_record + tr->n2_capacity, 0,
+			   (size_t)(new_n2_capacity - tr->n2_capacity) * sizeof *n2_record);
+		tr->n2_records = n2_record; tr->n2_capacity = new_n2_capacity;
+	}
+	uint32_t new_index = tr->n2_count++;
+	tr->n2_records[new_index].used = 1; tr->n2_records[new_index].assoc_id = assoc_id;
+	tr->n2_records[new_index].ran_ue_ngap_id = ran_ue_ngap_id;
+	tr->n2_records[new_index].uli_cell_index = -1; tr->n2_records[new_index].est_cause = -1;
+	if (hash_map_put(&tr->n2_map, hash, n2_eq, tr, &n2_key_probe, new_index) < 0) {
+		// 맵에 못 넣었으면 레코드도 되돌림
+		tr->n2_records[new_index].used = 0;
+		tr->n2_count--;
+		return NULL;
+	}
+	return &tr->n2_records[new_index];
+}
+
+/* N2 레코드 하나를 지움. 마지막 원소를 구멍으로 옮겨 배열과 맵의 크기를 같이 줄임. N2 종료
+ * 이벤트에서 부름(관측 층의 수명과 대칭).
+ * UECNTX 의 시도와 성공은 누적 카운터라 레코드를 지워도 값에 영향이 없음. 메모리만 회수함 */
+static void n2_remove(struct tr *tr, uint32_t assoc_id, uint64_t ran_ue_ngap_id)
+{
+	struct n2_key n2_key_probe = { assoc_id, ran_ue_ngap_id };
+	uint64_t hash = n2_hash(assoc_id, ran_ue_ngap_id);
+	uint32_t idx = hash_map_get(&tr->n2_map, hash, n2_eq, tr, &n2_key_probe);
+	if (idx == UINT32_MAX) return;
+	hash_map_del(&tr->n2_map, hash, n2_eq, tr, &n2_key_probe);
+	uint32_t last = tr->n2_count - 1;
+	if (idx != last) {
+		struct n2_key moved_n2_key_probe = { tr->n2_records[last].assoc_id,
+						     tr->n2_records[last].ran_ue_ngap_id };
+		uint64_t moved_hash = n2_hash(moved_n2_key_probe.assoc_id, moved_n2_key_probe.ran_ue_ngap_id);
+		tr->n2_records[idx] = tr->n2_records[last];   // 마지막 원소를 구멍으로 옮김
+		// 옮긴 원소의 옛 매핑을 지우고 새 위치로 다시 넣음
+		hash_map_del(&tr->n2_map, moved_hash, n2_eq, tr, &moved_n2_key_probe);
+		hash_map_put(&tr->n2_map, moved_hash, n2_eq, tr, &moved_n2_key_probe, idx);
+	}
+	tr->n2_records[last].used = 0;
+	tr->n2_count = last;
+}
+
+uint32_t tr_n2_count(const struct tr *tr) { return tr ? tr->n2_count : 0; }
+
+// ---- 수립 종료 공통 ----
+// 열린 수립을 결과를 모르는 실패로 닫음
+static void close_setup_other(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	if (ue_record->setup_state == SR_OPEN) {
+		// 이 실패도 시도를 센 셀에 귀속함. 형제 분기와 같은 셀이어야 대칭이 맞음
+		int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
+									 : ue_record->req_cell_index;
+		if (cell_index >= 0) {
+			struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+			cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_OTHER]++;
+			cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][ue_record->path]++;
+		}
+		settle_open_setup(tr, ue_record, SR_OTHER);
+	}
+}
+
+/* close_setup_complete_unobserved: Msg5 를 못 본 채 연결이 성립했다는 증거만 본 열린 수립 시도를
+ *   닫고, 그 사실을 unknown 밴드에 남김.
+ *   이유: 부르는 곳 두 군데(F1 의 RRCRelease 관측, N2 의 RRCInactiveTransitionReport 관측)가 보는
+ *     메시지는 RRC_CONNECTED 였던 UE 에만 존재함. TS 38.331 §5.3.8 "The network initiates the RRC
+ *     connection release procedure to a UE in RRC_CONNECTED", 그리고 N2 보고는 NGAP UE 컨텍스트가
+ *     있어야 하고 그 컨텍스트는 INITIAL UE MESSAGE(= Msg5 의 NAS)로만 생김. 즉 Msg5 는 CU 에 닿았음.
+ *     그런데 그 Msg5 를 우리가 보지 못했으므로 Succ 본값에 넣을 수 없음. 본값은 와이어로 나가는 합
+ *     이고(출력 쪽이 카운터 값을 원인 칸 value 의 합으로 냄), 그 키의 정의가 "칸 안에 받은
+ *     RRCSetupComplete 수" 임. 받지 않은 것을 받았다고 세면 확신 있는 오값이고, 판정값을 부풀려
+ *     실패를 가림.
+ *     거꾸로 마감만 풀고 아무 칸도 올리지 않으면 시도만 서고 결과가 어디에도 없어 신호 없는 드롭이
+ *     됨(실측: 시각을 100배 압축해 재생했을 때 수립 시도 6건이 Succ 와 FailCause 와 unknown 어디에도
+ *     없었음).
+ *     그래서 형제 분기(Complete 를 받았지만 못 읽은 경우)와 같은 unknown 밴드에 셈. unknown 은
+ *     와이어에 나가지 않고 JSONL 에만 실려, 판정값은 과장되지 않고 운영자는 관측 구멍을 봄.
+ *     값을 담지 않고 담지 않았음을 세는 두 걸음임.
+ *   한계: 수립 경로만 셈. 재수립과 재개 폴백 레코드는 그 지표가 지금 측정되지 않아 올릴 칸이 없음.
+ *   부작용: 시도를 성공으로 종결함(마감 해제, 반열림 비움). 이미 종결됐으면 아무것도 하지 않음 */
+static void close_setup_complete_unobserved(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	if (ue_record->setup_state != SR_OPEN) return;
+	int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index : ue_record->req_cell_index;
+	if (ue_record->path == PATH_SETUP && cell_index >= 0) {
+		struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+		enum tr_metric metric = TR_METRIC_RRC_CONN_ESTAB_SUCC;
+		int cause_index = (ue_record->est_cause >= 0 && ue_record->est_cause < METRIC_CAUSE_CNT[metric])
+				? ue_record->est_cause : -1;
+		if (cause_index >= 0) cell_record->cc_unknown[metric][cause_index]++;
+		else cell_record->cc_unknown_nocause[metric]++;
+	}
+	settle_open_setup(tr, ue_record, SR_SUCCESS);
+}
+
