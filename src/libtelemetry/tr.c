@@ -485,3 +485,513 @@ struct tr {
 	struct tr_cc_cell scratch_cc[TR_METRIC__COUNT][MAX_CAUSE];
 };
 
+// ---- 키 비교 ----
+struct cell_key { const uint8_t *plmn_bytes; uint64_t cell_id; };
+static int cell_eq(void *ctx, uint32_t idx, const void *key_ptr)
+{
+	struct tr *tr = ctx;
+	const struct cell_key *cell_key_probe = key_ptr;
+	struct tr_cell_record *cell_record = &tr->cell_records[idx];
+	return !cell_record->overflow
+		&& cell_record->cell.cell_id == cell_key_probe->cell_id
+		&& memcmp(cell_record->cell.plmn_bytes, cell_key_probe->plmn_bytes, 3) == 0;
+}
+static uint64_t cell_hash(const uint8_t *plmn_bytes, uint64_t cell_id)
+{
+	uint64_t hash = ((uint64_t)plmn_bytes[0] << 56) | ((uint64_t)plmn_bytes[1] << 48) | ((uint64_t)plmn_bytes[2] << 40)
+			   | (cell_id & 0xFFFFFFFFFFull);
+	return mix64(hash);
+}
+
+struct ue_key { uint64_t du_id; uint32_t du_ue_id; uint8_t du_id_is_temp; };
+static int ue_eq(void *ctx, uint32_t idx, const void *key_ptr)
+{
+	struct tr *tr = ctx;
+	const struct ue_key *ue_key_probe = key_ptr;
+	struct tr_ue_record *ue_record = &tr->ue_records[idx];
+	return ue_record->used
+		&& ue_record->du_id == ue_key_probe->du_id
+		&& ue_record->du_ue_id == ue_key_probe->du_ue_id
+		&& ue_record->du_id_is_temp == ue_key_probe->du_id_is_temp;
+}
+static uint64_t ue_hash(uint64_t du_id, uint32_t du_ue_id, uint8_t du_id_is_temp)
+{
+	return mix64(du_id * 0x9E3779B97F4A7C15ull + du_ue_id * 2654435761u + du_id_is_temp);
+}
+
+struct sx_key { uint32_t assoc_id; uint64_t ue_identity39; };
+static int sx_eq(void *ctx, uint32_t idx, const void *key_ptr)
+{
+	struct tr *tr = ctx;
+	const struct sx_key *sx_key_probe = key_ptr;
+	struct tr_ue_record *ue_record = &tr->ue_records[idx];
+	return ue_record->used
+		&& ue_record->assoc_id == sx_key_probe->assoc_id
+		&& ue_record->ue_identity39 == sx_key_probe->ue_identity39;
+}
+static uint64_t sx_hash(uint32_t assoc_id, uint64_t ue_identity39)
+{
+	return mix64(((uint64_t)assoc_id << 40) ^ mix64(ue_identity39));
+}
+
+struct n2_key { uint32_t assoc_id; uint64_t ran_ue_ngap_id; };
+static int n2_eq(void *ctx, uint32_t idx, const void *key_ptr)
+{
+	struct tr *tr = ctx;
+	const struct n2_key *n2_key_probe = key_ptr;
+	struct tr_n2_record *n2_record = &tr->n2_records[idx];
+	return n2_record->used
+		&& n2_record->assoc_id == n2_key_probe->assoc_id
+		&& n2_record->ran_ue_ngap_id == n2_key_probe->ran_ue_ngap_id;
+}
+static uint64_t n2_hash(uint32_t assoc_id, uint64_t ran_ue_ngap_id)
+{
+	return mix64(((uint64_t)assoc_id << 40) ^ mix64(ran_ue_ngap_id));
+}
+
+struct amf_key { uint64_t amf_key; };
+static int amf_eq(void *ctx, uint32_t idx, const void *key_ptr)
+{
+	struct tr *tr = ctx;
+	const struct amf_key *amf_key_probe = key_ptr;
+	return tr->amf_records[idx].used && tr->amf_records[idx].amf_key == amf_key_probe->amf_key;
+}
+
+// ---- 경고 ----
+static void warn(struct tr *tr, const char *warning_code, const char *detail)
+{
+	if (tr->sink_ops.on_warning) tr->sink_ops.on_warning(tr->user_ctx, warning_code, detail);
+}
+
+// ---- 셀 조회와 생성 ----
+static struct tr_cell_record *cell_grow(struct tr *tr)
+{
+	if (tr->cell_count == tr->cell_capacity) {
+		uint32_t new_cell_capacity = tr->cell_capacity ? tr->cell_capacity * 2 : 16;
+		struct tr_cell_record *new_cell_records =
+			realloc(tr->cell_records, (size_t)new_cell_capacity * sizeof *new_cell_records);
+		if (!new_cell_records) return NULL;
+		memset(new_cell_records + tr->cell_capacity, 0,
+			   (size_t)(new_cell_capacity - tr->cell_capacity) * sizeof *new_cell_records);
+		tr->cell_records = new_cell_records; tr->cell_capacity = new_cell_capacity;
+	}
+	return &tr->cell_records[tr->cell_count++];
+}
+static int overflow_cell(struct tr *tr)
+{
+	if (tr->overflow_cell_index < 0) {
+		struct tr_cell_record *cell_record = cell_grow(tr);
+		if (!cell_record) return -1;
+		cell_record->overflow = 1; cell_record->cell.valid = 0;
+		// 넘침 셀도 주기 도중에 생기므로 앞쪽 0 표본을 채워 다른 셀과 표본 수를 맞춤
+		cell_record->conn_sample_count = tr->conn_sample_count;
+		cell_record->inactive_sample_count = tr->inactive_sample_count;
+		tr->overflow_cell_index = (int)(cell_record - tr->cell_records);
+	}
+	if (!tr->warned_overflow) {
+		warn(tr, "overflow_cell", "max_cell_count exceeded; new cells merged");
+		tr->warned_overflow = 1;
+	}
+	return tr->overflow_cell_index;
+}
+// valid 셀만 받음. 모르면 -1
+static int cell_lookup(struct tr *tr, const struct tr_nr_cgi *cell, int create_if_missing)
+{
+	if (!cell || !cell->valid) return -1;
+	struct cell_key cell_key_probe = { cell->plmn_bytes, cell->cell_id };
+	uint64_t hash = cell_hash(cell->plmn_bytes, cell->cell_id);
+	uint32_t idx = hash_map_get(&tr->cell_map, hash, cell_eq, tr, &cell_key_probe);
+	if (idx != UINT32_MAX) return (int)idx;
+	if (!create_if_missing) return -1;
+	uint32_t limit = tr->tr_cfg.max_cell_count ? tr->tr_cfg.max_cell_count : DEF_MAX_CELL_COUNT;
+	// 넘침 셀을 빼고 센 유효 셀 수
+	uint32_t valid_cells = tr->cell_count - (tr->overflow_cell_index >= 0 ? 1u : 0u);
+	if (valid_cells >= limit) return overflow_cell(tr);
+	struct tr_cell_record *cell_record = cell_grow(tr);
+	if (!cell_record) return -1;
+	uint32_t new_index = (uint32_t)(cell_record - tr->cell_records);
+	cell_record->cell = *cell;
+	cell_record->late_join = 1;   // 새로 보인 셀. 그 주기 헤더에 표시하고 주기를 닫을 때 0 으로 돌림
+	/* 주기 도중에 나타난 셀이므로 앞쪽 0 표본을 채움(합과 최댓값은 0 유지 = 그 전에는 연결이 0).
+	 * 그래야 한 주기의 모든 셀이 표본 수가 같고 ConnMean 의 분모가 주기 전체가 됨(평균 과대 방지) */
+	cell_record->conn_sample_count = tr->conn_sample_count;
+	cell_record->inactive_sample_count = tr->inactive_sample_count;
+	if (hash_map_put(&tr->cell_map, hash, cell_eq, tr, &cell_key_probe, new_index) < 0) return -1;
+	return (int)new_index;
+}
+
+// ---- UE 조회와 생성 ----
+static uint32_t ue_alloc(struct tr *tr)
+{
+	if (tr->ue_free) {
+		uint32_t i = tr->ue_free - 1;
+		tr->ue_free = tr->ue_records[i].free_list_next;
+		memset(&tr->ue_records[i], 0, sizeof tr->ue_records[i]);
+		return i;
+	}
+	if (tr->ue_count == tr->ue_capacity) {
+		uint32_t new_ue_capacity = tr->ue_capacity ? tr->ue_capacity * 2 : 64;
+		struct tr_ue_record *ue_record = realloc(tr->ue_records, (size_t)new_ue_capacity * sizeof *ue_record);
+		if (!ue_record) return UINT32_MAX;
+		memset(ue_record + tr->ue_capacity, 0, (size_t)(new_ue_capacity - tr->ue_capacity) * sizeof *ue_record);
+		tr->ue_records = ue_record; tr->ue_capacity = new_ue_capacity;
+	}
+	return tr->ue_count++;
+}
+static struct tr_ue_record *ue_lookup(struct tr *tr, const struct tr_f1ue *f1ue,
+				      int create_if_missing, uint32_t assoc_id)
+{
+	if (!f1ue || !f1ue->valid) return NULL;
+	struct ue_key ue_key_probe = { f1ue->du_id, f1ue->du_ue_id, f1ue->du_id_is_temp };
+	uint64_t hash = ue_hash(f1ue->du_id, f1ue->du_ue_id, f1ue->du_id_is_temp);
+	uint32_t idx = hash_map_get(&tr->ue_map, hash, ue_eq, tr, &ue_key_probe);
+	if (idx != UINT32_MAX) return &tr->ue_records[idx];
+	if (!create_if_missing) return NULL;
+	uint32_t new_index = ue_alloc(tr);
+	if (new_index == UINT32_MAX) return NULL;
+	struct tr_ue_record *ue_record = &tr->ue_records[new_index];
+	ue_record->used = 1; ue_record->du_id = f1ue->du_id;
+	ue_record->du_ue_id = f1ue->du_ue_id; ue_record->du_id_is_temp = f1ue->du_id_is_temp;
+	ue_record->assoc_id = assoc_id;
+	ue_record->req_cell_index = -1; ue_record->est_cell_index = -1; ue_record->att_cell_index = -1;
+	ue_record->conn_cell_index = -1; ue_record->half_open_cell_index = -1; ue_record->ue_context_cell_index = -1;
+	ue_record->resume_cause_pending = -1;
+	ue_record->ciph_alg = ue_record->integ_alg = ue_record->ciph_alg_now = ue_record->integ_alg_now = -1;
+	ue_record->setup_state = SR_OPEN; ue_record->path = PATH_SETUP;
+	ue_record->est_cause = -1; ue_record->rrc_state = RS_UNKNOWN;
+	/* 보안 상태 기본값은 둘 다 미상임. AS 쪽에 NONE 을 바로 넣지 않는 이유: 보안 이전이라고
+	 * 증명되는 것은 수립 절차에서뿐이고, 늦게 합류하면 이미 보안이 걸렸는지 알 수 없음 */
+	ue_record->rrc_sec_state = TR_SEC_UNKNOWN; ue_record->rrc_sec_quality = TR_QUALITY_UNKNOWN;
+	ue_record->nas_sec_state = TR_SEC_UNKNOWN; ue_record->nas_sec_quality = TR_QUALITY_UNKNOWN;
+	ue_record->nas_ciph_alg = -1;
+	// 5GMM 상태도 미상에서 시작함. 늦게 합류했거나 암호가 걸린 뒤면 읽을 수 없기 때문임
+	ue_record->nas_reg_state = TR_5GMM_UNKNOWN; ue_record->nas_conn_mode = TR_CM_MODE_UNKNOWN;
+	ue_record->nas_reg_state_origin = TR_5GMM_UNKNOWN; ue_record->nas_state_quality = TR_QUALITY_UNKNOWN;
+	if (hash_map_put(&tr->ue_map, hash, ue_eq, tr, &ue_key_probe, new_index) < 0) {
+		// 색인에 넣지 못했으면 칸을 free-list 로 돌려놓음. 안 돌려놓으면 배열 안에서 영구히 새어 나감
+		ue_record->used = 0;
+		ue_record->free_list_next = tr->ue_free;
+		tr->ue_free = new_index + 1;
+		return NULL;
+	}
+	return ue_record;
+}
+/* open_list 는 마감 시각을 키로 하는 min-heap 임. 평면 배열이면 시간을 전진시킬 때마다 전체를
+ * 선형으로 훑어야 하고 제거도 선형이라, 연결 수립이 몰리는 상황에서 센서가 멈춤. heap 이면 최소
+ * 마감 읽기가 O(1), 넣기와 빼기와 키 변경이 O(log n) 임.
+ *   open_list[i]      = ue 색인
+ *   키                = ue_records[open_list[i]].deadline_ns
+ *   ue.open_pos       = heap 안 위치. UE 를 쥐고 제거하거나 키를 고치려고 들고 있음 */
+static void heap_swap(struct tr *tr, uint32_t i, uint32_t j)
+{
+	uint32_t index_a = tr->open_list[i], index_b = tr->open_list[j];
+	tr->open_list[i] = index_b; tr->open_list[j] = index_a;
+	tr->ue_records[index_b].open_pos = i; tr->ue_records[index_a].open_pos = j;
+}
+static void heap_sift_up(struct tr *tr, uint32_t i)
+{
+	while (i > 0) {
+		uint32_t parent = (i - 1) / 2;
+		if (tr->ue_records[tr->open_list[parent]].deadline_ns <= tr->ue_records[tr->open_list[i]].deadline_ns) break;
+		heap_swap(tr, i, parent); i = parent;
+	}
+}
+static void heap_sift_down(struct tr *tr, uint32_t i)
+{
+	for (;;) {
+		uint32_t left = 2 * i + 1, right = 2 * i + 2, smallest = i;
+		if (left < tr->open_count
+				&& tr->ue_records[tr->open_list[left]].deadline_ns < tr->ue_records[tr->open_list[smallest]].deadline_ns)
+			smallest = left;
+		if (right < tr->open_count
+				&& tr->ue_records[tr->open_list[right]].deadline_ns < tr->ue_records[tr->open_list[smallest]].deadline_ns)
+			smallest = right;
+		if (smallest == i) break;
+		heap_swap(tr, i, smallest); i = smallest;
+	}
+}
+// 위치 i 의 키가 바뀐 뒤 원래 위치로 보냄. 부모보다 작으면 위로, 아니면 아래로(둘 중 하나만 동작함)
+static void heap_fix(struct tr *tr, uint32_t i)
+{
+	if (i > 0 && tr->ue_records[tr->open_list[(i - 1) / 2]].deadline_ns > tr->ue_records[tr->open_list[i]].deadline_ns)
+		heap_sift_up(tr, i);
+	else
+		heap_sift_down(tr, i);
+}
+static void open_list_add(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	uint32_t idx = (uint32_t)(ue_record - tr->ue_records);
+	if (ue_record->open_in_list) return;
+	if (tr->open_count == tr->open_capacity) {
+		uint32_t new_open_capacity = tr->open_capacity ? tr->open_capacity * 2 : 32;
+		uint32_t *new_list = realloc(tr->open_list, (size_t)new_open_capacity * sizeof *new_list);
+		if (!new_list) return;   // 늘리지 못하면 이 UE 의 마감만 추적되지 않음. 메모리 안전에는 영향 없음
+		tr->open_list = new_list; tr->open_capacity = new_open_capacity;
+	}
+	uint32_t i = tr->open_count++;
+	tr->open_list[i] = idx; ue_record->open_pos = i; ue_record->open_in_list = 1;
+	heap_sift_up(tr, i);
+}
+static void open_list_remove(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	if (!ue_record->open_in_list) return;
+	uint32_t i = ue_record->open_pos, last = --tr->open_count;
+	ue_record->open_in_list = 0;
+	if (i != last) {   // 마지막 원소를 빈 위치로 옮기고 다시 정렬
+		uint32_t moved_index = tr->open_list[last];
+		tr->open_list[i] = moved_index; tr->ue_records[moved_index].open_pos = i;
+		heap_fix(tr, i);
+	}
+}
+// 전방 선언. 모든 종료 경로가 ue_record_free 한 곳을 지나며 두 게이지를 비우게 하려고 둠
+static void gauge_leave_inactive(struct tr *tr, struct tr_ue_record *ue_record);
+static void ue_context_leave(struct tr *tr, struct tr_ue_record *ue_record);
+static void ue_record_free(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	/* 이미 해제된 칸을 다시 해제하는 것을 막음. 막지 않으면 아래 free-list 가 자기를 가리켜
+	 * 순환하고, INACTIVE 게이지가 두 번 빠짐 */
+	if (!ue_record->used) return;
+	gauge_leave_inactive(tr, ue_record);
+	/* UE 컨텍스트 이탈도 이 한 곳으로 모음. UEContextReleaseComplete 처리가 이 함수로 끝나고,
+	 * 축출, DU ID 재사용, RESET, assoc 종료도 모두 여기를 지남. 그래서 이탈을 빠뜨려 게이지가
+	 * 영구히 새는 것이 구조적으로 불가능함 */
+	ue_context_leave(tr, ue_record);
+	// 색인과 맵에서 제거
+	struct ue_key ue_key_probe = { ue_record->du_id, ue_record->du_ue_id, ue_record->du_id_is_temp };
+	hash_map_del(&tr->ue_map, ue_hash(ue_record->du_id, ue_record->du_ue_id, ue_record->du_id_is_temp),
+			 ue_eq, tr, &ue_key_probe);
+	struct sx_key sx_key_probe = { ue_record->assoc_id, ue_record->ue_identity39 };
+	// 수립 색인이 이 UE 를 가리킬 때만 지움
+	uint32_t setup_index = hash_map_get(&tr->setup_idx, sx_hash(ue_record->assoc_id, ue_record->ue_identity39),
+						sx_eq, tr, &sx_key_probe);
+	if (setup_index != UINT32_MAX && &tr->ue_records[setup_index] == ue_record)
+		hash_map_del(&tr->setup_idx, sx_hash(ue_record->assoc_id, ue_record->ue_identity39),
+				 sx_eq, tr, &sx_key_probe);
+	open_list_remove(tr, ue_record);
+	uint32_t idx = (uint32_t)(ue_record - tr->ue_records);
+	ue_record->used = 0;
+	ue_record->free_list_next = tr->ue_free;   // 이 칸을 free-list 의 첫 칸으로 넣음
+	tr->ue_free = idx + 1;
+}
+
+// ---- 게이지 ----
+static void gauge_enter_conn(struct tr *tr, struct tr_ue_record *ue_record, int cell_index, int level)
+{
+	if (ue_record->in_conn || cell_index < 0) return;
+	tr->cell_records[cell_index].conn_gauge[level]++;
+	ue_record->in_conn = 1; ue_record->conn_level = level; ue_record->conn_cell_index = cell_index;
+}
+static void gauge_leave_conn(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	if (!ue_record->in_conn) return;
+	// 더한 칸에서만 뺌. 그 사이 셀이 바뀌었어도 올린 곳에서 내려야 게이지가 맞음
+	if (ue_record->conn_cell_index >= 0)
+		tr->cell_records[ue_record->conn_cell_index].conn_gauge[ue_record->conn_level]--;
+	ue_record->in_conn = 0;
+}
+/* 연결 게이지를 다른 셀로 옮김. 진입도 이탈도 아니라서 모집단과 등급이 보존되고 합이 변하지 않음.
+ * 교차 셀 재수립(옛 셀에서 -1, 새 셀에서 +1)과 UE Context Setup 의 SpCell IE 변경에서 씀.
+ * 새 셀이 없거나 같은 셀이면 아무것도 하지 않음 */
+static void conn_move_cell(struct tr *tr, struct tr_ue_record *ue_record, int new_cell_index)
+{
+	if (!ue_record->in_conn || new_cell_index < 0 || new_cell_index == ue_record->conn_cell_index) return;
+	if (ue_record->conn_cell_index >= 0)
+		tr->cell_records[ue_record->conn_cell_index].conn_gauge[ue_record->conn_level]--;
+	tr->cell_records[new_cell_index].conn_gauge[ue_record->conn_level]++;
+	ue_record->conn_cell_index = new_cell_index;
+}
+// INACTIVE 게이지. 연결 게이지와 같은 구조임(더한 칸에서만 뺌). suspend 에서 들어가고 resume 이나 해제에서 빠짐
+static void gauge_enter_inactive(struct tr *tr, struct tr_ue_record *ue_record, int cell_index, int level)
+{
+	if (ue_record->in_inactive || cell_index < 0) return;
+	tr->cell_records[cell_index].inactive_gauge[level]++;
+	ue_record->in_inactive = 1; ue_record->inactive_level = level; ue_record->inactive_cell_index = cell_index;
+}
+static void gauge_leave_inactive(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	if (!ue_record->in_inactive) return;
+	if (ue_record->inactive_cell_index >= 0)
+		tr->cell_records[ue_record->inactive_cell_index].inactive_gauge[ue_record->inactive_level]--;
+	ue_record->in_inactive = 0;
+}
+/* UE 컨텍스트 게이지. 연결 게이지와 같은 형태로 더한 칸에서만 뺌.
+ * 최댓값을 진입할 때마다 갱신하는 이유: 이탈은 최댓값을 올릴 수 없으므로 이 한 곳으로 정확함 */
+static void ue_context_enter(struct tr *tr, struct tr_ue_record *ue_record, int cell_index)
+{
+	if (ue_record->in_ue_context || cell_index < 0) return;
+	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+	cell_record->ue_context_gauge++;
+	if ((uint32_t)cell_record->ue_context_gauge > cell_record->ue_context_max)
+		cell_record->ue_context_max = (uint32_t)cell_record->ue_context_gauge;
+	ue_record->in_ue_context = 1; ue_record->ue_context_cell_index = cell_index;
+}
+static void ue_context_leave(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	if (!ue_record->in_ue_context) return;
+	if (ue_record->ue_context_cell_index >= 0) tr->cell_records[ue_record->ue_context_cell_index].ue_context_gauge--;
+	ue_record->in_ue_context = 0;
+}
+static void half_open_enter(struct tr *tr, struct tr_ue_record *ue_record, int cell_index)
+{
+	if (ue_record->half_open || cell_index < 0) return;
+	tr->cell_records[cell_index].half_open_gauge++;
+	ue_record->half_open = 1; ue_record->half_open_cell_index = cell_index;
+}
+static void half_open_leave(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	if (!ue_record->half_open) return;
+	if (ue_record->half_open_cell_index >= 0) tr->cell_records[ue_record->half_open_cell_index].half_open_gauge--;
+	ue_record->half_open = 0;
+}
+
+/* ---- 단일 종결 관문 ----
+ * 열린 수립 시도를 종결 상태로 옮기는 유일한 경로임. 이미 종결됐으면 아무것도 하지 않음.
+ * 열린 수립을 닫는 모든 형제 핸들러가 이 하나를 부르므로, 어느 핸들러가 open_list 제거나
+ * half_open 이탈을 빠뜨리는 비대칭이 구조적으로 불가능함.
+ * 실패 원인 카운팅은 한 번만 해야 하므로 이 관문 밖, 핸들러의 SR_OPEN 가드 안에 둠 */
+static void settle_open_setup(struct tr *tr, struct tr_ue_record *ue_record, int terminal)
+{
+	if (ue_record->setup_state != SR_OPEN) return;
+	ue_record->setup_state = terminal;
+	open_list_remove(tr, ue_record);
+	half_open_leave(tr, ue_record);
+}
+/* 연결, 반열림, INACTIVE 게이지에서 UE 를 완전히 빼는 공통 관문(종료, 전사, 축출에서 부름).
+ * 셋 다 들지 않은 게이지에 대해서는 아무것도 하지 않으므로 동작이 보존되고, INACTIVE 이탈을
+ * 빠뜨려 게이지가 새는 것이 구조적으로 사라짐 */
+static void teardown_all_gauges(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	gauge_leave_conn(tr, ue_record);
+	gauge_leave_inactive(tr, ue_record);
+	half_open_leave(tr, ue_record);
+}
+
+/* ---- 자기-불변식 ----
+ * 구조상 항상 참인 사실만 단언으로 둠. self_check 를 켠 빌드(시험, 새니타이저)에서만 부르고,
+ * 위반하면 경고를 올린 뒤 중단함. self_check 가 0 이면 호출 자체가 걸려 오버헤드와 동작 변화가 없음 */
+static void inv_fail(struct tr *tr, const char *detail, uint32_t value_a, uint32_t value_b)
+{
+	warn(tr, "INVARIANT", detail);
+	fprintf(stderr, "tr self-invariant violated: %s (a=%u b=%u)\n", detail, value_a, value_b);
+	abort();
+}
+
+/* 전체 검사. 비용은 O(ue_count + cell_count) 임. 보는 것 다섯 가지
+ *   게이지 비음수 / 상호배타 / 필드 범위 / 멤버십 합 == 게이지 / open_list 정합
+ * 멤버십 대조는 UE 를 한 번 돌며 셀별로 세어 게이지와 맞춰 봄. 대조표는 heap 에 잡아 스택이 안전함 */
+static void tr_self_check(struct tr *tr)
+{
+	if (!tr->self_check) return;
+	uint32_t cell_count = tr->cell_count;
+	// 게이지 비음수
+	for (uint32_t cell_index = 0; cell_index < cell_count; cell_index++) {
+		struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+		for (int level = 0; level < 3; level++) {
+			if (cell_record->conn_gauge[level]  < 0) inv_fail(tr, "conn_gauge<0",  cell_index, (uint32_t)level);
+			if (cell_record->inactive_gauge[level] < 0) inv_fail(tr, "inactive_gauge<0", cell_index, (uint32_t)level);
+		}
+		if (cell_record->half_open_gauge < 0) inv_fail(tr, "half_open_gauge<0", cell_index, 0);
+		if (cell_record->ue_context_gauge < 0) inv_fail(tr, "ue_context_gauge<0", cell_index, 0);
+	}
+	// 멤버십 대조표
+	size_t tally_count = cell_count ? cell_count : 1;
+	int32_t (*conn_gauges)[3] = calloc(tally_count, sizeof *conn_gauges);
+	int32_t (*inactive_gauges)[3] = calloc(tally_count, sizeof *inactive_gauges);
+	int32_t  *half_open_gauges     = calloc(tally_count, sizeof *half_open_gauges);
+	int32_t  *ue_context_gauges    = calloc(tally_count, sizeof *ue_context_gauges);
+	if (!conn_gauges || !inactive_gauges || !half_open_gauges || !ue_context_gauges) {
+		// 대조표를 못 잡으면 검사를 건너뜀. 검사 자체가 진단이므로 여기서 중단하지 않음
+		free(conn_gauges); free(inactive_gauges); free(half_open_gauges); free(ue_context_gauges);
+		return;
+	}
+	uint32_t counted_open = 0;
+	for (uint32_t i = 0; i < tr->ue_count; i++) {
+		struct tr_ue_record *ue_record = &tr->ue_records[i];
+		if (!ue_record->used) continue;
+		// 상호배타
+		int membership_count = (ue_record->in_conn ? 1 : 0) + (ue_record->in_inactive ? 1 : 0)
+					 + (ue_record->half_open ? 1 : 0);
+		if (membership_count > 1) inv_fail(tr, "UE in >1 gauge (conn/inactive/half_open)", i, (uint32_t)membership_count);
+		// 필드 범위와 멤버십 세기
+		if (ue_record->in_conn) {
+			if (ue_record->conn_cell_index < 0 || (uint32_t)ue_record->conn_cell_index >= cell_count
+					|| ue_record->conn_level < 0 || ue_record->conn_level >= 3)
+				inv_fail(tr, "conn field range", i, (uint32_t)ue_record->conn_cell_index);
+			else conn_gauges[ue_record->conn_cell_index][ue_record->conn_level]++;
+		}
+		if (ue_record->in_inactive) {
+			if (ue_record->inactive_cell_index < 0 || (uint32_t)ue_record->inactive_cell_index >= cell_count
+					|| ue_record->inactive_level < 0 || ue_record->inactive_level >= 3)
+				inv_fail(tr, "inactive field range", i, (uint32_t)ue_record->inactive_cell_index);
+			else inactive_gauges[ue_record->inactive_cell_index][ue_record->inactive_level]++;
+		}
+		if (ue_record->half_open) {
+			if (ue_record->half_open_cell_index < 0 || (uint32_t)ue_record->half_open_cell_index >= cell_count)
+				inv_fail(tr, "half_open field range", i, (uint32_t)ue_record->half_open_cell_index);
+			else half_open_gauges[ue_record->half_open_cell_index]++;
+		}
+		// UE 컨텍스트는 상호배타에 넣지 않음. 위 셋과 동시에 성립하는 것이 정상임
+		if (ue_record->in_ue_context) {
+			if (ue_record->ue_context_cell_index < 0 || (uint32_t)ue_record->ue_context_cell_index >= cell_count)
+				inv_fail(tr, "ue_context field range", i, (uint32_t)ue_record->ue_context_cell_index);
+			else ue_context_gauges[ue_record->ue_context_cell_index]++;
+		}
+		// open_list 정합
+		if (ue_record->open_in_list) {
+			counted_open++;
+			if (ue_record->open_pos >= tr->open_count || tr->open_list[ue_record->open_pos] != i)
+				inv_fail(tr, "open_list pos mismatch", i, ue_record->open_pos);
+			if (ue_record->setup_state != SR_OPEN)
+				inv_fail(tr, "open_in_list but !SR_OPEN", i, ue_record->setup_state);
+		}
+	}
+	// 멤버십 합을 게이지와 맞춰 봄
+	for (uint32_t cell_index = 0; cell_index < cell_count; cell_index++) {
+		struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+		for (int level = 0; level < 3; level++) {
+			if (conn_gauges[cell_index][level] != cell_record->conn_gauge[level])
+				inv_fail(tr, "conn_gauge != Sum(membership)",  cell_index, (uint32_t)level);
+			if (inactive_gauges[cell_index][level] != cell_record->inactive_gauge[level])
+				inv_fail(tr, "inactive_gauge != Sum(membership)", cell_index, (uint32_t)level);
+		}
+		if (half_open_gauges[cell_index] != cell_record->half_open_gauge)
+			inv_fail(tr, "half_open_gauge != Sum(membership)", cell_index, 0);
+		if (ue_context_gauges[cell_index] != cell_record->ue_context_gauge)
+			inv_fail(tr, "ue_context_gauge != Sum(membership)", cell_index, 0);
+	}
+	// open_in_list 를 센 수와 open_count 가 같아야 함
+	if (counted_open != tr->open_count) inv_fail(tr, "open_in_list count != open_count", counted_open, tr->open_count);
+	free(conn_gauges); free(inactive_gauges); free(half_open_gauges); free(ue_context_gauges);
+}
+
+/* 경고만 하고 절대 중단하지 않는 진단. 셀마다 succ <= att 를 네 묶음에 대해 봄. 관측 유실이
+ * 합법적으로 이 관계를 깨뜨릴 수 있어 단언으로 걸지 않고, 교차 셀 오귀속을 신호로만 드러냄.
+ * succ > att 가 설계상 합법인 경우: 진행 중인 중복으로 세지 않고 뺀 재요청의 F1 UE 가 완료하면
+ * att != succ + fail 이 됨. 이 경고를 없애려고 수립 요청에서 앞선 수립을 강제 종결하지 말 것 -
+ * 그렇게 하면 시도와 실패를 겹쳐 세는 결함이 돌아옴 */
+static void inv_soft_succ_le_att(struct tr *tr, const struct tr_cell_record *cell_record)
+{
+	if (!tr->self_check) return;
+	static const int PAIR[4][2] = {
+		{ TR_METRIC_RRC_CONN_ESTAB_ATT,   TR_METRIC_RRC_CONN_ESTAB_SUCC },
+		{ TR_METRIC_UECNTX_CONN_ESTAB_ATT,TR_METRIC_UECNTX_CONN_ESTAB_SUCC },
+		{ TR_METRIC_RRC_REESTAB_ATT,      TR_METRIC_RRC_REESTAB_SUCC_WITH_CTX },
+		{ TR_METRIC_RRC_RESUME_ATT,       TR_METRIC_RRC_RESUME_SUCC },
+	};
+	for (int path_index = 0; path_index < 4; path_index++) {
+		int att_metric = PAIR[path_index][0], succ_metric = PAIR[path_index][1];
+		int cause_count = tr_cause_count((enum tr_metric)att_metric);
+		uint64_t attempt_count = cell_record->cc_unknown_nocause[att_metric];
+		uint64_t success_count = cell_record->cc_unknown_nocause[succ_metric];
+		for (int cause_index = 0; cause_index < cause_count; cause_index++) {
+			attempt_count  += cell_record->cc_value[att_metric][cause_index] + cell_record->cc_unknown[att_metric][cause_index];
+			success_count += cell_record->cc_value[succ_metric][cause_index] + cell_record->cc_unknown[succ_metric][cause_index];
+			for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++) {
+				attempt_count += cell_record->cc_excluded[att_metric][excl_index][cause_index];
+				success_count += cell_record->cc_excluded[succ_metric][excl_index][cause_index];
+			}
+		}
+		if (success_count > attempt_count) warn(tr, "SUCC_GT_ATT", tr_metric_name((enum tr_metric)succ_metric));
+	}
+}
+
