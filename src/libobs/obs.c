@@ -1817,3 +1817,275 @@ static void handle_ngap(struct obs *obs, const struct sctp_message *sctp_message
 	}
 }
 
+// ---- 공개 API ---------------------------------------------------------------------------
+/* obs_on_sctp: SCTP 메시지 하나를 PPID 로 갈라 보냄. 디코드에 실패하거나 모르는 PPID 면 그 사실을
+ *   계수기로 남기고 돌아감 — 수동 관측자는 다시 달라고 할 수 없어, 못 읽은 것을 '없었다' 로
+ *   처리하면 지표가 조용히 거짓이 됨.
+ *
+ *     PPID            반환    하는 일
+ *     62 (F1AP)       0, -1   f1ap_parse 로 풀어 handle_f1ap 으로
+ *     60 (NGAP)       0, -1   ngap_parse 로 풀어 handle_ngap 으로
+ *     66, 68 (DTLS)   0       제어평면이 통째로 암호화돼 불가시. dtls_seen_count 로 카운팅
+ *     그 밖           0       해석하지 않음. unknown_ppid_count 로 카운팅
+ *
+ *   반환: 0 = 처리했거나 해석하지 않았음, -1 = 엔벨로프 디코드 실패(그때도 이벤트는 하나 냄).
+ *   부작용: 이벤트 방출, obs->stats 갱신. */
+int obs_on_sctp(struct obs *obs, const struct sctp_message *sctp_message)
+{
+	obs->stats.sctp_message_count++;
+	uint64_t emitted_before = obs->stats.event_emitted_count;
+
+	if (sctp_message->ppid == SCTP_PPID_F1AP) {
+		struct f1ap_msg f1ap_msg;
+		enum f1ap_result f1ap_result = f1ap_parse(sctp_message->data, sctp_message->len, &f1ap_msg);
+		/* APER 로는 풀렸지만 문법에 없는 (절차, PDU 종류) 짝임. 깨진 입력이 아니라 상대가 우리보다 새 판일
+		 * 수 있으므로 malformed 이벤트를 내지 않고 카운팅만 함. */
+		if (f1ap_result == F1AP_UNKNOWN_MESSAGE) { obs->stats.ap_body_unknown_count++; f1ap_release(&f1ap_msg); return 0; }
+		if (f1ap_result != F1AP_OK) {
+			int f1ap_rc = (f1ap_result == F1AP_NO_MEMORY) ? -ENOMEM : -EBADMSG;   // malformed.reason 은 음수 errno 로 실음
+			/* 엔벨로프 디코드 실패는 규격을 벗어난 AP PDU 임. 단말을 가릴 수 없어 연결 단위로 올림.
+			 *   방향: 절차를 모르는 것이 확실한 위치임 — 엔벨로프를 못 풀어 procedureCode 를 읽지 못했음.
+			 *   그래서 절차 규칙에 TR_DIRECTION_UNKNOWN 을 주고 와이어 규칙(IANA 포트)만 쓰게 함. 와이어로도
+			 *   못 정하면 decide_direction 이 direction_unknown_count 를 올림. 여기서 상행을 사실처럼 실으면,
+			 *   이 이벤트의 방향이 곧 "DU 쪽에서 왔나 CU 쪽에서 왔나" 라는 귀속이라 보안 판단이 틀어짐. */
+			enum tr_direction fail_direction = decide_direction(obs, sctp_message->record, TR_IFACE_F1, TR_DIRECTION_UNKNOWN);
+			struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_AP_DECODE_FAIL, fail_direction); event.quality = TR_QUALITY_UNKNOWN; event.payload.malformed.reason = f1ap_rc; emit(obs, &event);
+			f1ap_release(&f1ap_msg); return -1;
+		}
+		handle_f1ap(obs, sctp_message, &f1ap_msg);
+		f1ap_release(&f1ap_msg);
+		if (obs->stats.event_emitted_count == emitted_before)
+			obs->stats.handled_no_event_count++;
+		return 0;
+	}
+	if (sctp_message->ppid == SCTP_PPID_NGAP) {
+		struct ngap_msg ngap_msg;
+		enum ngap_result ngap_result = ngap_parse(sctp_message->data, sctp_message->len, &ngap_msg);
+		if (ngap_result == NGAP_UNKNOWN_MESSAGE) { obs->stats.ap_body_unknown_count++; ngap_release(&ngap_msg); return 0; }   // F1 쪽과 같은 사유
+		if (ngap_result != NGAP_OK) {
+			int ngap_rc = (ngap_result == NGAP_NO_MEMORY) ? -ENOMEM : -EBADMSG;
+			enum tr_direction fail_direction = decide_direction(obs, sctp_message->record, TR_IFACE_N2, TR_DIRECTION_UNKNOWN);   // F1 쪽과 같은 사유
+			struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_AP_DECODE_FAIL, fail_direction); event.iface = TR_IFACE_N2; event.quality = TR_QUALITY_UNKNOWN; event.payload.malformed.reason = ngap_rc; emit(obs, &event);
+			ngap_release(&ngap_msg); return -1;
+		}
+		handle_ngap(obs, sctp_message, &ngap_msg);
+		ngap_release(&ngap_msg);
+		if (obs->stats.event_emitted_count == emitted_before)
+			obs->stats.handled_no_event_count++;
+		return 0;
+	}
+	/* DTLS-over-SCTP(PPID 66, 68)로 오는 F1-C 와 N2 는 제어평면이 통째로 암호화돼 보이지 않음.
+	 * DTLS 복호는 범위 밖이지만 카운팅은 해야 함 — 안 세면 DTLS 로 다 가려진 주기가 빈 표 I / 표 II 로
+	 * 나가 'clean' 처럼 보임. dtls_seen_count 는 obs_internal_loss 를 거쳐 보고 헤더로 올라감. */
+	if (sctp_message->ppid == OBS_PPID_F1AP_DTLS || sctp_message->ppid == OBS_PPID_NGAP_DTLS) {
+		obs->stats.dtls_seen_count++;
+		return 0;
+	}
+	/* 아는 PPID 가 아니라 해석하지 않았음. 아무것도 세지 않고 0(처리함)을 돌려주면 PPID 만 바꾼 입력이
+	 * 흔적 없이 사라지고 호출자도 가릴 수 없음 — 신호 없는 드롭. */
+	obs->stats.unknown_ppid_count++;
+	return 0;
+}
+
+/* teardown_assoc: 한 연결의 모든 F1 과 N2 단말을 이탈시키고 레코드를 정리함. 마지막 수단 이탈 원천임.
+ *   SCTP END(obs_on_assoc)와 F1 SETUP 재접속 탐지 양쪽에서 부름 — 정리 경로를 한 곳으로 모았음. */
+static void teardown_assoc(struct obs *obs, uint32_t assoc_id, uint64_t end_ns)
+{
+	/* 전체 배열(기본 131072칸) 대신 LRU 리스트로 점유한 단말만 순회함. 전수 스캔이면 teardown 마다
+	 *   26만 칸을 훑는데, 위조 ABORT 로 와이어에서 유발할 수 있어(SCTP 는 vtag 만 맞으면 받음) 단일
+	 *   스레드 센서가 멈춤. ue_remove 가 노드를 LRU 에서 떼므로 next_index 를 먼저 저장함. */
+	for (int i = obs->lru_head; i >= 0; ) {
+		int next_index = obs->ue_states[i].lru_next;
+		if (obs->ue_states[i].used && obs->ue_states[i].assoc_id == assoc_id) {
+			struct obs_event event; memset(&event, 0, sizeof event);
+			event.kind = TR_EVENT_SCTP_ASSOC_END; event.wallclock_ns = end_ns;
+			event.iface = TR_IFACE_F1; event.assoc_id = assoc_id; fill_f1ue(&event, &obs->ue_states[i]);
+			emit(obs, &event);
+			ue_remove(obs, i);
+		}
+		i = next_index;
+	}
+	/* N2 레코드도 같은 연결에서 정리함. 안 하면 AMF 연결이 끊길 때 N2 레코드가 영구히 남음.
+	 * 그 AMF 로 가는 연결이 전부 끊기면 N2 도 끝나는 것이라, 연결 단위로 즉시 닫음. */
+	for (int i = obs->n2_lru_head; i >= 0; ) {
+		int next_index = obs->n2_states[i].lru_next;
+		if (obs->n2_states[i].used && obs->n2_states[i].assoc_id == assoc_id) {
+			struct obs_event event; memset(&event, 0, sizeof event);
+			event.kind = TR_EVENT_SCTP_ASSOC_END; event.wallclock_ns = end_ns;
+			event.iface = TR_IFACE_N2; event.assoc_id = assoc_id; fill_n2ue(&event, &obs->n2_states[i]);
+			emit(obs, &event);
+			n2_remove(obs, i);
+		}
+		i = next_index;
+	}
+	assoc_remove(obs, assoc_id);   // 연결 레코드도 해제
+}
+
+void obs_on_assoc(struct obs *obs, const struct sctp_assoc_event *assoc_event)
+{
+	if (assoc_event->kind != SCTP_ASSOC_END) return;
+	teardown_assoc(obs, assoc_event->assoc_id, assoc_event->record ? assoc_event->record->capture_time_ns : obs->now_ns);
+}
+
+#define OBS_SWEEP_INTERVAL_NS 50000000ull   // 만료 훑기 최소 간격 50ms
+
+void obs_advance(struct obs *obs, uint64_t now_ns)
+{
+	if (now_ns < obs->now_ns) return;   // 시각은 줄지 않음
+	obs->now_ns = now_ns;
+	/* 만료 훑기를 두 가지로 줄임 — (a) 스트림 시각 50ms 마다만 돌려 메시지당 비용을 상수로 두고,
+	 * (b) 전체 배열(기본 131072칸) 대신 LRU 연결 리스트로 점유한 칸만 순회함.
+	 * 둘을 합쳐, 메시지가 많이 와도 obs_advance 가 처리량 천장이 되지 않고 한가할 때는 훑기 비용이 없음.
+	 * 유예와 TTL 은 초 단위라 50ms 단위로 끊어도 만료 정확도에 영향이 없음. */
+	if (now_ns - obs->last_sweep_ns < OBS_SWEEP_INTERVAL_NS) return;
+	obs->last_sweep_ns = now_ns;
+	uint64_t grace_ns = (uint64_t)obs->obs_cfg.n2_release_grace_s * 1000000000ull;
+	uint64_t ttl_ns   = (uint64_t)obs->obs_cfg.ue_ttl_s * 1000000000ull;
+	/* 유예가 지난 해제 대기 레코드와, 연결되지 않은 채 TTL 이 지난 레코드를 정리함.
+	 * LRU 리스트로 점유한 단말만 순회하고, ue_remove 가 노드를 떼므로 next_index 를 먼저 저장함. */
+	for (int i = obs->lru_head; i >= 0; ) {
+		struct obs_ue_state *ue_state = &obs->ue_states[i];
+		int next_index = ue_state->lru_next;
+		if (ue_state->releasing && now_ns - ue_state->release_cmd_ns >= grace_ns) {
+				/* COMPLETE 를 못 본 채 유예가 지났음. 합성 종료 이벤트를 내보내 집계 층이 그때 게이지에서 뺌
+				 * (COMMAND 가 아니라 여기서). 이벤트 없이 지우면 게이지가 줄지 않고 남음. */
+			struct obs_event event; memset(&event, 0, sizeof event);
+			event.kind = TR_EVENT_F1_UE_CTX_RELEASE_COMPLETE; event.wallclock_ns = now_ns; event.iface = TR_IFACE_F1;
+			event.assoc_id = ue_state->assoc_id; event.quality = TR_QUALITY_STRUCT; fill_f1ue(&event, ue_state);
+			emit(obs, &event);
+			obs->stats.f1_grace_expired_count++;
+			ue_remove(obs, i);
+		} else if (!ue_state->connected && !ue_state->releasing && now_ns - ue_state->last_ns >= ttl_ns) {
+			struct obs_event event; memset(&event, 0, sizeof event);
+			event.kind = TR_EVENT_OBS_UE_EVICTED; event.wallclock_ns = now_ns; event.iface = TR_IFACE_F1; event.assoc_id = ue_state->assoc_id; fill_f1ue(&event, ue_state);
+			emit(obs, &event); obs->stats.ue_evicted_count++;
+			ue_remove(obs, i);
+		}
+		i = next_index;
+	}
+	/* N2 쪽 유예 만료. RELEASE COMMAND 뒤 COMPLETE 를 못 본 레코드에 합성 COMPLETE 를 내고 정리함 —
+	 * 위 F1 쪽과 같은 처분임. n2_remove 가 노드를 떼므로 next_index 를 먼저 저장함. */
+	for (int i = obs->n2_lru_head; i >= 0; ) {
+		struct obs_n2_state *n2_state = &obs->n2_states[i];
+		int next_index = n2_state->lru_next;
+		if (n2_state->releasing) {
+			if (now_ns - n2_state->release_cmd_ns >= grace_ns) {
+				struct obs_event event; memset(&event, 0, sizeof event);
+				event.kind = TR_EVENT_NG_UE_CTX_RELEASE_COMPLETE; event.wallclock_ns = now_ns; event.iface = TR_IFACE_N2;
+				event.assoc_id = n2_state->assoc_id; event.quality = TR_QUALITY_STRUCT; fill_n2ue(&event, n2_state);
+				emit(obs, &event);
+				obs->stats.n2_grace_expired_count++;
+				n2_remove(obs, i);
+			}
+		} else if (!n2_state->has_amf_ue_ngap_id && now_ns - n2_state->last_ns >= ttl_ns) {
+			/* NG 연결이 확립되지 않은 레코드만 TTL 로 정리함 — amf_ue_ngap_id 를 아직 못 배운 late-join 이나
+			 * 멈춘 레코드임. 확립된 레코드는 F1 의 connected 와 같이 TTL 면제이고, 해제나 연결 종료나 축출로만
+			 * 사라짐. INACTIVE 로 들어간 단말은 확립 상태라 자동으로 면제됨. */
+			struct obs_event event; memset(&event, 0, sizeof event);
+			event.kind = TR_EVENT_OBS_UE_EVICTED; event.wallclock_ns = now_ns; event.iface = TR_IFACE_N2; event.assoc_id = n2_state->assoc_id; fill_n2ue(&event, n2_state);
+			emit(obs, &event); obs->stats.ue_evicted_count++;
+			n2_remove(obs, i);
+		}
+		i = next_index;
+	}
+	corr_expire(obs, now_ns);   // 매칭 시간창 만료. 대기 중인 F1 항목을 정리하고 매칭 실패로 카운팅
+}
+
+const struct obs_stats *obs_get_stats(const struct obs *obs) { return &obs->stats; }
+
+/* obs_internal_loss: 관측자 안에서 생긴 유실의 합 — 매칭 대기열 넘침, 단말 축출, DTLS 맹점, 채널을
+ *   가리지 못해 풀지 못한 RRC 컨테이너. 소비자가 커버리지 값으로 집계 층에 공급함.
+ *   한 곳으로 모은 이유: 항목이 늘 때 여기만 고치면 됨. 종전에는 같은 식이 소비자 네 곳에 복사돼
+ *   있었고 그중 하나는 쓰이지 않는 필드까지 더하고 있었음. */
+uint64_t obs_internal_loss(const struct obs *obs)
+{
+	if (!obs)
+		return 0;
+	/* DTLS 맹점도 커버리지에 넣음. 채널 규칙에 없어 풀지 못한 RRC 컨테이너도 같은 맹점임.
+	 *   IE 241 과 IE 128 은 더하지 않음. 빠뜨린 것이 아니라, CU 도 버리거나 RRC 메시지가 아니어서
+	 *   놓친 상태 변화가 없기 때문임. */
+	return obs->stats.corr_queue_overflow_count + obs->stats.ue_evicted_count
+		 + obs->stats.dtls_seen_count + obs->stats.unknown_rrc_channel_count;
+}
+
+static uint32_t value_or_default(uint32_t value, uint32_t default_value) { return value ? value : default_value; }
+
+struct obs *obs_new(const struct obs_cfg *obs_cfg, obs_event_cb on_event, void *user_ctx)
+{
+	struct obs *obs = calloc(1, sizeof *obs);
+	if (!obs) return NULL;
+	obs->obs_cfg = obs_cfg ? *obs_cfg : (struct obs_cfg){0};
+	obs->obs_cfg.ue_capacity    = value_or_default(obs->obs_cfg.ue_capacity, DEF_UE_CAPACITY);
+	obs->obs_cfg.assoc_capacity = value_or_default(obs->obs_cfg.assoc_capacity, DEF_ASSOC_CAPACITY);
+	obs->obs_cfg.ue_ttl_s   = value_or_default(obs->obs_cfg.ue_ttl_s, DEF_UE_TTL_S);
+	obs->obs_cfg.n2_release_grace_s = value_or_default(obs->obs_cfg.n2_release_grace_s, DEF_N2_GRACE_S);
+	obs->on_event = on_event; obs->user_ctx = user_ctx;
+
+	obs->ue_capacity = obs->obs_cfg.ue_capacity;
+	obs->ue_states = calloc(obs->ue_capacity, sizeof *obs->ue_states);
+	obs->ue_hash_bucket_count = obs->ue_capacity * 2 + 1;
+	obs->ue_hash_buckets = malloc(obs->ue_hash_bucket_count * sizeof(int));
+	obs->assoc_capacity = obs->obs_cfg.assoc_capacity;
+	obs->assoc_records = calloc(obs->assoc_capacity, sizeof *obs->assoc_records);
+	obs->assoc_hash_bucket_count = obs->assoc_capacity * 2 + 1;
+	obs->assoc_hash_buckets = malloc(obs->assoc_hash_bucket_count * sizeof(int));
+
+	obs->obs_cfg.n2_capacity = value_or_default(obs->obs_cfg.n2_capacity, obs->obs_cfg.ue_capacity);   // 기본값은 ue_capacity 와 같게 둠
+	obs->n2_capacity = obs->obs_cfg.n2_capacity;
+	obs->n2_states = calloc(obs->n2_capacity, sizeof *obs->n2_states);
+	obs->n2_hash_bucket_count = obs->n2_capacity * 2 + 1;
+	obs->n2_hash_buckets = malloc(obs->n2_hash_bucket_count * sizeof(int));
+
+	obs->obs_cfg.correlation_window_ms = value_or_default(obs->obs_cfg.correlation_window_ms, 100u);
+	obs->obs_cfg.corr_queue_per_cell_capacity = value_or_default(obs->obs_cfg.corr_queue_per_cell_capacity, 16384u);
+	obs->obs_cfg.dl_dcch_exempt_max_count = value_or_default(obs->obs_cfg.dl_dcch_exempt_max_count, DL_DCCH_EXEMPT_DEFAULT);
+	if (obs->obs_cfg.dl_dcch_exempt_max_count > 255) obs->obs_cfg.dl_dcch_exempt_max_count = 255;   // 예산 칸이 uint8_t 라 255 가 상한
+	obs->correlation_window_ns = (uint64_t)obs->obs_cfg.correlation_window_ms * 1000000ull;
+	obs->corr_item_capacity = obs->obs_cfg.corr_queue_per_cell_capacity;
+	obs->corr_items = calloc(obs->corr_item_capacity, sizeof *obs->corr_items);
+	obs->corr_key_capacity = obs->obs_cfg.corr_queue_per_cell_capacity;
+	obs->corr_key_hash_bucket_count = obs->corr_key_capacity * 2 + 1;
+	obs->corr_key_hash_buckets = malloc(obs->corr_key_hash_bucket_count * sizeof(int));
+	obs->corr_keys = calloc(obs->corr_key_capacity, sizeof *obs->corr_keys);
+	if (!obs->ue_states || !obs->ue_hash_buckets || !obs->assoc_records || !obs->assoc_hash_buckets || !obs->n2_states || !obs->n2_hash_buckets ||
+		!obs->corr_items || !obs->corr_keys || !obs->corr_key_hash_buckets) { obs_free(obs); return NULL; }
+
+	for (uint32_t i = 0; i < obs->ue_hash_bucket_count; i++) obs->ue_hash_buckets[i] = -1;
+	for (uint32_t i = 0; i < obs->assoc_hash_bucket_count; i++) obs->assoc_hash_buckets[i] = -1;
+	for (uint32_t i = 0; i < obs->n2_hash_bucket_count; i++) obs->n2_hash_buckets[i] = -1;
+	obs->lru_head = obs->lru_tail = -1;
+	obs->ue_free = -1;
+	for (int i = (int)obs->ue_capacity - 1; i >= 0; i--) { obs->ue_states[i].hash_next = obs->ue_free; obs->ue_free = i; }
+	obs->assoc_free = -1;
+	for (int i = (int)obs->assoc_capacity - 1; i >= 0; i--) { obs->assoc_records[i].hash_next = obs->assoc_free; obs->assoc_free = i; }
+	obs->n2_lru_head = obs->n2_lru_tail = -1;
+	obs->n2_free = -1;
+	for (int i = (int)obs->n2_capacity - 1; i >= 0; i--) { obs->n2_states[i].hash_next = obs->n2_free; obs->n2_free = i; }
+	for (uint32_t i = 0; i < obs->corr_key_hash_bucket_count; i++) obs->corr_key_hash_buckets[i] = -1;
+	obs->corr_item_free = -1;
+	for (int i = (int)obs->corr_item_capacity - 1; i >= 0; i--) { obs->corr_items[i].next_index = obs->corr_item_free; obs->corr_item_free = i; }
+	obs->corr_key_free = -1;
+	for (int i = (int)obs->corr_key_capacity - 1; i >= 0; i--) { obs->corr_keys[i].hash_next = obs->corr_key_free; obs->corr_key_free = i; }
+	return obs;
+}
+
+void obs_free(struct obs *obs)
+{
+	if (!obs) return;
+	free(obs->ue_states); free(obs->ue_hash_buckets); free(obs->assoc_records); free(obs->assoc_hash_buckets);
+	free(obs->n2_states); free(obs->n2_hash_buckets); free(obs->corr_keys); free(obs->corr_key_hash_buckets); free(obs->corr_items); free(obs);
+}
+
+/* obs_direction_for_test: 방향 판정을 시험에서 부를 수 있게 노출함. 프로덕션 decide_direction 과 다른
+ *   점은 통계를 갱신하지 않는 것뿐이고, 판정은 같은 세 함수(f1ap_proc_direction, ngap_proc_direction,
+ *   wire_rule_direction)와 direction_pick 을 그대로 씀. */
+enum tr_direction obs_direction_for_test(enum tr_iface iface, long proc_code, int pdu_type,
+								   uint16_t src_port, uint16_t dst_port)
+{
+	/* 공개 헤더가 디코더 열거형을 품지 않으므로 인자는 int 로 받고 여기서 캐스트함.
+	 *   지역 변수로 받지 않는 이유: 같은 개념(PDU 종류)에 두 이름이 생김. */
+	enum tr_direction proc_direction = (iface == TR_IFACE_N2) ? ngap_proc_direction(proc_code, (enum ngap_pdu_type)pdu_type)
+											   : f1ap_proc_direction(proc_code, (enum f1ap_pdu_type)pdu_type);
+	struct cap_record record = { .src_port = src_port, .dst_port = dst_port };
+	return direction_pick(proc_direction, wire_rule_direction(&record, iface));
+}
