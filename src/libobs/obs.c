@@ -994,3 +994,309 @@ static void handle_rrc_container(struct obs *obs, const struct sctp_message *sct
 	rrc_release(&rrc_msg);
 }
 
+// ---- F1AP 메시지 하나 처리 --------------------------------------------------------------
+static void teardown_assoc(struct obs *obs, uint32_t assoc_id, uint64_t end_ns);   // 전방선언. obs_on_assoc 과 같이 씀
+
+/* RESET_UE_MAX: 일부 RESET 한 건에서 들고 올라가는 UE 항목의 상한.
+ *   TS 38.473 의 maxnoofIndividualF1ConnectionsToReset 은 65536 이지만, 그만큼을 알림 한 줄에 실으면
+ *   JSON 이 수백 KB 가 됨. 넘친 항목은 목록에서 빼고 세므로 읽는 쪽은 그만큼 덜 닫음 —
+ *   이 상한은 '정확히 가리킬 수 있는 범위' 만 정하고, 넘친 사실은 ue_overflow_count 로 남음. */
+#define RESET_UE_MAX 256
+
+/* assoc_fill_cells: 재시작 알림에 그 DU 의 셀 목록을 실음.
+ *   이유: RESET 메시지에는 셀이 없고 SETUP 의 셀 목록도 그 메시지에만 있으므로, 연결에 기억해 둔 것을 꺼냄.
+ *   빌려 쓰는 포인터 — 콜백이 돌아가는 동안만 유효. 모르면 cells_known 을 거짓으로 둬 읽는 쪽이
+ *   '모든 셀' 로 보게 함(목록을 지어내지 않음). */
+static void assoc_fill_cells(const struct obs_assoc_record *assoc_record, struct obs_event *event)
+{
+	if (!assoc_record || assoc_record->cell_count == 0 || assoc_record->cell_overflow)
+		return;
+	event->payload.reset.cells = assoc_record->cells;
+	event->payload.reset.cell_count = assoc_record->cell_count;
+	event->payload.reset.cells_known = true;
+}
+/* f1_reset_all: 한 연결의 F1 단말 레코드를 전부 지움(이벤트는 내지 않음).
+ *   이유: F1 RESET(전체)과 F1 SETUP 은 둘 다 그 인터페이스의 단말 컨텍스트를 한꺼번에 없앰
+ *     — TS 38.473 §8.2.1.2.1 "remove the indicated UE contexts",
+ *       §8.2.3.1 "re-initialises the F1AP UE-related contexts (if any) … like a Reset procedure would do".
+ *     우리 표에 남겨 두면 다음 단말이 같은 du_ue_id 로 올 때 옛 레코드의 AS 보안 상태로 가시성 관문을
+ *     판정하고(조용한 오값), INITIAL UL 은 UE_REPLACED 로 떨어져 du_id_reuse_count 가 우리 표 탓에 오름.
+ *   이탈 이벤트를 내지 않는 이유: 집계 쪽은 RESET / SETUP 이벤트 하나로 그 범위를 닫으므로
+ *     레코드별 이탈까지 내면 같은 이탈을 두 번 셈. N2 쪽 n2_reset_all 과 같은 처분임.
+ *   점유 UE 만 도는 이유는 teardown_assoc 과 같음(전수 배열 스캔은 위조 RESET 으로 스톨을 만들 수 있음). */
+static void f1_reset_all(struct obs *obs, uint32_t assoc_id)
+{
+	for (int i = obs->lru_head; i >= 0; ) {
+		int next_index = obs->ue_states[i].lru_next;
+		if (obs->ue_states[i].used && obs->ue_states[i].assoc_id == assoc_id) {
+			ue_remove(obs, i);
+			obs->stats.f1_reset_removed_count++;
+		}
+		i = next_index;
+	}
+}
+
+/* handle_f1ap: F1AP 메시지 하나를 이벤트로 바꿈. 처리 순서가 곧 의미임 — 연결 수준 절차는 거기서
+ *   끝나고, 단말 수준 절차만 아래로 내려가 레코드를 만지고 RRC 컨테이너를 품.
+ *
+ *     방향 판정 --> 연결 수준 절차 --여기서 끝남--> return
+ *               --> 단말 수준 절차 --> 레코드 찾기, 생성 --> 절차별 이벤트 --> RRC 컨테이너 루프
+ *
+ *     연결 수준   F1 SETUP            셀 집합을 갈아치우고 재시작을 알림. 가린 판이면 우리 표도 비움
+ *                 GNB-DU CFG UPDATE   셀을 더하기만 함
+ *                 RESET               범위가 전체면 그 연결의 표를 비우고, 일부면 가리킨 단말만
+ *     단말 수준   INITIAL UL          레코드 생성. 같은 번호가 또 오면 옛 레코드를 닫고 새로 만듦
+ *                 UE CTX SETUP        결과 세 갈래(요청, 성공, 실패)를 그대로 옮김
+ *                 UE CTX RELEASE      COMMAND 는 유예 표시만 하고, COMPLETE 에서 레코드를 지움
+ *                 그 밖               레코드만 갱신하고 RRC 컨테이너 루프로
+ *
+ *   부작용: 이벤트 방출, obs->stats 갱신, 단말 표와 연결 레코드 변경. */
+static void handle_f1ap(struct obs *obs, const struct sctp_message *sctp_message, const struct f1ap_msg *f1ap_msg)
+{
+	/* 방향은 절차와 PDU 종류로 먼저 정함 — 그 짝은 규격이 정의한 것이라 정확함. 정해지지 않으면
+	 * 와이어의 IANA 포트 규칙으로 가고, 그래도 모르면 미상으로 두고 카운팅함.
+	 * 절차 코드만 보고 통째로 정하면 안 되는 이유: 같은 절차의 RESPONSE 와 COMPLETE 는 반대 방향이고,
+	 * UEContextModificationConfirm 은 CU 에서 DU 로 가면서 RRC 컨테이너를 품음. 그것을 상행으로 잘못
+	 * 실으면 아래 컨테이너 루프가 하행 메시지로 상행 평문 예산을 깎음. */
+	enum tr_direction direction = decide_direction(obs, sctp_message->record, TR_IFACE_F1,
+									   f1ap_proc_direction(f1ap_msg->procedure_code, f1ap_msg->pdu_type));
+	/* 문법에 없는 (절차, PDU 종류) 짝과 F1AP-PDU 의 확장 선택지는 여기 오지 않음 — f1ap_parse 가
+	 *   F1AP_UNKNOWN_MESSAGE 를 돌려주고 obs_on_sctp 가 ap_body_unknown_count 로 카운팅함. 그래서 7바이트
+	 *   쓰레기가 F1 RESET(전체) 이벤트가 되어 그 연결의 단말을 전부 지우는 일이 없음. */
+
+	// F1 SETUP 이 가리키는 F1-C 인스턴스를 못 가린 판. 범위를 추측하지 않고 카운팅함
+	bool f1_setup_ambiguous = f1ap_msg->procedure_code == P_F1_SETUP && !f1ap_msg->has_du_id;
+
+	// 연결에서 DU 로 가는 매핑 학습. F1 SETUP 과 GNB-DU CONFIGURATION UPDATE 의 gNB-DU ID
+	if (f1ap_msg->has_du_id && (f1ap_msg->procedure_code == P_F1_SETUP || f1ap_msg->procedure_code == P_GNBDU_CFG_UPD)) {
+		/* 같은 gNB-DU ID 를 든 다른 연결은 재시작으로 죽은 옛 연결임. F1 SETUP 은 F1 인터페이스의
+		 * (재)초기화이므로(TS 38.473 §8.2.3) 그 도착을 신호로 삼아 옛 연결을 정리함.
+		 * 왜 필요한가: DU 가 새 소스 포트로 재접속하면 SCTP 재시작 탐지가 같은 4-tuple 만 보므로 놓치고,
+		 * 옛 연결이 END 없이 남음. 연결된 단말은 TTL 면제이고 LRU 는 개수로만 밀려나므로, 상시 집계되는
+		 * 평균과 최대 연결 수가 무기한 과대 계수됨(처닝이 적은 사설 5G 에서는 사실상 영구).
+		 * 시간 초과로 추측하지 않고 관측 가능한 신호에 근거함 — F1-U 만 쓰는 긴 세션을 잘못 떨어뜨리지
+		 * 않음. 재접속이 아예 없는 조용한 죽음은 수동 관측으로는 볼 수 없음. */
+		if (f1ap_msg->procedure_code == P_F1_SETUP)
+			for (uint32_t i = 0; i < obs->assoc_capacity; i++)
+				if (obs->assoc_records[i].used && obs->assoc_records[i].has_du_id && obs->assoc_records[i].du_id == f1ap_msg->du_id && obs->assoc_records[i].assoc_id != sctp_message->assoc_id)
+					teardown_assoc(obs, obs->assoc_records[i].assoc_id, sctp_message->record ? sctp_message->record->capture_time_ns : obs->now_ns);
+		struct obs_assoc_record *assoc_record = assoc_get(obs, sctp_message->assoc_id);
+		if (assoc_record) {
+			/* 같은 연결에 다른 gNB-DU ID 의 F1 SETUP = 공유 TNL(§8.2.3.1 NOTE: "several F1 Setup procedures
+			 *   may be issued via the same TNL association"). 그 연결의 단말이 어느 인스턴스 것인지 우리
+			 *   색인((연결, DU 번호))으로는 못 가르므로 닫을 범위를 정하지 않음. 종전엔 조용히 덮어썼음. */
+			if (f1ap_msg->procedure_code == P_F1_SETUP && assoc_record->has_du_id && assoc_record->du_id != f1ap_msg->du_id)
+				f1_setup_ambiguous = true;
+			assoc_record->du_id = f1ap_msg->du_id; assoc_record->has_du_id = true;
+		}
+	}
+
+	/* F1 SETUP REQUEST 의 Served Cell 을 집계 층의 셀 표에 등록시킴(이벤트가 나르는 값은 NR CGI 뿐).
+	 *   f1ap_msg.served_cells 는 F1 SETUP REQUEST 의 NR CGI 만 담으므로(ap.h), GNB-DU CONFIGURATION UPDATE 로
+	 *   추가되거나 바뀐 셀은 이 층에서 나오지 않음(served_cell_count 가 0). */
+	if (f1ap_msg->procedure_code == P_F1_SETUP || f1ap_msg->procedure_code == P_GNBDU_CFG_UPD) {
+		struct obs_assoc_record *assoc_record = assoc_get(obs, sctp_message->assoc_id);
+		// F1 SETUP 은 인터페이스 재초기화라 셀 집합을 갈아치우고, CONFIGURATION UPDATE 는 더함
+		if (assoc_record && f1ap_msg->procedure_code == P_F1_SETUP && f1ap_msg->pdu_type == F1AP_PDU_INITIATING) {
+			assoc_record->cell_count = 0;
+			assoc_record->cell_overflow = false;
+		}
+		for (int item_index = 0; item_index < f1ap_msg->served_cell_count; item_index++) {
+			struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_CELL_CONFIG, TR_DIRECTION_UP);
+			event.cell = tr_nr_cgi_from(&f1ap_msg->served_cells[item_index]);
+			emit(obs, &event);
+			if (!assoc_record)
+				continue;
+			if (assoc_record->cell_count == ASSOC_CELL_MAX) { assoc_record->cell_overflow = true; continue; }
+			assoc_record->cells[assoc_record->cell_count++] = event.cell;
+		}
+		/* 재시작 알림: DU 가 F1 을 새로 맺었음 = 그 DU 의 단말 컨텍스트가 단말별 해제 줄 없이 한꺼번에
+		 *   사라졌음. REQUEST 만 냄 — RESPONSE 와 FAILURE 는 CU 가 보내는 답이라 재시작 시점이 아님.
+		 *
+		 *   닫을 범위는 SCTP 연결이 아니라 F1-C 인스턴스이고 그것을 가리키는 것이 gNB-DU ID 임(§8.2.3.1 NOTE).
+		 *     인스턴스를 가린 판   scope=ALL   연결 전체를 닫음. 우리 표도 비움
+		 *     못 가린 판(공유 TNL) scope=LIST  목록이 비어 '닫을 것 없음'. 셀 목록은 이 메시지의 것이라
+		 *                                      그대로 싣고, 못 가렸다는 사실은 계수기로 남김 */
+		if (f1ap_msg->procedure_code == P_F1_SETUP && f1ap_msg->pdu_type == F1AP_PDU_INITIATING) {
+			struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_SETUP, direction);
+			event.payload.reset.scope = f1_setup_ambiguous ? TR_SCOPE_LIST : TR_SCOPE_ALL;
+			assoc_fill_cells(assoc_record, &event);
+			emit(obs, &event);
+			if (f1_setup_ambiguous)
+				obs->stats.f1_setup_ambiguous_count++;
+			else
+				f1_reset_all(obs, sctp_message->assoc_id);
+		}
+		if (f1ap_msg->procedure_code == P_F1_SETUP) return;
+	}
+	if (f1ap_msg->procedure_code == P_GNBDU_CFG_UPD) return;   // 셀만 읽는 메시지임. 단말 수준 처리로 내려보내지 않음
+
+	if (f1ap_msg->procedure_code == P_RESET) {
+		// RESET ACKNOWLEDGE 에는 ResetType 이 없어 범위가 0 으로 읽힘. 요청만 이벤트로 냄
+		if (f1ap_msg->pdu_type != F1AP_PDU_INITIATING) return;
+		struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_RESET, direction);
+		// 범위를 모르는 RESET(확장 갈래, 모르는 ResetAll 값)은 전체로 실음
+		event.payload.reset.scope = (f1ap_msg->reset_type == RESET_TYPE_PART) ? TR_SCOPE_LIST : TR_SCOPE_ALL;
+		assoc_fill_cells(assoc_get(obs, sctp_message->assoc_id), &event);
+		/* 일부 RESET 의 단말 번호. 두 번호 모두 선택 필드라(ap.h) DU 쪽 번호가 없는 항목이 있을 수 있고,
+		 *   그런 항목은 가리킬 방법이 없으므로 목록에서 빼고 따로 카운팅함. 읽는 쪽은 센 만큼 덜 닫음 —
+		 *   가리키지 못한 단말을 '전체' 로 넓히면 멀쩡한 단말까지 닫힘(확신 있는 오값). */
+		struct tr_reset_ue reset_ues[RESET_UE_MAX];
+		if (event.payload.reset.scope == TR_SCOPE_LIST) {
+			for (int item_index = 0; item_index < f1ap_msg->reset_ue_count; item_index++) {
+				if (event.payload.reset.ue_count == RESET_UE_MAX) { event.payload.reset.ue_overflow_count++; continue; }
+				const struct f1ap_reset_ue *item = &f1ap_msg->reset_ues[item_index];
+				struct tr_reset_ue *reset_ue = &reset_ues[event.payload.reset.ue_count++];
+				*reset_ue = (struct tr_reset_ue){
+					.du_ue_id     = item->du_ue_id,
+					.has_du_ue_id = item->has_du_ue_id,
+					.cu_ue_id     = item->cu_ue_id,
+					.has_cu_ue_id = item->has_cu_ue_id,
+				};
+				/* 우리 표에서 그 단말을 찾아 키를 같이 올림. CU 번호만 온 항목은 찾을 수 없음 —
+				 *   우리 색인이 (연결, DU 번호)뿐이기 때문임. 못 찾으면 f1ue.valid 가 거짓으로 남고,
+				 *   읽는 쪽은 그 단말을 닫지 않고 카운팅함(지어내지 않음). */
+				int ue_index = item->has_du_ue_id ? ue_find(obs, sctp_message->assoc_id, item->du_ue_id) : -1;
+				if (ue_index < 0)
+					continue;
+				reset_ue->f1ue = f1ue_key_of(&obs->ue_states[ue_index]);
+				// 키를 바로 위에서 복사했으므로 지금 지워도 이벤트는 온전함. 지우는 이유는 f1_reset_all 과 같음
+				ue_remove(obs, ue_index);
+				obs->stats.f1_reset_removed_count++;
+			}
+			event.payload.reset.ues = reset_ues;
+		}
+		emit(obs, &event);
+		if (event.payload.reset.scope == TR_SCOPE_ALL)
+			f1_reset_all(obs, sctp_message->assoc_id);
+		return;
+	}
+
+	/* 여기부터는 단말 레코드가 있어야 함. DU 번호가 없으면 레코드를 찾을 색인이 없음.
+	 *   계수기를 두지 않는 근거: 이 번호가 선택 IE 인 메시지는 UE CONTEXT SETUP 의 REQUEST 와 FAILURE
+	 *   둘뿐이고(asn1/f1ap-18.8.0.asn 전수 — 나머지 단말 연관 메시지는 전부 mandatory), 그 둘의 하류
+	 *   소비자 두 곳이 다 같은 번호를 필수로 요구함 —
+	 *     집계 층: f1ue 키로 찾은 단말 레코드에만 C-RNTI 와 셀을 적음
+	 *     출력 층: 단말 이벤트 줄은 cell_id 와 du_ue_id 가 둘 다 있어야 나감
+	 *   즉 '못 읽은 것' 이 아니라 '상대가 안 보낸 것' 이고, 보내지 않은 번호로는 아무 소비자도 할 일이
+	 *   없음. UECNTX.ConnEstabAtt 는 이 메시지가 아니라 NGAP INITIAL UE MESSAGE 가 세므로
+	 *   (TS 28.552 §5.1.1.16.1 c) 지표도 깎이지 않음. */
+	if (!f1ap_msg->has_du_ue_id) return;
+
+	// 단말 레코드 찾기와 생성
+	int idx = ue_find(obs, sctp_message->assoc_id, f1ap_msg->du_ue_id);
+	if (f1ap_msg->procedure_code == P_INITIAL_UL) {
+		if (idx >= 0) {   // 같은 (연결, DU 번호)가 다시 나타남 = DU 번호 재사용. 옛 레코드를 닫고 새로 만듦
+			struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_OBS_UE_REPLACED, direction); fill_f1ue(&event, &obs->ue_states[idx]);
+			emit(obs, &event); obs->stats.ue_replaced_count++; obs->stats.du_id_reuse_count++;
+			ue_remove(obs, idx);
+		}
+		idx = ue_create(obs, sctp_message->assoc_id, f1ap_msg->du_ue_id);
+		if (idx < 0) return;   // 상한에 걸려 축출도 실패함
+		set_f1ue_keys(obs, &obs->ue_states[idx]);
+		if (f1ap_msg->nr_cgi.is_valid) obs->ue_states[idx].cell = tr_nr_cgi_from(&f1ap_msg->nr_cgi);
+		if (f1ap_msg->has_crnti) { obs->ue_states[idx].crnti = f1ap_msg->crnti; obs->ue_states[idx].has_crnti = true; }
+		// 메시지당 한 번. RRC 컨테이너를 못 풀어도 단말 컨텍스트는 생기므로 RRC 이벤트에 얹지 않고 따로 냄
+		struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_INITIAL_UL, direction);
+		fill_f1ue(&event, &obs->ue_states[idx]);
+		event.payload.initial_ul.has_du_to_cu_rrc_container = f1ap_msg->has_du_to_cu_rrc_container;
+		emit(obs, &event);
+	}
+	/* 수립을 못 본 단말의 해제(COMMAND 나 COMPLETE)로는 레코드를 만들지 않음. 만들면 없던 단말이 생겨
+	 * '수립 없는 종료' 가 집계 층으로 흘러감. N2 쪽도 같게 막아 둠. */
+	if (idx < 0 && (f1ap_msg->procedure_code == P_UE_CTX_RELEASE || f1ap_msg->procedure_code == P_ERROR_INDICATION)) return;   // ERROR INDICATION 의 DU 번호는 '모르는 번호' 일 수 있어 레코드를 만들지 않음(Cause 가 unknown-or-already-allocated-gnb-du-ue-f1ap-id)
+	if (idx < 0) {
+		// INITIAL UL 을 못 본 뒤 등장(late join). 레코드는 만들되 보안 상태가 미상이라 가시성 관문을 닫음
+		idx = ue_create(obs, sctp_message->assoc_id, f1ap_msg->du_ue_id);
+		if (idx < 0) return;
+		set_f1ue_keys(obs, &obs->ue_states[idx]);
+		obs->ue_states[idx].late_join = true;
+	}
+	struct obs_ue_state *ue_state = &obs->ue_states[idx];
+	ue_state->last_ns = obs->now_ns; lru_touch(obs, idx);
+	if (f1ap_msg->has_cu_ue_id) { ue_state->cu_ue_id = f1ap_msg->cu_ue_id; ue_state->has_cu_ue_id = true; }
+	if (f1ap_msg->has_crnti) { ue_state->crnti = f1ap_msg->crnti; ue_state->has_crnti = true; }   // UE CONTEXT MODIFICATION RESPONSE 등에서 C-RNTI 가 옴
+	// 셀 추적. f1ap_msg 는 NR CGI IE(111)만 담음. UE CONTEXT SETUP 과 MODIFICATION REQUEST 의 SpCell ID(IE 63)는
+	//  담지 않아 그 메시지로는 셀이 갱신되지 않음
+	if (f1ap_msg->nr_cgi.is_valid) ue_state->cell = tr_nr_cgi_from(&f1ap_msg->nr_cgi);
+
+	/* IE 47(old gNB-DU UE F1AP ID)은 DL RRC MESSAGE TRANSFER 에서만 단말 연결 이전을 뜻함.
+	 * RELEASE COMMAND 의 IE 47 은 뜻이 달라, 해제 이벤트의 has_old_du_ue_id 속성으로만 실음. */
+	if (f1ap_msg->procedure_code == P_DL_RRC && f1ap_msg->has_old_du_ue_id) {
+		struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_UE_TRANSFER, direction); fill_f1ue(&event, ue_state);
+		event.payload.ue_transfer.old_du_ue_id = f1ap_msg->old_du_ue_id;
+		emit(obs, &event);
+	}
+
+	// 절차별 F1AP 수준 이벤트
+	switch (f1ap_msg->procedure_code) {
+	case P_UE_CTX_SETUP: {
+		struct obs_event ctx_setup_event; fill_event_header(&ctx_setup_event, obs, sctp_message, TR_EVENT_F1_UE_CTX_SETUP, direction); fill_f1ue(&ctx_setup_event, ue_state);
+		/* 결과 세 갈래를 그대로 옮김. bool 로 줄이면 unsuccessfulOutcome 이 successfulOutcome 과 같은 값이
+		 *   되어, 출력이 UEContextSetupFailure 를 "UEContextSetupResponse" 로 내보냄. */
+		switch (f1ap_msg->pdu_type) {
+		case F1AP_PDU_SUCCESSFUL:
+			ctx_setup_event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_SUCCESS;
+			break;
+		case F1AP_PDU_UNSUCCESSFUL:
+			ctx_setup_event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_FAILURE;
+			obs->stats.ue_ctx_setup_failure_cause_dropped_count++;   // Cause IE 를 실을 칸이 없음. 버린 사실만 남김
+			break;
+		default:
+			ctx_setup_event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_REQUEST;
+			break;
+		}
+		if (f1ap_msg->has_crnti) { ctx_setup_event.payload.ue_ctx_setup.has_crnti = true; ctx_setup_event.payload.ue_ctx_setup.crnti = f1ap_msg->crnti; }
+		emit(obs, &ctx_setup_event);
+		/* 알고리즘 변경 기회(DU 간 핸드오버)는 여기서 내지 않음: 판단 근거인 CU to DU RRC Information 의
+		 *   확장 IE 119(HandoverPreparationInformation) 유무가 f1ap_msg 에 없음(ap.h) */
+		break; }
+	case P_UE_CTX_REL_REQ: {
+		struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_UE_CTX_RELEASE_REQ, direction); fill_f1ue(&event, ue_state);
+		event.payload.f1_release.cause_group = f1ap_msg->cause.group; event.payload.f1_release.cause_value = f1ap_msg->cause.value;
+		event.payload.f1_release.cause_present = f1ap_msg->cause.is_present;
+		event.payload.f1_release.cause_group_name = f1ap_msg->cause.group_name; event.payload.f1_release.cause_value_name = f1ap_msg->cause.value_name;
+		emit(obs, &event);
+		break; }
+	case P_UE_CTX_RELEASE:
+		if (f1ap_msg->pdu_type == F1AP_PDU_INITIATING) {   // RELEASE COMMAND
+			/* 명령에 실린 평문 RRCRelease 를 해제 명령 이벤트보다 먼저 냄.
+			 * 집계 층은 '평문 RRCRelease 가 이미 적용돼 RRC 상태가 CONNECTED 가 아님' 을 전제로, 암호 SRB1
+			 * 때문에 suspend 를 못 읽은 경우의 분기를 거름. 명령을 먼저 내면 평문 해제(NEA0 경로)에도 그 분기가
+			 * 걸려 거짓 UNKNOWN 줄이나 잘못된 등급이 나감. 암호(NEA2)면 컨테이너가 OPAQUE 라 RRCRelease 가
+			 * 안 나가고 명령만 나가므로 그 분기가 제대로 걸림. */
+			for (int item_index = 0; item_index < f1ap_msg->rrc_container_count; item_index++)
+				handle_rrc_container(obs, sctp_message, f1ap_msg, ue_state, direction, &f1ap_msg->rrc_containers[item_index]);
+			struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_UE_CTX_RELEASE_CMD, direction); fill_f1ue(&event, ue_state);
+			event.payload.f1_release.cause_group = f1ap_msg->cause.group; event.payload.f1_release.cause_value = f1ap_msg->cause.value;
+			event.payload.f1_release.cause_present = f1ap_msg->cause.is_present;
+			event.payload.f1_release.cause_group_name = f1ap_msg->cause.group_name; event.payload.f1_release.cause_value_name = f1ap_msg->cause.value_name;
+			event.payload.f1_release.has_old_du_ue_id = f1ap_msg->has_old_du_ue_id;
+				/* 어느 SRB 로 왔는지를 컨테이너가 말해 주므로 그대로 옮김. 컨테이너가 있기만 하면 SRB1 로
+				 *   적으면 안 됨 — 이 메시지는 RRCReject 를 SRB0 으로 명시해 싣는 갈래가 있어(TS 38.473 §9.2.2.5)
+				 *   그 경우 이름이 거짓이 됨.
+				 *   여러 개면 첫 컨테이너를 따름 — 이 메시지의 RRC 컨테이너 IE 는 하나뿐임(§9.2.2.5). */
+			event.payload.f1_release.rrc_container_kind = TR_RRC_CONTAINER_NONE;
+			if (f1ap_msg->rrc_container_count > 0)
+				event.payload.f1_release.rrc_container_kind =
+					(f1ap_msg->rrc_containers[0].srb_id == 0) ? TR_RRC_CONTAINER_SRB0 : TR_RRC_CONTAINER_SRB1;
+			emit(obs, &event);
+			// COMMAND 로는 레코드를 지우지 않음. COMPLETE 나 유예 만료에서 정리함
+			ue_state->releasing = true; ue_state->release_cmd_ns = obs->now_ns;
+			return;   // 컨테이너를 이미 처리했으므로 아래 일반 루프를 건너뜀
+		} else {   // RELEASE COMPLETE
+			struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_UE_CTX_RELEASE_COMPLETE, direction); fill_f1ue(&event, ue_state);
+			emit(obs, &event);
+			ue_remove(obs, idx);   // 이제 빈 칸으로 반납. COMPLETE 에서 소멸시킴
+			return;
+		}
+		break;
+	default:
+		break;
+	}
+
+	// RRC 컨테이너 루프. RELEASE COMMAND 의 rrcRelease 는 위에서 따로 처리함
+	for (int item_index = 0; item_index < f1ap_msg->rrc_container_count; item_index++)
+		handle_rrc_container(obs, sctp_message, f1ap_msg, ue_state, direction, &f1ap_msg->rrc_containers[item_index]);
+}
+
