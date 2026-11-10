@@ -256,6 +256,12 @@ struct ngap_msg {
 	int rejected_ie_count;
 	// 담는 IE 가 두 번째 이후로 온 수 (TS 38.413 §10.3.6). 같은 IE 세 번이면 2. 첫 것만 담음 (첫 것이 거부됐어도)
 	int duplicate_ie_count;
+	// IE 번호는 아는데 값 타입이 표와 달라 담지 않은 수
+	//   15.8.0 문법에서는 늘 0 임 - 최상위 IE 컨테이너가 쓰는 IE 번호 150개 전부가 값 타입
+	//   하나씩이라 도달하지 않음(ngap.c ie_take 주석)
+	//   0 이 아니면 상대가 우리보다 새 판이어서 어떤 번호의 타입이 바뀐 것임
+	//   rejected_ie_count 와 합치지 말 것: 저쪽은 '타입은 맞는데 값이 범위 밖' 이라 원인도 대응도 다름
+	int type_mismatch_ie_count;
 
 	// ngap.c 전용 (asn1c 트리, 배열)
 	struct ngap_internal *internal;
