@@ -1701,3 +1701,1384 @@ static void close_setup_complete_unobserved(struct tr *tr, struct tr_ue_record *
 	settle_open_setup(tr, ue_record, SR_SUCCESS);
 }
 
+// ---- 개별 이벤트 처리 ----
+/* on_setup_request: RRCSetupRequest 한 건을 RRC.ConnEstabAtt 에 반영하고 새 F1 UE 레코드를 엶.
+ *   이유: 이 메시지가 수립 시도의 시작점임. 여기서 연 레코드에 뒤따르는 Msg4, Msg5 의 결과가 붙음.
+ *   부작용: 시도 카운터 한 칸 증가(본값 / 제외 / 미상 중 하나), 레코드 초기화, 마감 등록, 표 I 줄 방출 */
+static void on_setup_request(struct tr *tr, const struct obs_event *event)
+{
+	int est_cause = event->payload.setup_request.est_cause;
+	int cell_index = cell_lookup(tr, &event->cell, 1);
+	if (cell_index < 0) return;                       // 셀 모름 -> 세지 않음(필수 IE 지만 방어)
+	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+	enum tr_metric metric = TR_METRIC_RRC_CONN_ESTAB_ATT;
+	// 칸 수는 리터럴로 적지 않고 metrics.h 의 이름표에서 유도한 값을 씀
+	int cause_index = (est_cause >= 0 && est_cause < METRIC_CAUSE_CNT[metric]) ? est_cause : -1;
+
+	/* 진행 중 재요청 판정. 마감 안에 같은 단말(연결, 39비트 식별자)이 다시 요청하면 그 요청은 시도로
+	 *   세지 않고 제외 칸에 넣음.
+	 *   선행 레코드를 강제로 종결하지 않는 이유: F1 단말은 각자 자기 결과로만 닫힘. 제외한 재요청의
+	 *     수립도 결과 하나를 받으므로, 두 F1 단말이 모두 Complete 면 성공은 2 임. 강제 종결하면 선행의
+	 *     완료가 진단 칸으로 새고, 마감으로 서야 할 NoReply 도 사라짐.
+	 *   시도와 성공의 합이 어긋날 수 있는 것은 설계 의도임 - 소프트 불변식(inv_soft_succ_le_att)이
+	 *     합법적으로 경고할 수 있고 그것은 결함이 아님. 같은 du_ue_id 재사용은 아래 open_list_remove 가 막음 */
+	struct sx_key sx_key_probe = { event->assoc_id, event->payload.setup_request.ue_identity39 };
+	uint64_t setup_hash = sx_hash(event->assoc_id, event->payload.setup_request.ue_identity39);
+	uint32_t prev = hash_map_get(&tr->setup_idx, setup_hash, sx_eq, tr, &sx_key_probe);
+	int ongoing = 0;
+	if (prev != UINT32_MAX) {
+		struct tr_ue_record *prev_ue_record = &tr->ue_records[prev];
+		if (prev_ue_record->setup_state == SR_OPEN && event->wallclock_ns < prev_ue_record->deadline_ns)
+			ongoing = 1;
+	}
+	enum overload_decision overload_decision = decide_overload(tr, cause_index >= 0 ? cause_index : 0);
+
+	if (cause_index < 0) {
+		// establishmentCause 는 필수라 보통 없음 - 방어적으로 원인 없는 미상에 넣음
+		cell_record->cc_unknown_nocause[metric]++;
+	} else if (ongoing) {
+		cell_record->cc_excluded[metric][TR_EXCLUDED_ONGOING_SETUP][cause_index]++;
+		if (overload_decision == OVERLOAD_EXCLUDE)
+			cell_record->cc_overlap[metric][cause_index][TR_OVERLAP_ONGOING_AND_OVL_EXCL]++;
+		else if (overload_decision == OVERLOAD_UNKNOWN)
+			cell_record->cc_overlap[metric][cause_index][TR_OVERLAP_ONGOING_AND_OVL_UNKNOWN]++;
+	} else if (overload_decision == OVERLOAD_EXCLUDE) {
+		cell_record->cc_excluded[metric][TR_EXCLUDED_AMF_OVERLOAD][cause_index]++;
+	} else if (overload_decision == OVERLOAD_UNKNOWN) {
+		cell_record->cc_unknown[metric][cause_index]++;
+	} else {
+		cell_record->cc_value[metric][cause_index]++;   // 요청은 평문이라 inferred 는 늘 0 임
+	}
+
+	// 새 F1 UE 레코드. 요청마다 새 du_ue_id 가 옴
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (!ue_record) return;
+	/* 게이지 소속과 세션 플래그를 여기서 전부 비움.
+	 *   이유: ue_lookup 은 같은 du_ue_id 가 다시 오면 memset 없이 기존 레코드를 돌려줌. 수립 요청은
+	 *     연결의 첫 메시지이므로 이 레코드는 '어느 게이지에도 없고 세션 플래그가 0' 인 상태여야 함.
+	 *     정상 재사용은 libobs 가 du_ue_id 재사용마다 교체, 축출, 연결 종료 이벤트를 먼저 내 주어
+	 *     ue_record_free 가 거르므로 지금 동작은 바뀌지 않음. 그 발행에 의존하지 않고 요청 경계에서
+	 *     못박아 libobs 가 바뀌어도 게이지 정합성이 유지되게 함.
+	 *     비우지 않으면 남아 있던 in_conn 이 gauge_enter_conn 의 가드에 막혀 신규 연결이 누락되고 옛
+	 *     셀이 누수됨 - 상시 계수되는 ConnMean, ConnMax 가 손상되므로 INACTIVE 지표가 늘 0 인 것보다
+	 *     영향이 큼. 진행 중 재전송은 이 필드가 전부 0 이라 무영향이고 신규 레코드는 memset 으로 0 임 */
+	open_list_remove(tr, ue_record);
+	gauge_leave_conn(tr, ue_record);
+	gauge_leave_inactive(tr, ue_record);
+	half_open_leave(tr, ue_record);
+	ue_record->est_cell_index = -1;
+	ue_record->has_n2_pair = 0;
+	ue_record->n2_released = 0;
+	ue_record->suspend_resolved = 0;
+	ue_record->rel_had_container = 0;
+	ue_record->rel_inferred = 0;
+	ue_record->conn_inferred = 0;
+	ue_record->path = PATH_SETUP;
+	ue_record->setup_state = SR_OPEN;
+	ue_record->est_cause = est_cause;
+	ue_record->req_cell_index = cell_index;
+	ue_record->att_cell_index = cell_index;   // 시도를 센 셀. 뒤에 셀이 바뀌어도 이 칸은 두어 결과를 같은 셀에 귀속함
+	// RRCSetupRequest 는 새 RRC 연결의 보안 전 CCCH 평문이므로 AS 보안은 NONE 이고 등급은 정확임
+	ue_record->rrc_sec_state = TR_SEC_NONE;
+	ue_record->rrc_sec_quality = TR_QUALITY_EXACT;
+	ue_record->request_time_ns = event->wallclock_ns;
+	ue_record->saw_setup_sent = 0;
+	ue_record->ue_identity39 = event->payload.setup_request.ue_identity39;
+	setup_recompute_deadline(tr, ue_record);
+	open_list_add(tr, ue_record);
+	// 제외한 재요청도 '가장 최근' 이 되어 마감을 뒤로 밀도록 색인을 갱신함
+	hash_map_put(&tr->setup_idx, setup_hash, sx_eq, tr, &sx_key_probe,
+		     (uint32_t)(ue_record - tr->ue_records));
+
+	// 표 I: C-RNTI, S-TMSI 앞부분, RRC 상태, 마지막 RRC 메시지
+	uint32_t changed_mask = 0;
+	if (event->payload.setup_request.crnti) {
+		ue_record->crnti = event->payload.setup_request.crnti;
+		ue_record->has_crnti = 1;
+		changed_mask |= TR_UE_F_CRNTI;
+	}
+	/* 앞부분만 온 경우 48비트 S-TMSI 는 아직 조립 전이고 앞부분 자체는 출력 계약에 없음. 그래서
+	 * stmsi 변경 비트를 켜지 않음 - 값 없는 변경은 허위 신호임. 그 비트는 뒷부분이 와서 실제 48비트가
+	 * 생기는 on_setup_complete 에서 켜짐. 내부 추적 칸은 조립용으로 유지함 */
+	if (event->payload.setup_request.ue_identity_type == TR_UE_IDENTITY_STMSI_PART1) {
+		ue_record->stmsi_part1 = event->payload.setup_request.ue_identity39;
+		ue_record->has_stmsi_part1 = 1;
+	}
+	ue_record->rrc_state = RS_IDLE_PENDING;
+	changed_mask |= TR_UE_F_RRC_STATE;
+	changed_mask |= TR_UE_F_RRC_MSG;   // 마지막 RRC 메시지 값은 emit_ue_line 이 이벤트에서 직접 채움
+	emit_ue_line(tr, ue_record, event, changed_mask, 0);
+}
+
+/* on_rrc_setup: RRCSetup(Msg4) 송신을 레코드에 표시하고 반쯤 열린 연결 창을 시작함.
+ *   이유: 이 시점부터 Msg5 를 기다리므로 마감을 다시 계산해야 하고, 그 창 동안의 연결은 상한에만
+ *     기여해야 함.
+ *   부작용: 마감 재계산, 폴백 경로면 마감 등록, 게이지 이동 */
+static void on_rrc_setup(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (!ue_record) return;
+	/* 선행 요청이 무엇이었는지로 경로를 가름. 이미 폴백 경로가 잡혀 있으면 수립으로 끌어내리지 않음 -
+	 * 요청이 먼저 경로를 기록했다면 그 귀속을 보존함.
+	 * default 를 두지 않음: enum 에 값이 하나 늘면 -Wswitch 가 빌드를 깨 이 곳을 같이 고치게 함 */
+	switch (event->payload.setup.prior_req) {
+	case TR_PRIOR_REEST_FALLBACK:
+		ue_record->path = PATH_REEST_FALLBACK;
+		break;
+	case TR_PRIOR_RESUME_FALLBACK:
+		ue_record->path = PATH_RESUME_FALLBACK;
+		break;
+	case TR_PRIOR_SETUP:
+	case TR_PRIOR_OTHER_OR_UNREADABLE:
+		if (ue_record->path != PATH_REEST_FALLBACK && ue_record->path != PATH_RESUME_FALLBACK)
+			ue_record->path = PATH_SETUP;
+		break;
+	}
+	/* 여기서 마감을 다시 등록하는 것은 폴백 경로뿐임.
+	 *   종결된 수립은 되살리지 않음: 중복, 재전송 RRCSetup 으로 되살리면 뒤이은 RRCSetupComplete 가
+	 *     성공을 한 번 더 세어 성공이 시도를 넘김(재현됨). 정상 수립은 요청에서 이미 열리고 등록됐고
+	 *     du_ue_id 재사용도 요청 핸들러가 다시 열므로 여기서 재개할 일이 없음.
+	 *   폴백은 요청 핸들러가 열기만 하고 마감을 걸지 않아, RRCSetupComplete 가 없을 때 정상 수립과
+	 *     대칭으로 NoReply 를 내려면 폴백 RRCSetup 을 본 지금 걸어야 함. 요청을 못 본 경우(경로가 수립)는
+	 *     걸지 않음 - 시도 없는 NoReply 가 늘어남.
+	 *   폴백의 모든 종결 경로가 마감 목록에서 빼므로 허위 NoReply 가 없고, 순수 재수립, 재개 성공은
+	 *     이 핸들러에 오지 않음. open_list_add 는 멱등이라 중복 RRCSetup 도 안전함 */
+	if (ue_record->setup_state == SR_OPEN
+	    && (ue_record->path == PATH_REEST_FALLBACK || ue_record->path == PATH_RESUME_FALLBACK))
+		open_list_add(tr, ue_record);
+	if (ue_record->req_cell_index < 0 && event->cell.valid)
+		ue_record->req_cell_index = cell_lookup(tr, &event->cell, 1);
+	ue_record->saw_setup_sent = 1;
+	ue_record->setup_sent_time_ns = event->wallclock_ns;
+	setup_recompute_deadline(tr, ue_record);
+	/* 반쯤 열린 창에 들어가기 전에 다른 게이지를 비움.
+	 *   INACTIVE 단말이 요청 유실로 RRCSetup 부터 관측되면 반쯤 열림과 INACTIVE 가 공존해 그 창 동안
+	 *   표본이 두 번 세어짐. 이미 연결 중인 단말에 재전송, 주입 RRCSetup 이 와도 같은 일이 생겨
+	 *   ConnMax, ConnMean 의 상한이 2 로 불어남. 정상 재연결이면 옛 연결을 대체하는 것이 맞고 멱등이며,
+	 *   정상 신규 경로에서는 둘 다 아무것도 하지 않음. 형제 on_setup_request 는 세 게이지를 전부 비움 */
+	gauge_leave_conn(tr, ue_record);
+	gauge_leave_inactive(tr, ue_record);
+	half_open_enter(tr, ue_record, ue_record->req_cell_index);
+}
+
+/* on_setup_complete: RRCSetupComplete(Msg5) 한 건을 RRC.ConnEstabSucc 와 경로 칸에 반영하고 연결
+ *   게이지에 넣음.
+ *   이유: 이 메시지를 받은 것이 수립 성공의 정의임(TS 28.552 §5.1.1.15.2 c).
+ *   부작용: 성공 카운터 또는 경로 칸 증가, 수립 종결, 게이지 진입, 표 I 줄 방출 */
+static void on_setup_complete(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record || ue_record->req_cell_index < 0) return;   // 요청을 못 봐 셀을 모름 -> 세지 않음
+	// 카운터는 시도를 센 셀에 귀속하고, 게이지는 현재 셀을 씀(전사와 SpCell 변경을 반영)
+	int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
+							 : ue_record->req_cell_index;
+	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+	enum tr_metric metric = TR_METRIC_RRC_CONN_ESTAB_SUCC;
+	int cause_index = (ue_record->est_cause >= 0 && ue_record->est_cause < METRIC_CAUSE_CNT[metric])
+			? ue_record->est_cause : -1;
+
+	/* 미상 등급 분기에도 '열린 수립' 가드를 둠. 이미 종결된 시도에 늦게 온 미상 Complete 를 성공으로
+	 * 세면 한 시도가 실패와 성공에 동시에 들어감. 종결된 것은 아래 else 로 떨어져 진단 칸만 올림 -
+	 * 종결된 정확 등급과 같은 처분임. 형제 on_reest_complete, on_resume_complete 는 이미 이 가드를 가짐 */
+	if (event->quality == TR_QUALITY_UNKNOWN && ue_record->setup_state == SR_OPEN) {
+		// 망 공유로 Complete 자체를 보지 못하고 추정한 경우 -> 원인별 미상
+		if (cause_index >= 0) cell_record->cc_unknown[metric][cause_index]++;
+		else cell_record->cc_unknown_nocause[metric]++;
+	} else if (ue_record->setup_state == SR_OPEN && ue_record->path == PATH_SETUP) {
+		/* 본값과 경로 칸을 같이 올림.
+		 *   이 지표는 수립 경로만 원인 칸을 같이 올림. 나머지 경로 칸은 원인 칸을 올리지 않는 성공을
+		 *   따로 세므로 경로 칸의 합과 본값이 같지 않음 - 소비자는 둘을 더하면 안 됨.
+		 *   ConnEstabFailCause 는 반대로 모든 경로가 원인 칸을 올려 두 합이 같음.
+		 *   실측: RRCSetupComplete 6건 = 수립 5 + 재수립 폴백 1 이고 본값은 5 임. 6번째는 요청을
+		 *   뒤따르지 않아 TS 28.552 §5.1.1.15.2 c) "Receipt by the gNB of an RRCSetupComplete message
+		 *   following a RRC connection setup request" 밖이고 수립 원인도 없음 */
+		if (cause_index >= 0) {
+			cell_record->cc_value[metric][cause_index]++;
+			cell_record->path_value[metric][PATH_SETUP]++;
+			/* 구조, 교차 추론으로 얻은 성공은 inferred 밴드로 보냄(exact = 본값 - inferred).
+			 * 지금 libobs 는 Complete 를 늘 정확으로 주어 이 분기는 실행되지 않지만, 집계 층은 어떤
+			 * 등급이 와도 정직하게 갈라야 함. 형제 on_reest_complete, on_resume_complete 와 같은 모양임 */
+			if (event->quality == TR_QUALITY_STRUCT || event->quality == TR_QUALITY_CROSS)
+				cell_record->cc_inferred[metric][cause_index]++;
+		}
+		else cell_record->cc_unknown_nocause[metric]++;
+	} else if (ue_record->setup_state == SR_OPEN && ue_record->path == PATH_REEST_FALLBACK) {
+		cell_record->path_value[metric][PATH_REEST_FALLBACK]++;
+	} else if (ue_record->setup_state == SR_OPEN && ue_record->path == PATH_RESUME_FALLBACK) {
+		cell_record->path_value[metric][PATH_RESUME_FALLBACK]++;
+	} else if ((ue_record->setup_state == SR_NOREPLY || ue_record->setup_state == SR_UNKNOWN)
+		   && event->quality != TR_QUALITY_UNKNOWN) {
+		/* 마감이 지난 뒤 도착한 Msg5. 처분은 늦게 온 Msg5 도 성공으로 세고 이미 센 NoReply 는 그대로
+		 *   두는 것임. TS 28.552 §5.1.1.15.2 c) 가 "Each RRCSetupComplete message received is added to
+		 *   the relevant per establishment cause measurement" 라고 적어 받은 것마다 세라고 함.
+		 *   두 값이 같이 서는 것이 모순이 아님 - NoReply 는 "마감 안에 답이 없었다", 성공은 "Msg5 를
+		 *   받았다" 로 서로 다른 사실이고, 그 시차는 읽는 쪽이 맞춤.
+		 *   종전에는 진단 칸만 올려 끝냈고 그 칸은 검산식과 와이어 둘 다에 없어서, 실제로 받은
+		 *   Complete 11건이 성공 0 으로 나갔음(같은 고정물에서 PDU 간격 300 ms 는 11, 1100 ms 는 0).
+		 *   미상 등급을 이 갈래에서 뺀 이유: 그 등급은 Msg5 를 실제로 보지 못하고 망 공유 정보로
+		 *   추정한 것이라 "받았다" 가 성립하지 않음. 그 경우는 아래 else 로 떨어져 진단 칸만 올림 */
+		cell_record->path_value[metric][PATH_LATE_COMPLETE]++;
+		if (cause_index >= 0) {
+			cell_record->cc_value[metric][cause_index]++;
+			if (event->quality == TR_QUALITY_STRUCT || event->quality == TR_QUALITY_CROSS)
+				cell_record->cc_inferred[metric][cause_index]++;
+		} else {
+			cell_record->cc_unknown_nocause[metric]++;
+		}
+	} else {
+		cell_record->path_value[metric][PATH_OTHER]++;   // 이미 성공으로 닫힘(중복 Complete) 등
+	}
+	settle_open_setup(tr, ue_record, SR_SUCCESS);
+
+	/* 연결 게이지 진입. 그 전에 INACTIVE 를 비움 - 요청을 못 봐 on_setup_request 의 비우기를 건너뛴
+	 * INACTIVE 단말이 Complete 로 연결에 들어오면 한 단말이 두 게이지에 동시 계수되어 상시 계수되는
+	 * ConnMean, ConnMax 가 과대해짐. 정상 경로는 아무것도 하지 않음. 형제 재수립, 재개 완료와 대칭임 */
+	gauge_leave_inactive(tr, ue_record);
+	half_open_leave(tr, ue_record);
+	int level = (event->quality == TR_QUALITY_EXACT) ? LV_EXACT
+			: (event->quality == TR_QUALITY_UNKNOWN ? LV_UNKNOWN : LV_INFERRED);
+	gauge_enter_conn(tr, ue_record, ue_record->req_cell_index, level);
+	ue_record->est_cell_index = ue_record->req_cell_index;   // 수립이 끝난 셀. 해제 계수가 이 칸을 씀
+
+	// 표 I: S-TMSI 조립, RRC CONNECTED
+	uint32_t changed_mask = 0;
+	if (event->payload.setup_complete.has_stmsi48) {
+		ue_record->stmsi48 = event->payload.setup_complete.stmsi48;
+		ue_record->has_stmsi48 = 1;
+		changed_mask |= TR_UE_F_STMSI;
+	}
+	else if (event->payload.setup_complete.has_stmsi_part2 && ue_record->has_stmsi_part1) {
+		ue_record->stmsi48 = ((uint64_t)event->payload.setup_complete.stmsi_part2 << 39)
+				   | (ue_record->stmsi_part1 & 0x7FFFFFFFFFull);
+		ue_record->has_stmsi48 = 1;
+		changed_mask |= TR_UE_F_STMSI;
+	}
+	ue_record->rrc_state = RS_CONNECTED;   // RRCSetupComplete 는 평문 직접 관측이라 등급은 정확임
+	ue_record->conn_inferred = 0;
+	changed_mask |= TR_UE_F_RRC_STATE;
+	changed_mask |= TR_UE_F_RRC_MSG;   // 마지막 RRC 메시지 값은 emit_ue_line 이 이벤트에서 직접 채움
+	// 초기 5GMM 상태. RRCSetupComplete 가 실어 온 초기 NAS 는 AS 보안 전 평문임. 연결모드는 AMF 응답 전이라 IDLE
+	int nas_msg_type = event->payload.setup_complete.nas.msg_type,
+	    nas_reg_type = event->payload.setup_complete.nas.reg_type;
+	if (nas_msg_type == NAS_MM_REGISTRATION_REQUEST) {
+		/* 등록 유형을 못 읽었으면 주상태를 단정하지 않음. 종전엔 -1 이 삼항의 거짓 가지로 떨어져
+		 * DEREGISTERED 가 정확 등급으로 나갔음 - 안 읽은 것을 '읽어서 initial 이었음' 과 같은 모양으로
+		 * 내보내는 확신 있는 오값임. 메시지 종류는 읽었으므로 연결모드는 그대로 둠.
+		 * 등록 유형에 '범위 밖' 은 없음(TS 24.501 §9.11.3.7: 쓰이지 않는 값도 initial registration 으로
+		 * 해석) -> 0 이상이면 전부 단정 가능하고, 이 분기는 '안 읽음' 하나만 가름 */
+		bool reg_type_read = nas_reg_type >= 0;
+		ue_record->nas_reg_state = !reg_type_read ? TR_5GMM_UNKNOWN
+			: ((nas_reg_type == NAS_REG_MOBILITY || nas_reg_type == NAS_REG_PERIODIC
+			    || nas_reg_type == NAS_REG_DISASTER_MOBILITY) ? TR_5GMM_REGISTERED
+									 : TR_5GMM_DEREGISTERED);
+		ue_record->nas_conn_mode = TR_CM_MODE_IDLE;
+		/* 등급은 '무엇을 근거로 그 상태를 적었나' 임. 못 읽어서 미상이면 근거가 없으므로 판정 불가임.
+		 * 구조 등급을 달면 읽는 쪽이 '절차 흐름으로 판정했음' 으로 읽음 */
+		ue_record->nas_state_quality = reg_type_read ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
+		changed_mask |= TR_UE_F_NAS_STATE;
+	} else if (nas_msg_type == NAS_MM_SERVICE_REQUEST || nas_msg_type == NAS_MM_CP_SERVICE_REQUEST) {
+		/* TS 24.501 §4.4.6 이 초기 NAS 로 꼽는 셋 중 둘임. CONTROL PLANE SERVICE REQUEST 도
+		 * 5GMM-REGISTERED 단말만 보냄(§5.6.1.1) */
+		ue_record->nas_reg_state = TR_5GMM_REGISTERED;
+		ue_record->nas_conn_mode = TR_CM_MODE_IDLE;
+		ue_record->nas_state_quality = TR_QUALITY_EXACT;
+		changed_mask |= TR_UE_F_NAS_STATE;
+	}
+	emit_ue_line(tr, ue_record, event, changed_mask, 0);
+}
+
+/* on_reject: RRCReject 를 ConnEstabFailCause[NetworkReject] 로 세고 수립을 닫음.
+ *   부작용: 실패 원인 카운터와 경로 칸 증가, 수립 종결. 열린 수립이 아니면 아무것도 하지 않음 */
+static void on_reject(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	// 실패 원인도 시도를 센 셀에 귀속함. SpCell 이 바뀐 뒤에도 같은 셀이어야 성공 쪽과 대칭이 맞음
+	int cell_index = ue_record ? ((ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
+								: ue_record->req_cell_index) : -1;
+	if (cell_index < 0) return;                             // 요청 셀 모름 -> 세지 않음
+	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+	int path = PATH_OTHER;
+	/* 선행 요청이 무엇이었는지로 경로 칸을 가름. 읽지 못한 경우도 한 칸을 받음.
+	 * default 를 두지 않음: enum 에 값이 하나 늘면 -Wswitch 가 빌드를 깨 이 곳을 같이 고치게 함.
+	 * default 가 있으면 새 값이 조용히 PATH_OTHER 로 섞여 들어감 */
+	switch (event->payload.reject.prior_req) {
+	case TR_PRIOR_SETUP:
+		path = PATH_SETUP;
+		break;
+	case TR_PRIOR_REEST_FALLBACK:
+		path = PATH_REEST_FALLBACK;
+		break;
+	case TR_PRIOR_RESUME_FALLBACK:
+		path = PATH_RESUME_FALLBACK;
+		break;
+	case TR_PRIOR_OTHER_OR_UNREADABLE:
+		path = PATH_OTHER;
+		break;
+	}
+	/* 계수를 '열린 수립' 가드 안에서 함. 종전엔 가드 밖이라 중복, 재전송 RRCReject 가 같은 원인을
+	 * 다시 세거나 이미 성공한 단말을 실패로도 셌음. 형제 실패 원인 생산자는 모두 이 가드를 먼저 함 */
+	if (ue_record->setup_state == SR_OPEN) {
+		cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_NETWORK_REJECT]++;
+		cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][path]++;
+		gauge_leave_inactive(tr, ue_record);   // 폴백으로 다시 열린 INACTIVE 누수 방지(멱등)
+		settle_open_setup(tr, ue_record, SR_NETWORK_REJECT);
+	}
+}
+
+/* on_reest_request: RRCReestablishmentRequest 를 RRC.ReEstabAtt 에 세고 폴백 경로를 표시함.
+ *   이 요청은 SRB0 평문이라 늘 정확하고 제외 칸이 없음 */
+static void on_reest_request(struct tr *tr, const struct obs_event *event)
+{
+	int cell_index = cell_lookup(tr, &event->cell, 1);
+	if (cell_index < 0) return;
+	tr->cell_records[cell_index].cc_value[TR_METRIC_RRC_REESTAB_ATT][0]++;
+	// 폴백 경로를 위해 레코드에 경로와 셀을 심음
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (ue_record) {
+		ue_record->path = PATH_REEST_FALLBACK;
+		ue_record->setup_state = SR_OPEN;
+		ue_record->req_cell_index = cell_index;
+		ue_record->att_cell_index = cell_index;   // 시도를 센 셀
+		ue_record->request_time_ns = event->wallclock_ns;
+		ue_record->est_cause = -1;
+		ue_record->rrc_state = RS_IDLE_PENDING;
+		ue_record->reest_succ_counted = 0;   // 새 재수립 주기 시작이므로 성공 계수 플래그를 리셋함
+	}
+	// 재수립 요청도 RRC 메시지이므로 마지막 RRC 메시지 변경 비트를 켬(형제 on_setup_request 와 대칭)
+	if (ue_record) emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE | TR_UE_F_RRC_MSG, 0);
+}
+
+/* on_reest: RRCReestablishment(허가, DL)를 보고 ReEstabSuccWithUeContext 를 inferred 로 세고 연결
+ *   게이지에 넣음.
+ *   이유: 허가는 평문(TS 38.331 §5.3.7.4, 무결성만)이라 관측 가능한 '컨텍스트 있는 재수립 허가' 임.
+ *     완료는 암호라 가시성 관문에서 막히므로 완료에서는 셀 수 없음. 허가 자체는 평문 정확 디코드지만
+ *     지표의 뜻이 '완료' 이므로 완료는 추론이고, 그래서 정직하게 inferred 에 넣음. 실제로 이 지표는
+ *     늘 inferred 밴드이고 exact 는 0 에 가까움 - 소비자는 exact = 본값 - inferred 로 읽어야 함.
+ *   가드: 이미 실패나 미상으로 종결된 시도에 재전송, 재정렬된 허가가 와도 성공을 덧세지 않음.
+ *     다만 정상 재수립은 허가 '전에' 연결 이전(on_ue_transfer)이 성공으로 올리므로 성공 상태도
+ *     허용해야 함 - 열린 상태만 허용하면 정상 허가가 전부 막혀 이 지표가 다시 0 이 됨(실측).
+ *     경로가 재수립 폴백인 것도 요구함: 성공 상태를 출처 불문 허용하면 수립이나 재개로 성공한
+ *     레코드에 요청 없는 허가가 와도 이 지표를 세어 성공이 시도를 넘김(재현됨). 요청을 못 본
+ *     중간 합류는 시도도 0 이라 세지 않는 쪽이 일관됨.
+ *   부작용: 성공 카운터와 inferred 증가, 수립 종결, 게이지 이동, RRC 상태를 CONNECTED 로 */
+static void on_reest(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (!ue_record) return;
+	ue_record->wait_reest = 1;
+	if (ue_record->req_cell_index < 0 || ue_record->reest_succ_counted
+	    || ue_record->path != PATH_REEST_FALLBACK
+	    || (ue_record->setup_state != SR_OPEN && ue_record->setup_state != SR_SUCCESS)) return;
+	// 시도를 센 셀에 귀속함. 전사로 현재 셀이 옮겨가도 성공이 시도를 넘지 않게 하려는 것임
+	int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
+							 : ue_record->req_cell_index;
+	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+	enum tr_metric metric = TR_METRIC_RRC_REESTAB_SUCC_WITH_CTX;
+	cell_record->cc_value[metric][0]++;   // 본값과 inferred 를 같이 올려 exact 기여는 0 이 됨
+	cell_record->cc_inferred[metric][0]++;
+	ue_record->reest_succ_counted = 1;
+	// 연결 이전이 이미 성공으로 올렸으면 아무것도 하지 않음. 폴백으로 마감이 걸려 있었으면 해제함
+	if (ue_record->setup_state == SR_OPEN) {
+		ue_record->setup_state = SR_SUCCESS;
+		open_list_remove(tr, ue_record);
+	}
+	gauge_leave_inactive(tr, ue_record);   // INACTIVE 였다면 연결 진입 전에 비움(이중 계수 방지)
+	half_open_leave(tr, ue_record);
+	gauge_enter_conn(tr, ue_record, ue_record->req_cell_index, LV_INFERRED);   // 완료 미관측이라 추론 진입
+	ue_record->rrc_state = RS_CONNECTED;
+	ue_record->conn_inferred = 1;   // 허가로 추론한 CONNECTED 이므로 등급은 구조 추론임
+}
+
+/* on_reest_complete: RRCReestablishmentComplete 를 본 경우의 폴백 계수.
+ *   이유: 실가동에서는 이 완료가 암호라 늘 불가독이므로, 이 핸들러는 허가를 못 본 경로(합성, 전면
+ *     가시성)용임.
+ *   계수 규칙: 허가가 이미 inferred 로 셌으면 다시 세지 않음. 종전의 inferred -> exact 승격은 셀
+ *     단위라 주기 경계에서 다른 단말의 추론분을 깎아 엉뚱한 단말을 exact 로 표기했음(재현됨). 게다가
+ *     완료 가독은 실가동에서 도달 불가이므로 승격을 없애고 정직하게 inferred 를 유지함.
+ *     실패나 미상으로 종결된 시도는 세지 않음. 성공 상태를 허용하는 이유와 경로를 요구하는 이유는
+ *     on_reest 와 같음.
+ *   부작용: 성공 카운터 증가, 수립 종결, 게이지 이동, RRC 상태를 CONNECTED 로 */
+static void on_reest_complete(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record || ue_record->req_cell_index < 0) return;
+	int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
+							 : ue_record->req_cell_index;
+	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+	enum tr_metric metric = TR_METRIC_RRC_REESTAB_SUCC_WITH_CTX;
+	if (!ue_record->reest_succ_counted && ue_record->path == PATH_REEST_FALLBACK
+	    && (ue_record->setup_state == SR_OPEN || ue_record->setup_state == SR_SUCCESS)) {
+		if (event->quality == TR_QUALITY_UNKNOWN) cell_record->cc_unknown[metric][0]++;
+		else {
+			cell_record->cc_value[metric][0]++;
+			if (event->quality == TR_QUALITY_STRUCT || event->quality == TR_QUALITY_CROSS)
+				cell_record->cc_inferred[metric][0]++;
+		}
+		ue_record->reest_succ_counted = 1;
+	}
+	ue_record->wait_reest = 0;
+	// 실패로 종결된 뒤면 게이지와 상태를 건드리지 않음(종결된 레코드를 되살리지 않음)
+	if (ue_record->setup_state != SR_OPEN && ue_record->setup_state != SR_SUCCESS) return;
+	settle_open_setup(tr, ue_record, SR_SUCCESS);
+	/* 게이지 진입. 정상 경로는 연결 이전에서 이미 들어가 있어 멱등으로 아무 일도 없고, 허가가 먼저
+	 * 추론 밴드로 들어갔으면 그대로 둠. 이전을 못 본 경우에만 실제로 진입함 */
+	gauge_leave_inactive(tr, ue_record);
+	half_open_leave(tr, ue_record);
+	{
+		int level = (event->quality == TR_QUALITY_EXACT) ? LV_EXACT
+				: (event->quality == TR_QUALITY_UNKNOWN ? LV_UNKNOWN : LV_INFERRED);
+		gauge_enter_conn(tr, ue_record, ue_record->req_cell_index, level);
+	}
+	ue_record->rrc_state = RS_CONNECTED;
+	ue_record->conn_inferred = (event->quality != TR_QUALITY_EXACT);   // 평문 완료 관측이면 정확, 추론이면 구조
+}
+
+/* on_initial_ul: INITIAL UL RRC MESSAGE TRANSFER 한 건을 UE 컨텍스트 게이지와 두 계수기에 반영함.
+ *   이유: 이 세 값은 메시지 안의 RRC 가 무엇인지, 풀렸는지와 무관하게 '메시지마다 1' 임. RRC
+ *     핸들러에 얹으면 디코드 실패분이 빠져 과소가 됨.
+ *   부작용: UE 컨텍스트 게이지 진입(멱등), 최대값, 메시지 수, DU-to-CU 컨테이너 없는 수 갱신 */
+static void on_initial_ul(struct tr *tr, const struct obs_event *event)
+{
+	int cell_index = cell_lookup(tr, &event->cell, 1);
+	if (cell_index < 0) return;   // 셀 모름 -> 세지 않음(필수 IE 지만 방어, on_setup_request 와 대칭)
+	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+	cell_record->initial_ul_count++;
+	if (!event->payload.initial_ul.has_du_to_cu_rrc_container) cell_record->no_du_to_cu_count++;
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (ue_record) ue_context_enter(tr, ue_record, cell_index);
+}
+
+// on_resume_request: RRCResumeRequest 를 RRC.ResumeAtt 에 세고 재개 폴백 경로를 표시함
+static void on_resume_request(struct tr *tr, const struct obs_event *event)
+{
+	int cell_index = cell_lookup(tr, &event->cell, 1);
+	if (cell_index < 0) return;
+	int resume_cause = event->payload.resume_request.resume_cause;
+	// 칸 수는 리터럴로 적지 않고 metrics.h 의 이름표에서 유도한 값을 씀
+	int cause_index = (resume_cause >= 0
+			   && resume_cause < METRIC_CAUSE_CNT[TR_METRIC_RRC_RESUME_ATT]) ? resume_cause : -1;
+	if (cause_index >= 0)
+		tr->cell_records[cell_index].cc_value[TR_METRIC_RRC_RESUME_ATT][cause_index]++;
+	else tr->cell_records[cell_index].cc_unknown_nocause[TR_METRIC_RRC_RESUME_ATT]++;
+	/* 'INACTIVE 를 쓰지 않는 망' 이라는 전제가 깨졌음을 알리는 증거 하나.
+	 *   재개 요청은 저장된 INACTIVE 컨텍스트가 있다는 뜻이고 이 신호는 암호 구간에서도 평문임. 그래서
+	 *   그 전제를 켠 배치에서 재개 요청이 보이면 전제가 깨진 것임.
+	 *   종전엔 증거 셋 중 평문 suspendConfig 하나만 경보를 올려, 재개 요청만 보이는 배치에서는 전제
+	 *   위반을 알리지 않고 해제 쪽 구조 추론을 계속 적용했음 - 조용한 오값임 */
+	if (tr->tr_cfg.assume_no_inactive) tr->inactive_alarm_count++;
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (ue_record) {
+		ue_record->path = PATH_RESUME_FALLBACK;
+		ue_record->setup_state = SR_OPEN;
+		ue_record->req_cell_index = cell_index;
+		ue_record->att_cell_index = cell_index;   // 시도를 센 셀
+		ue_record->resume_cause_pending = resume_cause;
+		ue_record->rrc_state = RS_IDLE_PENDING;
+		ue_record->resume_succ_counted = 0;   // 새 재개 주기 시작이므로 성공 계수 플래그를 리셋함
+	}
+}
+
+/* on_resume_complete: RRCResumeComplete 를 RRC.ResumeSucc 에 세고 INACTIVE 에서 연결로 옮김.
+ *   원인은 평문 SRB0 요청에서 알려지므로 완료가 암호여서 등급이 미상이어도 원인별 미상 칸에 셈.
+ *     원인 자체를 모를 때(요청 미관측)만 원인 없는 미상으로 감. 종전엔 미상 등급을 원인 미상과 묶어
+ *     원인이 알려진 재개까지 원인 없는 칸으로 흘려 원인별 미상이 항상 0 이었음.
+ *   가드 셋: 중복 완료 이중 계수 금지, 경로가 재개 폴백일 것, 실패나 미상으로 종결된 시도에 성공을
+ *     덧세지 않을 것. 성공 상태를 허용하는 이유는 on_reest 와 같음. 종전엔 셀 색인만 검사해 중복,
+ *     실패 뒤, 엉뚱한 완료가 전부 계수됐음.
+ *   부작용: 성공 카운터 증가, 수립 종결, 게이지 이동, RRC 상태를 CONNECTED 로 */
+static void on_resume_complete(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record || ue_record->req_cell_index < 0) return;
+	int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
+							 : ue_record->req_cell_index;
+	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+	enum tr_metric metric = TR_METRIC_RRC_RESUME_SUCC;
+	int resume_cause_pending = ue_record->resume_cause_pending;
+	int cause_index = (resume_cause_pending >= 0
+			   && resume_cause_pending < METRIC_CAUSE_CNT[metric]) ? resume_cause_pending : -1;
+	if (!ue_record->resume_succ_counted && ue_record->path == PATH_RESUME_FALLBACK
+	    && (ue_record->setup_state == SR_OPEN || ue_record->setup_state == SR_SUCCESS)) {
+		if (cause_index < 0) cell_record->cc_unknown_nocause[metric]++;
+		else if (event->quality == TR_QUALITY_UNKNOWN)
+			cell_record->cc_unknown[metric][cause_index]++;
+		else {
+			cell_record->cc_value[metric][cause_index]++;
+			if (event->quality == TR_QUALITY_STRUCT || event->quality == TR_QUALITY_CROSS)
+				cell_record->cc_inferred[metric][cause_index]++;
+		}
+		ue_record->resume_succ_counted = 1;
+	}
+	// 실패로 종결된 뒤면 게이지와 상태를 건드리지 않음(형제 on_reest_complete 와 대칭)
+	if (ue_record->setup_state != SR_OPEN && ue_record->setup_state != SR_SUCCESS) return;
+	settle_open_setup(tr, ue_record, SR_SUCCESS);
+	// INACTIVE 게이지에서 빼고 연결 게이지로 옮김
+	gauge_leave_inactive(tr, ue_record);
+	half_open_leave(tr, ue_record);
+	int level = (event->quality == TR_QUALITY_EXACT) ? LV_EXACT
+			: (event->quality == TR_QUALITY_UNKNOWN ? LV_UNKNOWN : LV_INFERRED);
+	gauge_enter_conn(tr, ue_record, ue_record->req_cell_index, level);
+	ue_record->rrc_state = RS_CONNECTED;
+	ue_record->conn_inferred = (event->quality != TR_QUALITY_EXACT);   // 평문 완료 관측이면 정확, 추론이면 구조
+}
+
+/* on_release: 평문 RRCRelease 를 보고 RRC.RelWithoutSuspendConfig 를 세거나 INACTIVE 로 옮김.
+ *   suspendConfig 가 없으면 완전 해제이므로 셈. 있으면 단말이 INACTIVE 로 가므로 세지 않고 게이지만
+ *     옮김. 암호라 못 읽었으면 'INACTIVE 를 쓰지 않는 망' 전제가 켜져 있을 때만 구조 추론으로 셈.
+ *   부작용: 해제 카운터 또는 미상 칸 증가, 근거 수 갱신, 게이지 이동, 표 I 줄 방출 */
+static void on_release(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (ue_record) {
+		ue_record->suspend_resolved = 1;   // 평문으로 읽어 suspend 를 판정했으므로 추론이 필요 없음
+		/* Complete 를 놓친 채(열린 수립, 마감 등록됨) RRCRelease 를 보면 - 캡처 1패킷 유실로 도달
+		 * 가능 - RRCRelease 는 수립된 연결을 푸는 것이므로 연결은 성립했음. 그래서 열린 수립을 닫아
+		 * 마감을 풀고 반쯤 열림을 비움. 안 하면 뒤에 마감이 허위 NoReply 를 발화하고 반쯤 열림이
+		 * 누수됨. 형제 종결 핸들러는 모두 이 가드를 하는데 여기만 빠져 있었음 */
+		close_setup_complete_unobserved(tr, ue_record);
+	}
+	enum tr_metric metric = TR_METRIC_RRC_REL_WITHOUT_SUSPEND;
+	int suspend = event->payload.release.suspend;
+	int count_it = 0, inferred = 0;
+	if (suspend == TR_SUSPEND_NO) { count_it = 1; inferred = (event->quality != TR_QUALITY_EXACT); }
+	else if (suspend == TR_SUSPEND_UNKNOWN && tr->tr_cfg.assume_no_inactive) {
+		count_it = 1;   // 못 읽었지만 전제가 켜져 있으므로 구조 추론으로 셈
+		inferred = 1;
+	}
+	else if (suspend == TR_SUSPEND_YES) {
+		// 평문 suspendConfig 를 봤으면 망이 INACTIVE 를 쓴다는 뜻이므로 전제 위반 경보를 올림
+		if (tr->tr_cfg.assume_no_inactive) tr->inactive_alarm_count++;
+		/* suspendConfig 가 있으면 단말은 INACTIVE 로 감. 완전 해제가 아니므로 세지 않음.
+		 * 연결 게이지에서 먼저 뺀 뒤 INACTIVE 게이지로 옮김 - 순서가 어긋나면 ConnMean, ConnMax 가
+		 * 과대해짐. 그 게이지는 재개 완료나 레코드 해제에서 빠짐 */
+		if (ue_record) {
+			gauge_leave_conn(tr, ue_record);
+			half_open_leave(tr, ue_record);
+			ue_record->rrc_state = RS_INACTIVE;
+			ue_record->rel_inferred = 0;   // 평문 직접 관측이므로 남아 있던 추론 표시를 지움
+			int release_cell = ue_record->est_cell_index >= 0 ? ue_record->est_cell_index
+									 : ue_record->req_cell_index;
+			/* 들어갈 밴드를 가르는 것은 '그 단말의 소멸을 관측할 수 있는가' 하나임.
+			 *   suspend 를 읽었다는 것 자체가 DCCH 가시성 관문을 통과했다는 뜻이므로 암호가 아닌 것은
+			 *   이미 확인된 것임(암호면 libobs 가 미상으로 줌). 남은 판별자는 N2 와의 매칭 유무임.
+			 *   매칭이 있으면 그 N2 의 NG 해제를 on_ng_release_cmd 가 받아 게이지에서 빼므로 모집단을
+			 *   정확히 추적할 수 있어 정확 밴드임. 매칭이 없으면 소멸을 관측할 수 없어 레코드 해제까지
+			 *   남으므로 과대 계수를 막기 위해 미상 밴드(정직한 상한)에 넣음.
+			 *   이 선택은 on_ng_release_cmd 의 빼기와 한 묶음으로만 뜻이 성립함 */
+			int inactive_level = ue_record->has_n2_pair ? LV_EXACT : LV_UNKNOWN;
+			gauge_enter_inactive(tr, ue_record, release_cell, inactive_level);
+			// CONNECTED 에서 INACTIVE 로 가는 전이 줄. 평문 RRCRelease 는 관측된 RRC 메시지임
+			emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE | TR_UE_F_RRC_MSG, 0);
+		}
+		return;
+	} else {
+		// 전제가 꺼져 있고 암호라 못 읽음 -> 미상
+		int cell_index = ue_record ? (ue_record->est_cell_index >= 0 ? ue_record->est_cell_index
+									: ue_record->req_cell_index)
+					   : cell_lookup(tr, &event->cell, 0);
+		if (cell_index >= 0) tr->cell_records[cell_index].cc_unknown[metric][0]++;
+		// 상태는 불확정이지만 RRCRelease 는 관측된 RRC 메시지이므로 줄은 냄
+		if (ue_record) emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_MSG, 0);
+		return;
+	}
+	if (count_it) {
+		// 보고 헤더가 내는 근거 수. 평문 관측과 추론을 따로 셈
+		if (inferred) tr->release_basis_assumed_count++;
+		else tr->release_basis_observed_count++;
+		int target_cell = ue_record ? ue_record->est_cell_index : -1;   // 수립이 끝난 셀에 귀속함
+		if (target_cell >= 0) {
+			tr->cell_records[target_cell].cc_value[metric][0]++;
+			if (inferred) tr->cell_records[target_cell].cc_inferred[metric][0]++;
+		}
+		else {                                      // 수립 셀 모름 -> 제외 칸
+			int cell_index = ue_record ? ue_record->req_cell_index
+						   : cell_lookup(tr, &event->cell, 0);
+			if (cell_index >= 0)
+				tr->cell_records[cell_index]
+					.cc_excluded[metric][TR_EXCLUDED_EST_CELL_UNKNOWN][0]++;
+		}
+		/* 등급: 추론으로 센 해제는 교차 추론, 평문 관측은 정확임. 종전엔 추론일 때만 1 을 넣어
+		 * 평문 관측에서 옛 값이 남아 정확한 해제가 추론 등급으로 나갔음 - 늘 대입하게 고침 */
+		if (ue_record) {
+			ue_record->rrc_state = RS_RELEASED;
+			ue_record->rel_inferred = inferred;
+		}
+	}
+	// RELEASED 또는 미계수 미상으로 가는 전이 줄(평문 RRCRelease)
+	if (ue_record) emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE | TR_UE_F_RRC_MSG, 0);
+}
+
+/* on_ctx_release_cmd: UE CONTEXT RELEASE COMMAND 를 보고 열린 수립을 실패로 닫고 RRC 상태를 정함.
+ *   게이지는 여기서 빼지 않음 - 이탈의 원천만 기록하고 감소는 COMPLETE 에서 함. libobs 가 유예 시간
+ *     만료 때 COMPLETE 를 합성해 주므로 늘 COMPLETE 가 옴.
+ *   부작용: 실패 원인 카운터 증가, 수립 종결, RRC 상태 갱신, 표 I 줄 방출 */
+static void on_ctx_release_cmd(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record) return;
+	// 해제 명령에 RRC 컨테이너가 있었는지만 봄. SRB 번호는 보지 않음
+	if (event->payload.f1_release.rrc_container_kind != TR_RRC_CONTAINER_NONE)
+		ue_record->rel_had_container = 1;
+	// 열린 수립이면 CU 가 먼저 끊은 것임. RRCSetup 을 봤으면 NoReply, 그 전이면 Other
+	if (ue_record->setup_state == SR_OPEN) {
+		int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
+								 : ue_record->req_cell_index;
+		int terminal = SR_OPEN;   // 셀을 모르면 계수할 수 없으므로 상태는 그대로 두고 마감만 해제함
+		if (cell_index >= 0) {
+			struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+			int fail_cause = ue_record->saw_setup_sent ? FC_NOREPLY : FC_OTHER;
+			cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][fail_cause]++;
+			cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][ue_record->path]++;
+			terminal = ue_record->saw_setup_sent ? SR_NOREPLY : SR_OTHER;
+		}
+		settle_open_setup(tr, ue_record, terminal);
+	}
+	/* 여기 CONNECTED 로 남은 것은 두 경우뿐임. 평문 RRCRelease 는 on_release 가 이미 상태를 잡아
+	 *   걸러짐.
+	 *   RRC 컨테이너가 없는 해제 명령이면 완전 해제가 확실하므로 RELEASED 에 정확 등급임.
+	 *   컨테이너가 있으나 암호라 suspend 를 못 읽었으면, 전제가 켜져 있을 때만 RELEASED 로 구조 추론
+	 *   하고 꺼져 있으면 미상으로 둠. 종전엔 둘을 구분하지 않고 RELEASED 에 정확 등급으로 과신해
+	 *   암호 해제를 '정확한 해제' 로 내보냈음 */
+	if (ue_record->rrc_state != RS_CONNECTED)
+		return;
+	if (ue_record->rel_had_container) {
+		if (tr->tr_cfg.assume_no_inactive) {
+			ue_record->rrc_state = RS_RELEASED;
+			ue_record->rel_inferred = 1;
+		}
+		else ue_record->rrc_state = RS_UNKNOWN;   // 정직하게 판정 불가로 둠
+	} else {
+		ue_record->rrc_state = RS_RELEASED;
+		ue_record->rel_inferred = 0;   // 컨테이너 없음 -> 정확. 남아 있던 추론 표시를 지움
+	}
+	emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE, 0);
+}
+
+/* on_ctx_release_complete: UE CONTEXT RELEASE COMPLETE 로 게이지에서 빼고 레코드를 회수함.
+ *   암호 구간에서 suspend 를 못 읽었을 때 여기서 한 번 더 추론함: 해제 명령에 컨테이너가 있었고
+ *     N2 와 매칭돼 있으면, 명령과 완료 사이에 그 N2 의 NG 해제가 왔으면 완전 해제로 보고 세고, 안
+ *     왔으면 NG 연결이 유지된 것이므로 suspend 로 보고 INACTIVE 로 둠(세지 않음).
+ *     표준 순서상 완전 해제에서는 NG 해제가 F1 해제보다 먼저 와 그 표시가 제때 섬.
+ *   부작용: 해제 카운터 증가 가능, 게이지 감소, 연결모드 갱신, 닫힘 줄 방출, 레코드 회수 */
+static void on_ctx_release_complete(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record) return;
+	// 닫힘 줄의 변경 비트는 이 핸들러가 실제로 바꾼 칸만 실음
+	int rrc_state_before = ue_record->rrc_state, nas_conn_mode_before = ue_record->nas_conn_mode;
+	if (ue_record->setup_state == SR_OPEN) {
+		// 명령을 못 본 채 완료가 옴 -> 원인 없는 미상
+		int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
+								 : ue_record->req_cell_index;
+		if (cell_index >= 0)
+			tr->cell_records[cell_index]
+				.cc_unknown_nocause[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE]++;
+		settle_open_setup(tr, ue_record, SR_UNKNOWN);
+	}
+	gauge_leave_conn(tr, ue_record);     // 게이지 감소는 명령이 아니라 완료에서 함
+	half_open_leave(tr, ue_record);
+	/* N2 와 매칭된 경우에만 추론함. 매칭이 없으면 추론을 금지하고 명령 핸들러가 남긴 미상을 유지함 -
+	 * F1 만 보이는 캡처에서 허위 INACTIVE 를 만들지 않으려는 것임. 암호 INACTIVE 의 게이지 기여는
+	 * 판정이 늦어 관측할 수 없고 그것이 암호 구간의 한계임 */
+	if (!ue_record->suspend_resolved && ue_record->rel_had_container && ue_record->has_n2_pair) {
+		ue_record->rel_inferred = 1;   // 아래 상태는 평문 관측이 아니라 추론이므로 교차 등급임
+		enum tr_metric metric = TR_METRIC_RRC_REL_WITHOUT_SUSPEND;
+		if (ue_record->n2_released) {        // 창 안에 NG 해제가 옴 -> 완전 해제 -> 추론 계수
+			if (ue_record->est_cell_index >= 0) {
+				tr->cell_records[ue_record->est_cell_index].cc_value[metric][0]++;
+				tr->cell_records[ue_record->est_cell_index].cc_inferred[metric][0]++;
+			}
+			else if (ue_record->req_cell_index >= 0)
+				tr->cell_records[ue_record->req_cell_index]
+					.cc_excluded[metric][TR_EXCLUDED_EST_CELL_UNKNOWN][0]++;
+			ue_record->rrc_state = RS_RELEASED;
+		} else {                     // NG 연결 유지 -> suspend 추론 -> INACTIVE(세지 않음)
+			ue_record->rrc_state = RS_INACTIVE;
+		}
+	}
+	/* 컨텍스트 해제 완료이므로 연결모드는 IDLE 로 감. 등록 상태는 유지함 - 정상 해제 뒤에도 등록은
+	 * 남을 수 있음. 다만 INACTIVE 는 N2 와 NAS 연결이 유지되어 연결모드가 CONNECTED 이므로 강제로
+	 * IDLE 로 내리지 않음 */
+	if (ue_record->nas_conn_mode == TR_CM_MODE_CONNECTED && ue_record->rrc_state != RS_INACTIVE)
+		ue_record->nas_conn_mode = TR_CM_MODE_IDLE;
+	uint32_t changed_mask = 0;
+	if (ue_record->rrc_state != rrc_state_before) changed_mask |= TR_UE_F_RRC_STATE;
+	if (ue_record->nas_conn_mode != nas_conn_mode_before)   changed_mask |= TR_UE_F_NAS_STATE;
+	emit_ue_line(tr, ue_record, event, changed_mask, 1);
+	ue_record_free(tr, ue_record);
+}
+
+/* drain_assoc: 한 연결에 속한 모든 UE 를 닫음. 전수 스캔이라 비용이 UE 수에 비례함.
+ *   전체 범위 RESET 과 F1 SETUP 에서만 씀 - libobs 가 그 둘을 UE 별이 아니라 연결당 한 번만 보내기
+ *     때문임. SCTP 연결 종료는 libobs 가 UE 별로 하나씩 보내므로 on_assoc_end 가 UE 하나씩 처리함.
+ *     일부 범위 RESET 은 목록이 가리킨 UE 만 닫으므로 여기로 오지 않음 */
+static void drain_assoc(struct tr *tr, uint32_t assoc_id, int as_other)
+{
+	for (uint32_t i = 0; i < tr->ue_count; i++) {
+		struct tr_ue_record *ue_record = &tr->ue_records[i];
+		if (!ue_record->used || ue_record->assoc_id != assoc_id) continue;
+		if (as_other) close_setup_other(tr, ue_record);
+		teardown_all_gauges(tr, ue_record);
+		ue_record_free(tr, ue_record);
+	}
+}
+
+/* on_reset: F1AP RESET 또는 F1 SETUP 이 가리킨 UE 를 닫음.
+ *   TS 38.473 §8.2.1.2.1 "release all allocated resources on F1 ... related to the UE association(s)
+ *   indicated explicitly or implicitly in the RESET message and remove the indicated UE contexts".
+ *   F1 SETUP 도 같은 조항으로 묶는 근거는 §8.2.3.1 - "This procedure also re-initialises the F1AP
+ *   UE-related contexts (if any) and erases all related signalling connections in the two nodes
+ *   like a Reset procedure would do". 범위를 가르는 것은 libobs 이고(그쪽만 gNB-DU ID 를 앎) 여기는
+ *   이벤트가 실어 온 범위를 그대로 적용함.
+ *   전체 범위는 그 연결 전부, 일부 범위는 목록이 가리킨 UE 만임(목록이 비면 닫을 것이 없음).
+ *   같은 조항이 "shall use the gNB-CU UE F1AP ID IE and/or the gNB-DU UE F1AP ID IE" 라고 적어
+ *   항목에 CU 번호만 실릴 수 있는데, 우리 색인은 (연결, DU 번호)뿐이라 그런 항목은 못 가리킴.
+ *   못 가리킨 것을 '전체' 로 넓히면 CU 가 유지한 멀쩡한 UE 까지 닫혀 지표가 과소 계수됨 -
+ *   그래서 닫지 않고 셈. 그 UE 는 게이지에 남아 과대 계수되지만, 센 수가 그 사실을 말해 줌.
+ *   부작용: 닫은 UE 마다 진행 중 수립을 Other 로 마감하고 게이지에서 뺌 */
+static void on_reset(struct tr *tr, const struct obs_event *event)
+{
+	if (event->payload.reset.scope == TR_SCOPE_ALL) {
+		drain_assoc(tr, event->assoc_id, 1);           // 결과를 모르는 실패로 닫음
+		return;
+	}
+	/* 경계 검사: 집계 엔진은 libobs 를 믿지 않음(이벤트만 아는 계층이므로 들어온 값으로 판단함).
+	 *   개수가 음수면 0 으로 보고, 목록이 없는데 개수가 있으면 가리키지 못한 것으로 셈 -
+	 *   조용히 지나가면 "RESET 이 아무도 안 가리켰음" 과 같은 모양이 됨(값을 담지 않고 그 수를 셈) */
+	int listed_count = event->payload.reset.ue_count > 0 ? event->payload.reset.ue_count : 0;
+	int overflow_count = event->payload.reset.ue_overflow_count > 0
+			   ? event->payload.reset.ue_overflow_count : 0;
+	tr->reset_unresolved_count += (uint32_t)overflow_count;
+	if (!event->payload.reset.ues) {
+		tr->reset_unresolved_count += (uint32_t)listed_count;
+		return;
+	}
+	for (int ue_index = 0; ue_index < listed_count; ue_index++) {
+		const struct tr_reset_ue *reset_ue = &event->payload.reset.ues[ue_index];
+		struct tr_ue_record *ue_record = ue_lookup(tr, &reset_ue->f1ue, 0, event->assoc_id);
+		if (!ue_record) {
+			// libobs 가 못 찾았거나(CU 번호만 온 항목) 우리에게 레코드가 없음. 둘 다 '가리키지 못함' 임
+			tr->reset_unresolved_count++;
+			continue;
+		}
+		close_setup_other(tr, ue_record);
+		teardown_all_gauges(tr, ue_record);
+		ue_record_free(tr, ue_record);
+	}
+}
+
+/* on_assoc_end: SCTP 연결 종료로 그 UE 를 닫고 AMF 레코드를 회수함.
+ *   libobs 는 이 연결의 F1 UE 마다 하나씩 보내므로 이벤트가 가리키는 UE 하나만 처리함. 종전엔 전수
+ *     스캔을 UE 수만큼 반복해, 위조 ABORT 로 정리 비용이 UE 수의 제곱까지 늘었음. 식별 없는 벌크
+ *     종료는 지금 libobs 가 보내지 않지만 대비로 전수 스캔을 남김 */
+static void on_assoc_end(struct tr *tr, const struct obs_event *event)
+{
+	if (event->f1ue.valid) {
+		struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+		if (ue_record) {
+			close_setup_other(tr, ue_record);
+			teardown_all_gauges(tr, ue_record);
+			ue_record_free(tr, ue_record);
+		}
+	} else {
+		drain_assoc(tr, event->assoc_id, 1);
+	}
+	/* 끊긴 AMF 의 과부하 상태가 영구히 남아 과부하 판정이 썩는 것을 막고 표 크기도 묶음. F1 경로라
+	 * 보통 AMF 키와 연결이 맞지 않아 아무 일도 없지만 대칭으로 불러 둠 - 실제 N2 회수는 디스패치의
+	 * N2 분기가 담당함 */
+	amf_drop_assoc(tr, event->assoc_id);
+}
+
+// on_ue_replaced: 같은 du_ue_id 가 다시 쓰여 옛 레코드를 닫음
+static void on_ue_replaced(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record) return;
+	close_setup_other(tr, ue_record);
+	teardown_all_gauges(tr, ue_record);
+	/* 번호 재사용은 해제 명령 없이 끝나는 것이므로 미상으로 닫음. RELEASED 와 INACTIVE 는 유지함 -
+	 * 끝 신호가 RRC 결과를 알려 주지 않기 때문임. 종전엔 CONNECTED, 수립 대기 상태를 그대로 둬
+	 * 닫힘 줄이 과신이었음. 바뀌면 변경 비트에 RRC 상태를 실음 */
+	uint32_t changed_mask = 0;
+	if (ue_record->rrc_state != RS_RELEASED && ue_record->rrc_state != RS_INACTIVE
+	    && ue_record->rrc_state != RS_UNKNOWN) {
+		ue_record->rrc_state = RS_UNKNOWN;
+		changed_mask |= TR_UE_F_RRC_STATE;
+	}
+	emit_ue_line(tr, ue_record, event, changed_mask, 1);
+	ue_record_free(tr, ue_record);
+}
+
+/* on_ue_evicted: 우리 쪽 레코드 상한으로 UE 를 버림. 수립 실패가 아니라 관측 한계임.
+ *   게이지나 반쯤 열림에 실제로 들어 있던 UE 가 축출될 때만 그 주기의 표본 상한을 무효화함. 이미
+ *     결과가 난 레코드의 축출은 상한을 건드리지 않음 */
+static void on_ue_evicted(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record) return;
+	int was_in_gauge = ue_record->in_conn || ue_record->in_inactive || ue_record->half_open;
+	// 무효화할 셀은 그 UE 가 실제로 기여 중인 게이지의 셀임
+	int cell_index = ue_record->in_conn ? ue_record->conn_cell_index
+			 : (ue_record->in_inactive ? ue_record->inactive_cell_index
+						  : (ue_record->half_open ? ue_record->half_open_cell_index
+									  : ue_record->req_cell_index));
+	gauge_leave_conn(tr, ue_record);
+	half_open_leave(tr, ue_record);
+	open_list_remove(tr, ue_record);
+	if (was_in_gauge && cell_index >= 0) tr->cell_records[cell_index].evicted_this_period = 1;
+	tr->lost_evicted_count++;
+	ue_record_free(tr, ue_record);
+}
+
+/* on_ue_transfer: 재수립 수락으로 옛 F1 UE 의 연결과 표 I 값을 새 레코드로 넘김.
+ *   이유: 재수립 수락은 새 연결이 아니라 연결의 '이전' 임. 게이지 수치는 유지되어야 하고, 표 I 의
+ *     관측값도 새 레코드에서 되살아나야 함.
+ *   순서: 새 레코드를 먼저 만듬 - 생성이 배열을 재배치할 수 있어 옛 포인터는 그 뒤에 얻어야 함.
+ *   부작용: 게이지 소유권 이전, 표 I 값 복사, 옛 레코드 회수, 수립 종결 */
+static void on_ue_transfer(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *new_ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (!new_ue_record) return;
+	struct tr_f1ue old_f1ue = event->f1ue;
+	old_f1ue.du_ue_id = event->payload.ue_transfer.old_du_ue_id;
+	// 생성하지 않으므로 배열 재배치가 없고 위에서 얻은 포인터가 유효함
+	struct tr_ue_record *old_ue_record = ue_lookup(tr, &old_f1ue, 0, event->assoc_id);
+	/* 이어지는 연결이 놓이는 셀은 이 전송이 일어난 셀임(libobs 가 추적하는 현재 셀). 정상 재수립에서는
+	 * 재수립 요청 셀과 같음. 새 레코드 자신의 옛 수립 셀이 아님 - du_ue_id 재사용 같은 경우엔 둘이
+	 * 다를 수 있음. 셀을 모르면 옛 셀을 유지함. 셀 조회는 셀 배열만 재배치하므로 UE 포인터는 안전함 */
+	int target_cell_index = event->cell.valid ? cell_lookup(tr, &event->cell, 1) : -1;
+	if (old_ue_record && old_ue_record != new_ue_record) {
+		/* 목적지가 이미 게이지에 있으면 그 기여를 먼저 비운 뒤 옛 상태를 넘겨받음 - du_ue_id 재사용과
+		 * 이전 해제 유실이 겹친 경우임. 안 비우면 목적지의 옛 1 이 고아가 되어 그 셀 게이지가 영영
+		 * 빠지지 않아 ConnMean, ConnMax 가 과대해짐. 신규 레코드면 세 호출 모두 아무 일도 하지 않음 */
+		gauge_leave_conn(tr, new_ue_record);
+		half_open_leave(tr, new_ue_record);
+		gauge_leave_inactive(tr, new_ue_record);
+		if (old_ue_record->in_conn) {                 // 소유권 이전이므로 수치는 유지함
+			new_ue_record->in_conn = 1;
+			new_ue_record->conn_level = old_ue_record->conn_level;
+			new_ue_record->conn_cell_index = old_ue_record->conn_cell_index;
+			old_ue_record->in_conn = 0;
+			/* 전송 셀이 옛 연결 셀과 다르면 1 을 옛 셀에서 전송 셀로 옮김(한쪽 -1, 다른쪽 +1 이라
+			 * 합은 보존됨). 같은 셀이면 아무 일도 하지 않으므로 단일 셀 배치는 무영향임 */
+			conn_move_cell(tr, new_ue_record,
+				       (target_cell_index >= 0) ? target_cell_index
+								: old_ue_record->conn_cell_index);
+		}
+		if (old_ue_record->est_cell_index >= 0)
+			new_ue_record->est_cell_index = old_ue_record->est_cell_index;
+		// 시도를 센 셀도 넘김. 옛 레코드에서 요청을 봤다면 새 레코드의 성공이 그 셀에 귀속되어야 함
+		if (old_ue_record->att_cell_index >= 0 && new_ue_record->att_cell_index < 0)
+			new_ue_record->att_cell_index = old_ue_record->att_cell_index;
+		new_ue_record->has_stmsi48 = old_ue_record->has_stmsi48;
+		new_ue_record->stmsi48 = old_ue_record->stmsi48;
+		new_ue_record->stmsi_part1 = old_ue_record->stmsi_part1;
+		new_ue_record->has_stmsi_part1 = old_ue_record->has_stmsi_part1;
+		new_ue_record->has_alg = old_ue_record->has_alg;
+		new_ue_record->ciph_alg = old_ue_record->ciph_alg;
+		new_ue_record->integ_alg = old_ue_record->integ_alg;
+		new_ue_record->ciph_alg_now = old_ue_record->ciph_alg_now;
+		new_ue_record->integ_alg_now = old_ue_record->integ_alg_now;
+		new_ue_record->alg_changed_after_smc = old_ue_record->alg_changed_after_smc;
+		new_ue_record->alg_change_opportunity_count = old_ue_record->alg_change_opportunity_count;
+		/* 표 I 항목은 전부 옮김. 새 레코드에서 본 값으로 두는 것은 C-RNTI 와 RRC 메시지 기록뿐임.
+		 * 종전 복사 블록은 S-TMSI, 알고리즘, RRC 상태만 옮기고 NAS 상태, AS 보안, NAS 보안, 마지막
+		 * NAS, N2 매칭을 빠뜨려 전사 뒤 CONNECTED 인데 보안 상태가 미상으로 리셋됐음 - 내부가 서로
+		 * 모순되고 관측값이 사라짐. 형제 분기 사이의 비대칭이 그대로 결함이 된 곳임 */
+		new_ue_record->rrc_sec_state = old_ue_record->rrc_sec_state;
+		new_ue_record->rrc_sec_quality = old_ue_record->rrc_sec_quality;
+		new_ue_record->nas_sec_state = old_ue_record->nas_sec_state;
+		new_ue_record->nas_sec_quality = old_ue_record->nas_sec_quality;
+		new_ue_record->nas_reg_state = old_ue_record->nas_reg_state;
+		new_ue_record->nas_conn_mode = old_ue_record->nas_conn_mode;
+		new_ue_record->nas_reg_state_origin = old_ue_record->nas_reg_state_origin;
+		new_ue_record->nas_state_quality = old_ue_record->nas_state_quality;
+		new_ue_record->last_nas_epd = old_ue_record->last_nas_epd;
+		new_ue_record->last_nas_sht = old_ue_record->last_nas_sht;
+		new_ue_record->last_nas_msg_type = old_ue_record->last_nas_msg_type;
+		new_ue_record->has_last_nas = old_ue_record->has_last_nas;
+		new_ue_record->nas_msg_quality = old_ue_record->nas_msg_quality;
+		new_ue_record->has_n2_pair = old_ue_record->has_n2_pair;
+		new_ue_record->n2_released = old_ue_record->n2_released;
+		new_ue_record->rrc_state = RS_CONNECTED;   // 전사도 등급을 승계함(위 블록과 같은 이유)
+		new_ue_record->conn_inferred = old_ue_record->conn_inferred;
+		half_open_leave(tr, old_ue_record);
+		old_ue_record->in_conn = 0;
+		ue_record_free(tr, old_ue_record);
+	}
+	if (target_cell_index >= 0) new_ue_record->req_cell_index = target_cell_index;
+	else if (new_ue_record->req_cell_index < 0 && event->cell.valid)
+		new_ue_record->req_cell_index = cell_lookup(tr, &event->cell, 1);
+	/* 전사는 연결이 계속되는 '이전' 이지 열린 수립이 아니므로 종결함.
+	 *   레코드가 기본값인 열린 수립으로 남으면(요청 미관측, 옛 레코드 미상, 완료 미도달) 위에서 셀을
+	 *   심었으므로 이후 해제 명령이나 완료가 '열린 수립 + 셀 있음' 을 보고 실패 원인을 허위 계수함.
+	 *   재수립 성공 계수는 무영향임 - 그 핸들러는 수립 상태와 무관하게 셈.
+	 *   종결에 settle 을 쓰는 이유는 반쯤 열림도 같이 비우기 때문임. 옛 레코드가 있던 경로는 위에서
+	 *   이미 비웠으니 여기서는 아무 일도 하지 않고, 옛 레코드가 없거나 같은 레코드인 경로에서만 남아
+	 *   있던 반쯤 열림을 비움 - 전사로 이 레코드는 연결 레코드가 되므로 그 창은 끝나야 함. 종전에는
+	 *   손으로 펼쳐 쓰면서 반쯤 열림 비우기를 빠뜨려 그 게이지가 주기를 넘겨 영구히 누수됐음 */
+	settle_open_setup(tr, new_ue_record, SR_SUCCESS);
+}
+
+/* on_cell_config: F1 SETUP REQUEST 또는 GNB-DU CONFIGURATION UPDATE 의 Served Cell 하나.
+ *   이 이벤트로 하는 일은 셀 표에 그 셀을 등록하는 것뿐임.
+ *   사건이 없는 셀도 0건 주기 보고를 내야 하는데, 등록이 없으면 그 셀은 첫 UE 가 붙을 때까지
+ *   아예 보고되지 않음 - 읽는 쪽은 빠진 칸을 '알 수 없음' 으로 보류함 */
+static void on_cell_config(struct tr *tr, const struct obs_event *event)
+{
+	cell_lookup(tr, &event->cell, 1);
+}
+
+/* on_smc: AS 보안 모드 명령 또는 알고리즘을 바꾸는 재설정에서 암호, 무결성 알고리즘을 받음.
+ *   명령이면 보안 상태를 CMD_SENT 로 올리고, 재설정이면 지금 값과 달라졌는지만 봄 */
+static void on_smc(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (!ue_record) return;
+	uint32_t changed_mask = 0;
+	if (event->kind == TR_EVENT_RRC_SMC) {
+		ue_record->ciph_alg = event->payload.smc.ciph_alg;
+		ue_record->integ_alg = event->payload.smc.integ_alg;
+		ue_record->ciph_alg_now = ue_record->ciph_alg;
+		ue_record->integ_alg_now = ue_record->integ_alg;
+		ue_record->has_alg = 1;
+		changed_mask |= TR_UE_F_ALG;
+		ue_record->rrc_sec_state = TR_SEC_CMD_SENT;   // 하행 보안 모드 명령 -> 명령 보냄
+		ue_record->rrc_sec_quality = TR_QUALITY_EXACT;
+		changed_mask |= TR_UE_F_SEC;
+	} else { /* 알고리즘을 바꾸는 재설정: 지금 값의 변경만 관측함 */
+		int new_ciph_alg = event->payload.smc.ciph_alg, new_integ_alg = event->payload.smc.integ_alg;
+		/* '명령 뒤' 라는 말이 성립하려면 명령을 봤어야 함. 안 보고 비교하면 초기값과 달랐다는 사실이
+		 * '명령 뒤 변경' 으로 나가 없는 사건을 지어냄. 그래서 명령을 봤는지를 관문으로 씀 */
+		if (ue_record->has_alg
+		    && ((new_ciph_alg >= 0 && new_ciph_alg != ue_record->ciph_alg_now)
+			|| (new_integ_alg >= 0 && new_integ_alg != ue_record->integ_alg_now))) {
+			ue_record->alg_changed_after_smc = 1;
+			changed_mask |= TR_UE_F_ALG;
+		}
+		if (new_ciph_alg >= 0) ue_record->ciph_alg_now = new_ciph_alg;
+		if (new_integ_alg >= 0) ue_record->integ_alg_now = new_integ_alg;
+	}
+	emit_ue_line(tr, ue_record, event, changed_mask, 0);
+}
+
+// on_alg_opportunity: 알고리즘을 바꿀 수 있었던 재설정 수. 바뀌었는지와 무관하게 기회만 셈
+static void on_alg_opportunity(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (ue_record) ue_record->alg_change_opportunity_count++;
+}
+
+/* on_smc_result: AS 보안 모드 완료 또는 실패로 보안 상태를 확정함.
+ *   완료면 ACTIVE, 실패면 FAILED(보안 전과 같은 상태)임. 둘 다 규격상 평문 상행이라 정확 등급임 */
+static void on_smc_result(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (!ue_record) return;
+	ue_record->rrc_sec_state = (event->kind == TR_EVENT_RRC_SMC_COMPLETE) ? TR_SEC_ACTIVE
+									      : TR_SEC_FAILED;
+	ue_record->rrc_sec_quality = TR_QUALITY_EXACT;
+	emit_ue_line(tr, ue_record, event, TR_UE_F_SEC, 0);
+}
+
+/* on_rrc_dcch_opaque: 탭을 붙이기 전부터 연결돼 있던 단말을 미상 연결 모집단에 넣음.
+ *   이유: 그런 단말의 첫 신호는 암호 SRB1 이라 가시성 관문에서 막혀 내용을 알 수 없음. 그래도 연결은
+ *     실재하므로 ConnMean, ConnMax 의 상한에는 기여해야 함.
+ *   규칙: 이미 추적 중인 단말은 손대지 않음 - 그 단말은 이미 정확이나 반쯤 열림 모집단에 있어 미상으로
+ *     다시 넣으면 이중 계수임. 셀을 모르면 어느 셀에도 귀속할 수 없어 세지 않음(정직한 잔여 한계).
+ *     수립 상태를 미상으로 둬 '수립 시도' 로 오인되어 실패 원인이 오발화하지 않게 함 */
+static void on_rrc_dcch_opaque(struct tr *tr, const struct obs_event *event)
+{
+	if (ue_lookup(tr, &event->f1ue, 0, event->assoc_id)) return;   // 이미 추적 중 -> 아무것도 하지 않음
+	if (!event->cell.valid) return;                          // 셀 미상 -> 귀속 불가
+	int cell_index = cell_lookup(tr, &event->cell, 1);
+	if (cell_index < 0) return;
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (!ue_record) return;
+	ue_record->req_cell_index = cell_index;
+	ue_record->setup_state = SR_UNKNOWN;        // 수립 시도가 아니므로 실패 원인 오발화를 막음
+	gauge_enter_conn(tr, ue_record, cell_index, LV_UNKNOWN);   // 미상 밴드라 표본 상한에만 기여함
+	ue_record->rrc_state = RS_CONNECTED;
+	ue_record->conn_inferred = 1;   // 암호 SRB1 중간 합류의 구조 추론이라 직접 관측이 아님
+}
+
+/* on_ue_ctx_setup: UE CONTEXT SETUP / MODIFICATION REQUEST 에서 C-RNTI 와 현재 셀을 갱신함.
+ *   SpCell ID 로 현재 셀이 바뀌면 연결 게이지를 옛 셀에서 새 셀로 옮김(DU 안 핸드오버).
+ *   부작용: 게이지 셀 이동, 현재 셀 갱신, C-RNTI 가 오면 표 I 줄 방출 */
+static void on_ue_ctx_setup(struct tr *tr, const struct obs_event *event)
+{
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
+	if (!ue_record) return;
+	if (event->cell.valid) {
+		int cell_index = cell_lookup(tr, &event->cell, 1);
+		if (cell_index >= 0) {
+			conn_move_cell(tr, ue_record, cell_index);   // 연결 중이면 옮기고 아니면 아무 일도 없음
+			/* 현재 셀은 수립이나 연결을 실제로 관측한 레코드에만 심음.
+			 *   이 이벤트로 처음 본 중간 합류 단말은 수립 요청과 RRCSetup 을 못 봤고 게이지에도 없는
+			 *   채 기본값인 열린 수립으로 남음. 그런 레코드에 셀을 심으면 이후 해제 명령이 '열린
+			 *   수립 + 셀 있음' 을 보고 실패 원인을 허위 계수함 - 열린 수립은 RRCSetupRequest 를
+			 *   관측했을 때만 세는 것이 규칙임.
+			 *   반쯤 열림, 연결, 종결된 상태는 실제 관측이므로 SpCell 로 현재 셀을 갱신함 */
+			if (ue_record->setup_state != SR_OPEN || ue_record->half_open
+			    || ue_record->saw_setup_sent || ue_record->in_conn)
+				ue_record->req_cell_index = cell_index;
+		}
+	}
+	if (event->payload.ue_ctx_setup.has_crnti) {
+		ue_record->crnti = event->payload.ue_ctx_setup.crnti;
+		ue_record->has_crnti = 1;
+		emit_ue_line(tr, ue_record, event, TR_UE_F_CRNTI, 0);
+	}
+}
+
+// ---- N2 이벤트 ----
+/* on_initial_ue_msg: INITIAL UE MESSAGE 를 UECNTX.ConnEstabAtt 에 세고 N2 레코드에 원인과 셀을 심음.
+ *   TS 28.552 §5.1.1.16.1 c) "On transmission of an INITIAL UE MESSAGE by the gNodeB to the AMF ...
+ *   is incremented by 1" - 메시지 송신 자체가 발화 조건임 */
+static void on_initial_ue_msg(struct tr *tr, const struct obs_event *event)
+{
+	tr->n2_observed = 1;
+	int cell_index = cell_lookup(tr, &event->cell, 1);
+	int est_cause = event->payload.initial_ue.est_cause;
+	enum tr_metric metric = TR_METRIC_UECNTX_CONN_ESTAB_ATT;
+	int cause_index = (est_cause >= 0 && est_cause < METRIC_CAUSE_CNT[metric]) ? est_cause : -1;
+	if (cell_index >= 0) {
+		if (cause_index >= 0) tr->cell_records[cell_index].cc_value[metric][cause_index]++;
+		else tr->cell_records[cell_index].cc_unknown_nocause[metric]++;
+	}
+	// 성공 쪽에서 쓸 원인과 셀을 N2 레코드에 저장함
+	if (event->n2ue.valid) {
+		struct tr_n2_record *n2_record = n2_lookup(tr, event->assoc_id,
+							   event->n2ue.ran_ue_ngap_id, 1);
+		if (n2_record) {
+			n2_record->est_cause = est_cause;
+			n2_record->uli_cell_index = cell_index;
+			n2_record->amf_id_seen = 0;
+		}
+	}
+}
+
+/* on_amf_dl: AMF 가 그 단말에 처음 내려 보낸 하행을 UECNTX.ConnEstabSucc 에 셈.
+ *   amf_id_seen 은 중복 가드임 - libobs 가 레코드를 다시 만들어 '첫 하행' 을 또 보내도 성공은 한 번만
+ *     세어야 함. 종전에는 기록만 하고 읽지 않아 쓰이지 않는 칸이었음 */
+static void on_amf_dl(struct tr *tr, const struct obs_event *event)
+{
+	tr->n2_observed = 1;
+	if (!event->payload.amf_dl.first_for_ran_ue_ngap_id || !event->n2ue.valid) return;
+	struct tr_n2_record *n2_record = n2_lookup(tr, event->assoc_id, event->n2ue.ran_ue_ngap_id, 0);
+	if (!n2_record || n2_record->uli_cell_index < 0 || n2_record->amf_id_seen) return;
+	enum tr_metric metric = TR_METRIC_UECNTX_CONN_ESTAB_SUCC;
+	int cause_index = (n2_record->est_cause >= 0
+			   && n2_record->est_cause < METRIC_CAUSE_CNT[metric]) ? n2_record->est_cause : -1;
+	if (cause_index >= 0)
+		tr->cell_records[n2_record->uli_cell_index].cc_value[metric][cause_index]++;
+	else tr->cell_records[n2_record->uli_cell_index].cc_unknown_nocause[metric]++;
+	n2_record->amf_id_seen = 1;
+}
+
+/* on_ng_release_cmd: NG UE CONTEXT RELEASE COMMAND 로 완전 해제 신호를 남기고 INACTIVE 게이지를 비움.
+ *   이 이벤트가 F1 단말에 붙어 왔다는 것 자체가 F1 과 N2 의 매칭이 성립했다는 증거임. F1 만 보이는
+ *     캡처에는 N2 이벤트가 아예 없어 그 칸이 계속 0 이므로, 매칭 없는 암호 해제는 미상으로 남음.
+ *   해제 원인이 NAS 해제면 5GMM 은 DEREGISTERED 로 감(교차 추론). 그 밖 원인은 등록이 유지되므로
+ *     표 I 에 변화가 없고 줄도 내지 않음 */
+static void on_ng_release_cmd(struct tr *tr, const struct obs_event *event)
+{
+	tr->n2_observed = 1;
+	if (!event->f1ue.valid) return;   // 매칭된 F1 이 없으면 표 I 에 반영할 대상이 없음
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record) return;
+	ue_record->has_n2_pair = 1;
+	ue_record->n2_released = 1;   // 완전 해제 신호. 내부 플래그라 그 자체로 줄을 내지 않음
+	/* 매칭된 N2 단말의 NG 해제는 INACTIVE 모집단에서 그 단말이 사라졌다는 뜻이므로 여기서 바로 비움.
+	 * 종전엔 레코드 해제까지 남아 과잉 잔류였음. gauge_leave_inactive 는 멱등이라 뒤에 레코드 해제가
+	 * 다시 불러도 이중 감소가 없음. 들어간 밴드를 그대로 되돌리므로 늦게 매칭이 생겨 미상 밴드로
+	 * 들어간 단말도 정확히 그 칸에서 빠짐. INACTIVE 에서 RELEASED 로 가는 전이는 평문 RRC 관측이
+	 * 아니라 N2 교차 추론임 */
+	if (ue_record->in_inactive) {
+		gauge_leave_inactive(tr, ue_record);
+		ue_record->rrc_state = RS_RELEASED;
+		ue_record->rel_inferred = 1;
+	}
+	if (event->payload.ng_cause.cause_group == TR_NGAP_CAUSE_GRP_NAS &&
+	    event->payload.ng_cause.cause_value == TR_NGAP_CAUSE_NAS_DEREGISTER) {
+		ue_record->nas_reg_state = TR_5GMM_DEREGISTERED;
+		ue_record->nas_state_quality = TR_QUALITY_CROSS;
+		emit_ue_line(tr, ue_record, event, TR_UE_F_NAS_STATE, 0);
+	}
+}
+
+/* on_rrc_state_report: N2 의 RRC INACTIVE TRANSITION REPORT 로 INACTIVE 진입을 확정하고 전제 위반을
+ *   경보함.
+ *   이유: 이 보고가 오면 망이 RRC_INACTIVE 를 쓴다는 것이 확정됨. 암호 구간에서는 suspend 를 읽을 수
+ *     없어 미상으로만 남는데, 이 보고는 그 구간에서도 진입을 확정해 줌.
+ *   밴드가 정확인 이유: 망이 자기 상태를 NGAP 로 명시 보고한 것이라 평문 suspendConfig 경로의 매칭
+ *     추정보다 강한 근거임. 다만 F1 레코드에는 교차 귀속으로 붙으므로 상태 등급은 교차로 둠 -
+ *     관측한 쪽은 N2 이고 F1 단말로는 추론임.
+ *   RRCState 가 connected 인 보고는 아무 전이도 만들지 않음: INACTIVE 에서 CONNECTED 로 되돌리는 것은
+ *     규격이 정한 것이 아니라 우리 설계 결정이 됨. 비우기는 기존 경로(재개 완료, NG 해제, 레코드
+ *     해제)가 맡고 그때까지 게이지는 정직한 상한으로 남음. 조용한 드롭이 아님 - 이벤트는 처리되고
+ *     매칭 표시도 갱신하되 상태를 새로 주장하지 않을 뿐임.
+ *   부작용: 전제 위반 경보 증가(중복 보고는 제외), 열린 수립을 단일 종결 관문으로 닫음, 게이지를
+ *     연결에서 INACTIVE 로 옮김, 표 I 줄 방출. 평문으로 이미 판정된 단말은 덮지 않고 경고만 올림 */
+static void on_rrc_state_report(struct tr *tr, const struct obs_event *event)
+{
+	tr->n2_observed = 1;
+	int rrc_state = event->payload.rrc_state_report.rrc_state;
+	if (rrc_state != TR_NGAP_RRC_STATE_INACTIVE) return;   // connected 와 확장값은 전이를 만들지 않음
+
+	struct tr_ue_record *ue_record = event->f1ue.valid
+				       ? ue_lookup(tr, &event->f1ue, 0, event->assoc_id) : NULL;
+	if (ue_record) ue_record->has_n2_pair = 1;   // 교차 귀속된 N2 이벤트는 매칭 성립의 증거임
+
+	/* 중복, 재전송 보고는 경보도 세지 않음. 종전엔 게이지만 멱등이고 경보 증가는 가드 위에 있어, 한
+	 *   INACTIVE 구간이 경보 4건(평문 해제 + 보고 + 중복 보고 + 재개 요청)으로 불어났음. 이 경보는
+	 *   혼자서도 주기 보고를 만들어 내므로 부풀면 보고 자체가 왜곡됨. 게이지와 같은 멱등성을 줌 */
+	bool already_inactive = ue_record && ue_record->rrc_state == RS_INACTIVE;
+	/* 전제 위반 경보는 매칭된 F1 이 없어도 올림 - 이 보고 자체가 "망이 RRC_INACTIVE 를 쓴다" 는
+	 * 증거이고, 전제는 단말이 아니라 배치에 대한 것임 */
+	if (tr->tr_cfg.assume_no_inactive && !already_inactive) tr->inactive_alarm_count++;
+
+	if (!ue_record || already_inactive) return;   // 매칭된 F1 이 없으면 표 I 에 반영할 대상이 없음
+
+	/* 평문으로 suspend 가 이미 판정됐으면 교차 추론으로 덮지 않음.
+	 *   형제 추론 지점이 쓰는 전제와 같음. 안 막으면 재정렬, 중복 보고가 직접 관측한 RELEASED 를
+	 *   INACTIVE 로 뒤집어, 같은 단말이 완전 해제로 세어진 채 INACTIVE 게이지에도 들어감 - 표 II 의
+	 *   두 값이 서로 모순됨. 강한 직접 관측을 약한 추론으로 낮추지 않는다는 등급 정책의 정반대임.
+	 *   조용히 버리지도 않음 - 모순 자체를 운영자 신호로 올림 */
+	if (ue_record->suspend_resolved) {
+		warn(tr, "RRC_STATE_CONTRADICTION",
+		     "N2 RRCInactiveTransitionReport(inactive) contradicts plaintext RRCRelease; keeping the plaintext");
+		return;
+	}
+
+	/* 형제 on_release 처럼 단일 종결 관문을 먼저 통과함. 종전엔 그 경로를 인용하면서 게이지 이동만
+	 *   베끼고 관문을 빠뜨렸음 - 열린 수립이 마감을 건 채 남아, 뒤에 마감이 허위 NoReply 를
+	 *   발화했음. 그러면 같은 단말이 수립 실패로 세어진 동시에 INACTIVE 의 정확 밴드에 들어감.
+	 *   반쯤 열림만 비우고 시도를 열어 두면 그 창이 잘려 ConnMean, ConnMax 상한도 과소가 됨 */
+	close_setup_complete_unobserved(tr, ue_record);   // 완료는 못 봤으므로 시도는 미상 밴드에 남김
+
+	/* 형제 경로(on_release 의 suspend 있음)와 같은 순서로 옮김: 연결에서 빼고 반쯤 열림을 비운 뒤
+	 * INACTIVE 로 진입함. 순서가 어긋나면 ConnMean, ConnMax 가 과대해지거나 반쯤 열림이 누수됨 */
+	int release_cell = ue_record->est_cell_index >= 0 ? ue_record->est_cell_index
+							 : ue_record->req_cell_index;
+	gauge_leave_conn(tr, ue_record);
+	half_open_leave(tr, ue_record);
+	ue_record->rrc_state = RS_INACTIVE;
+	ue_record->rel_inferred = 1;   // N2 교차 귀속이라 상태 등급은 교차임
+	gauge_enter_inactive(tr, ue_record, release_cell, LV_EXACT);
+	emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE, 0);
+}
+
+// on_overload_start: AMF 과부하 시작. 과부하 판정이 읽을 입력을 AMF 레코드에 담음
+static void on_overload_start(struct tr *tr, const struct obs_event *event)
+{
+	tr->n2_observed = 1;
+	uint64_t amf_key = event->amf_id ? ((uint64_t)event->amf_id | (1ull << 40))
+					 : ((uint64_t)event->assoc_id);
+	struct tr_amf_record *amf_record = amf_lookup(tr, amf_key, 1);
+	if (amf_record) {
+		amf_record->state = AMF_OVERLOAD;
+		amf_record->action_mask = event->payload.overload.action_mask;
+		amf_record->last_assoc = event->assoc_id;
+		amf_record->has_action = event->payload.overload.has_action;
+		amf_record->traffic_load_reduction_pct = event->payload.overload.traffic_load_reduction_pct;
+		amf_record->nssai_list_present = event->payload.overload.nssai_list_present;
+	}
+}
+
+// on_overload_stop: AMF 과부하 종료. 과부하 내용을 비움
+static void on_overload_stop(struct tr *tr, const struct obs_event *event)
+{
+	tr->n2_observed = 1;
+	uint64_t amf_key = event->amf_id ? ((uint64_t)event->amf_id | (1ull << 40))
+					 : ((uint64_t)event->assoc_id);
+	struct tr_amf_record *amf_record = amf_lookup(tr, amf_key, 0);
+	if (amf_record) {
+		amf_record->state = AMF_NONE;
+		amf_record->action_mask = 0;
+		amf_record->has_action = 0;
+		amf_record->traffic_load_reduction_pct = -1;
+		amf_record->nssai_list_present = 0;
+	}
+}
+
+// on_ng_setup: NG SETUP 성공으로 그 AMF 의 과부하 상태를 초기화함
+static void on_ng_setup(struct tr *tr, const struct obs_event *event)
+{
+	tr->n2_observed = 1;
+	if (event->payload.ng_setup.outcome_failure) return;
+	uint64_t amf_key = event->amf_id ? ((uint64_t)event->amf_id | (1ull << 40))
+					 : ((uint64_t)event->assoc_id);
+	struct tr_amf_record *amf_record = amf_lookup(tr, amf_key, 1);
+	if (amf_record) {
+		amf_record->state = AMF_NONE;
+		amf_record->action_mask = 0;
+		amf_record->last_assoc = event->assoc_id;
+		amf_record->has_action = 0;
+		amf_record->traffic_load_reduction_pct = -1;
+		amf_record->nssai_list_present = 0;
+	}
+}
+
+/* on_nas: F1 또는 N2 에서 본 NAS 메시지 하나로 마지막 NAS 기록, NAS 보안 상태, 5GMM 상태를 갱신함.
+ *   관측자이므로 전진 조건을 좁게 잡음 - 전달 실패한 하행, 형식 오류 PDU, 방향이 어긋난 보안 헤더는
+ *     상태를 전진시키지 않음. 그 셋은 모두 공격자가 만들 수 있는 모양임.
+ *   부작용: 표 I 의 마지막 NAS, NAS 보안 상태, 5GMM 주상태와 연결모드 갱신, 표 I 줄 방출 */
+static void on_nas(struct tr *tr, const struct obs_event *event)
+{
+	if (event->iface == TR_IFACE_N2) tr->n2_observed = 1;
+	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+	if (!ue_record) return;
+	/* NAS Non Delivery Indication 에 실린 NAS 는 기지국이 단말에 전달하지 못한 하행임 -> 단말은 받지
+	 * 못했으므로 NAS 상태 기계를 전진시키면 안 됨. libobs 가 그 표시를 달아 줌. N2 관측 자체는
+	 * 실재했으므로 위에서 이미 표시해 둠 */
+	if (event->payload.nas.non_delivered) return;
+	// libobs 가 유일한 F1 과 N2 매칭으로 교차 귀속한 N2 NAS 이므로 소멸을 관측할 수 있다는 신호임
+	if (event->iface == TR_IFACE_N2 && event->quality == TR_QUALITY_CROSS)
+		ue_record->has_n2_pair = 1;
+	ue_record->last_nas_sht = event->payload.nas.sht;
+	ue_record->last_nas_msg_type = event->payload.nas.msg_type;
+	/* 마지막 NAS 기록은 '마지막으로 본 NAS 메시지' 임. 형식 오류 PDU 의 보안 헤더 니블은 공격자가 고른
+	 * 바이트이므로 헤더에서 읽은 값은 담되(libnas 가 음수 반환에도 그 두 칸은 유효하다고 계약) 메시지를
+	 * 봤다는 주장은 하지 않음 - 그 표시가 거짓이면 출력 등급이 미상으로 떨어짐. 아래에서 보안 상태를
+	 * 막은 것과 같은 이유임. 못 읽은 수는 libobs 가 셈 */
+	/* NAS 보안 모드 명령이 고른 암호 알고리즘. 그 메시지가 아닌 줄에서는 음수라 걸리지 않음.
+	 * 종전엔 '이 메시지를 푼 알고리즘'(libobs 가 앞선 명령에서 학습해 둔 값)을 같은 칸에서 읽고
+	 * 있었음 - 첫 명령에서는 학습 전이라 음수이고, 그 뒤 보호된 NAS 줄에서 뒤늦게 들어와 엉뚱한
+	 * 메시지에 귀속됐음 */
+	if (event->payload.nas.smc_ciph_alg >= 0)
+		ue_record->nas_ciph_alg = event->payload.nas.smc_ciph_alg;
+	// libnas 가 확장 프로토콜 판별자를 보안 헤더보다 먼저 세우므로 '헤더는 읽고 판별자는 못 읽음' 은 도달 불가임
+	ue_record->last_nas_epd = event->payload.nas.epd;
+	if (event->payload.nas.parse_ok) ue_record->has_last_nas = 1;
+	// 교차 귀속이면 교차 등급, 평문이면 정확 등급임. 추론한 메시지 종류는 읽은 것이 아니라 구조 판정이므로 더 약한 쪽을 씀
+	ue_record->nas_msg_quality = event->payload.nas.msg_type_inferred
+				   ? ((event->quality > TR_QUALITY_STRUCT) ? event->quality
+									   : TR_QUALITY_STRUCT)
+				   : event->quality;
+	// NAS 보안 상태는 보안 헤더 종류로만 유도함(암호 구간에서도 가능). 0 평문, 1/2 보호, 3 명령, 4 완료
+	int nas_sec_state_before = ue_record->nas_sec_state;
+	/* 전진 조건 둘을 여기서 한 칸으로 묶음.
+	 *   형식 오류 PDU 의 보안 헤더 니블은 공격자가 고른 바이트임. AMF 도 버릴 메시지이므로 보안 상태를
+	 *     전진시키지 않음. 종전엔 두 바이트가 보안 헤더 4 로 읽혀 NAS 보안 ACTIVE 를 평문 관측 등급
+	 *     그대로 올렸음 - 확신 있는 오값임.
+	 *   방향까지 맞아야 전진함. 보안 헤더 3 과 4 는 규격이 각각 한 방향뿐인 메시지에만 묶어 두었으므로
+	 *     어긋난 조합은 조작으로만 생김 - 상행 3 을 받아 주면 단말이 자기 보안 상태를 명령 보냄으로,
+	 *     하행 4 를 받아 주면 ACTIVE 로 올릴 수 있음. 방향 판정은 방향을 아는 libobs 가 하고 그쪽이 셈 */
+	int sht_for_sec_state = (event->payload.nas.parse_ok && event->payload.nas.sec_header_direction_ok)
+			      ? event->payload.nas.sht : -1;
+	switch (sht_for_sec_state) {
+	case 3:
+		ue_record->nas_sec_state = TR_SEC_CMD_SENT;
+		ue_record->nas_sec_quality = event->quality;
+		break;
+	case 4:
+		ue_record->nas_sec_state = TR_SEC_ACTIVE;
+		ue_record->nas_sec_quality = event->quality;
+		break;
+	case 1: case 2:   // 보호된 NAS 를 봤으면 보안은 활성임(구조 추론). 이미 활성이면 유지함
+		/* 명령 보냄 상태에서도 올림 - 완료를 놓친 채 암호 트래픽만 보이면 상태가 멈춤. 종단 상태인
+		 * 실패는 보존함. 교차 귀속이면 구조보다 강할 수 없으므로 둘 중 약한 등급을 씀 */
+		if (ue_record->nas_sec_state != TR_SEC_ACTIVE
+		    && ue_record->nas_sec_state != TR_SEC_FAILED) {
+			ue_record->nas_sec_state = TR_SEC_ACTIVE;
+			ue_record->nas_sec_quality = (event->quality > TR_QUALITY_STRUCT) ? event->quality
+											 : TR_QUALITY_STRUCT;
+		}
+		break;
+	case 0:   // 평문 NAS 는 보안 전이라는 뜻임. 이미 활성이면 되돌리지 않음
+		if (ue_record->nas_sec_state == TR_SEC_UNKNOWN) {
+			ue_record->nas_sec_state = TR_SEC_NONE;
+			ue_record->nas_sec_quality = event->quality;
+		}
+		break;
+	default:
+		break;
+	}
+	// 5GMM 주상태와 연결모드. N2 NAS 는 교차 귀속으로 F1 단말에 붙음
+	uint32_t changed_mask = TR_UE_F_NAS_MSG;
+	/* NAS 보안 상태 전이도 변경 비트에 실음. 종전엔 그 비트가 AS 보안에서만 세워져 NAS 쪽 전이가
+	 * 변경 목록에서 사라졌음. 비트 하나를 AS 와 NAS 가 함께 쓰는데, 나누는 것은 출력 형식 변경이라
+	 * 지금 하지 않음 */
+	if (ue_record->nas_sec_state != nas_sec_state_before) changed_mask |= TR_UE_F_SEC;
+	if (event->iface == TR_IFACE_N2 && event->direction == TR_DIRECTION_DOWN
+	    && ue_record->nas_conn_mode != TR_CM_MODE_CONNECTED) {
+		ue_record->nas_conn_mode = TR_CM_MODE_CONNECTED;   // 첫 AMF 하행 NAS -> 연결모드 CONNECTED
+		changed_mask |= TR_UE_F_NAS_STATE;
+	}
+	int nas_msg_type = event->payload.nas.msg_type, mm_cause = event->payload.nas.mm_cause,
+	    nas_reg_state = -1;
+	switch (nas_msg_type) {
+	case NAS_MM_AUTH_REQUEST: case NAS_MM_IDENTITY_REQUEST: case NAS_MM_SECURITY_MODE_COMMAND:
+		// 공통 절차 시작. 되돌아갈 출발 상태를 기억해 둠
+		if (ue_record->nas_reg_state != TR_5GMM_COMMON_PROC_INIT)
+			ue_record->nas_reg_state_origin = ue_record->nas_reg_state;
+		nas_reg_state = TR_5GMM_COMMON_PROC_INIT; break;
+	case NAS_MM_AUTH_RESPONSE: case NAS_MM_IDENTITY_RESPONSE: case NAS_MM_SECURITY_MODE_COMPLETE:
+		/* 공통 절차 응답이면 출발 상태로 복귀함. 등록된 단말의 독립 공통 절차(재인증, 재키잉)는
+		 * 등록 상태로 돌아가고, 초기 등록이면 등록 완료까지 공통 절차 상태를 유지함 */
+		if (ue_record->nas_reg_state == TR_5GMM_COMMON_PROC_INIT
+		    && ue_record->nas_reg_state_origin == TR_5GMM_REGISTERED)
+			nas_reg_state = TR_5GMM_REGISTERED;
+		break;
+	case NAS_MM_SECURITY_MODE_REJECT:
+	case NAS_MM_AUTH_REJECT:
+		nas_reg_state = TR_5GMM_DEREGISTERED;
+		break;
+	case NAS_MM_REGISTRATION_ACCEPT:
+		nas_reg_state = TR_5GMM_COMMON_PROC_INIT;
+		break;   // 등록 완료를 기다리는 상태
+	case NAS_MM_REGISTRATION_COMPLETE:
+		nas_reg_state = TR_5GMM_REGISTERED;
+		break;
+	case NAS_MM_SERVICE_ACCEPT:
+		nas_reg_state = TR_5GMM_REGISTERED;
+		break;
+	case NAS_MM_REGISTRATION_REQUEST:   // 5GS 등록 유형이 출발 상태를 가름(TS 24.501 §9.11.3.7)
+		/* F1 쪽 on_setup_complete 과 같은 판정임. 한쪽에만 두면 등록 갱신이 N2 에서만 사라짐 -
+		 * 암호가 없는 구간에서는 그 메시지를 읽을 수 있으므로 실제로 도달함.
+		 * 등록 유형을 못 읽었으면 단정하지 않음(libobs 가 필수 IE 누락으로 이미 셌음) */
+		if (event->payload.nas.reg_type >= 0)
+			nas_reg_state = (event->payload.nas.reg_type == NAS_REG_MOBILITY
+				      || event->payload.nas.reg_type == NAS_REG_PERIODIC
+				      || event->payload.nas.reg_type == NAS_REG_DISASTER_MOBILITY)
+				      ? TR_5GMM_REGISTERED : TR_5GMM_DEREGISTERED;
+		break;
+	case NAS_MM_SERVICE_REQUEST: case NAS_MM_CP_SERVICE_REQUEST:
+		// 둘 다 5GMM-REGISTERED 단말만 보냄(TS 24.501 §5.6.1.1, §4.4.6)
+		nas_reg_state = TR_5GMM_REGISTERED; break;
+	case NAS_MM_REGISTRATION_REJECT: case NAS_MM_SERVICE_REJECT:
+		// 초기 등록이었거나 원인이 불법 단말, 불법 기기, 5GS 불허면 등록 해제, 그 밖은 미상
+		nas_reg_state = (ue_record->nas_reg_state == TR_5GMM_DEREGISTERED
+			      || mm_cause == NAS_CAUSE_ILLEGAL_UE
+			      || mm_cause == NAS_CAUSE_ILLEGAL_ME
+			      || mm_cause == NAS_CAUSE_5GS_NOT_ALLOWED) ? TR_5GMM_DEREGISTERED
+									: TR_5GMM_UNKNOWN; break;
+	case NAS_MM_DEREG_REQ_UE_ORIG:
+	case NAS_MM_DEREG_ACC_UE_ORIG:
+	case NAS_MM_DEREG_ACC_UE_TERM:
+		nas_reg_state = TR_5GMM_DEREGISTERED;
+		break;
+	case NAS_MM_DEREG_REQ_UE_TERM:
+		nas_reg_state = TR_5GMM_DEREG_INITIATED;
+		break;   // 망이 먼저 해제를 걸었으므로 응답을 기다림
+	default:
+		/* 형식은 정상이나 암호라 종류를 못 읽음 -> 미상. 보안 헤더만 보면 규격상 없는 조합(조작으로만
+		 * 생기는 하행 완료)이 이 줄을 건너뛰어 옛 상태가 남으므로, 안쪽을 읽을 수 있었는지로 판정함.
+		 * 잘리거나 깨진 PDU 는 캡처 손실이라 알려진 상태를 지우지 않음 */
+		if (nas_msg_type < 0 && !event->payload.nas.inner_readable
+		    && event->payload.nas.parse_ok) nas_reg_state = TR_5GMM_UNKNOWN;
+		break;
+	}
+	if (nas_reg_state >= 0) {
+		ue_record->nas_reg_state = nas_reg_state;
+		/* 추론한 메시지 종류는 읽은 것이 아니라 구조 판정이므로 등급을 더 약한 쪽으로 깎음.
+		 * 상태가 미상이면 근거가 없으므로 등급도 판정 불가임(위 초기 NAS 쪽과 같은 규칙) */
+		ue_record->nas_state_quality = (nas_reg_state == TR_5GMM_UNKNOWN) ? TR_QUALITY_UNKNOWN
+			: (event->payload.nas.msg_type_inferred
+			   ? ((event->quality > TR_QUALITY_STRUCT) ? event->quality : TR_QUALITY_STRUCT)
+			   : event->quality);
+		changed_mask |= TR_UE_F_NAS_STATE;
+	}
+	emit_ue_line(tr, ue_record, event, changed_mask, 0);
+}
