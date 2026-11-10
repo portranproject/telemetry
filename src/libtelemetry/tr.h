@@ -111,15 +111,11 @@ struct tr_cfg {
 	                                 * 준실시간은 임의 ms = E2SM-KPM Granularity Period) */
 	uint64_t gp_origin_ns;          /* 주기 원점(0 = 벽시계 gp 배수). 두 실행의 주기 경계를 맞춰
 	                                 * 산출물을 대조할 때 씀 */
-	uint32_t conn_sample_period_ms;        // ConnMean 과 ConnMax 의 표본 간격 (100)
 	uint32_t inactive_sample_period_ms;    // Inactive 표본 간격 (100 - TS 38.314 §4.2.1.4 상한)
-	uint32_t setup_outcome_timeout_ms;  /* Msg3 만 보고 결과를 못 본 수립을 포기하는 시각
-	                                     * (0 = TR_DEF_SETUP_OUTCOME_TIMEOUT_MS = 2000). 위 상수의 구간 표를 볼 것 */
 	uint32_t noreply_timeout_ms;    /* 무응답 대기(0 = TR_DEF_NOREPLY_TIMEOUT_MS = 1000). 셀마다 다르게 두지 않음 -
 	                                 * 광고는 한 번뿐이라 셀별 값을 내보낼 칸이 없음 */
 	uint32_t late_slack_ms;         /* 유휴 진행 워터마크 여유(0 = TR_DEF_LATE_SLACK_MS = 50).
 	                                 * tr 이 아니라 호출자가 읽음 - 시간을 진행시키는 쪽이 그쪽임 */
-	uint32_t max_cell_count;        // 셀 표 상한 (4096). 넘으면 '넘침 셀' 하나에 모으고 경고를 냄
 	bool     assume_no_inactive;    /* 망이 RRC_INACTIVE 를 쓰지 않는다는 전제. 모든 보고 헤더에 기록하고,
 	                                 * 그 전제를 깨는 증거가 보이면 경보를 올림 */
 	bool     self_check;            /* 자기 불변식 검사. true 면 게이지, 멤버십, 열린 목록의 정합을 매 이벤트와

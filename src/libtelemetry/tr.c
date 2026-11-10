@@ -589,7 +589,7 @@ static int overflow_cell(struct tr *tr)
 		tr->overflow_cell_index = (int)(cell_record - tr->cell_records);
 	}
 	if (!tr->warned_overflow) {
-		warn(tr, "overflow_cell", "max_cell_count exceeded; new cells merged");
+		warn(tr, "overflow_cell", "DEF_MAX_CELL_COUNT exceeded; new cells merged");
 		tr->warned_overflow = 1;
 	}
 	return tr->overflow_cell_index;
@@ -603,7 +603,7 @@ static int cell_lookup(struct tr *tr, const struct tr_nr_cgi *cell, int create_i
 	uint32_t idx = hash_map_get(&tr->cell_map, hash, cell_eq, tr, &cell_key_probe);
 	if (idx != UINT32_MAX) return (int)idx;
 	if (!create_if_missing) return -1;
-	uint32_t limit = tr->tr_cfg.max_cell_count ? tr->tr_cfg.max_cell_count : DEF_MAX_CELL_COUNT;
+	uint32_t limit = DEF_MAX_CELL_COUNT;
 	// 넘침 셀을 빼고 센 유효 셀 수
 	uint32_t valid_cells = tr->cell_count - (tr->overflow_cell_index >= 0 ? 1u : 0u);
 	if (valid_cells >= limit) return overflow_cell(tr);
@@ -1005,12 +1005,6 @@ static uint32_t applied_noreply_timeout_ms(const struct tr *tr)
 {
 	return tr->tr_cfg.noreply_timeout_ms ? tr->tr_cfg.noreply_timeout_ms : TR_DEF_NOREPLY_TIMEOUT_MS;
 }
-static uint32_t applied_setup_outcome_timeout_ms(const struct tr *tr)
-{
-	return tr->tr_cfg.setup_outcome_timeout_ms ? tr->tr_cfg.setup_outcome_timeout_ms
-						    : TR_DEF_SETUP_OUTCOME_TIMEOUT_MS;
-}
-
 /* setup_recompute_deadline: 열린 수립 하나의 마감을 다시 잡음.
  *   구간이 둘이라 값도 둘임(tr.h 가 두 구간을 표로 적어 둠). Msg4 를 봤으면 그 시각부터 무응답
  *   대기이고, 못 봤으면 Msg3 시각부터 결과를 못 봤다고 포기하는 창임. 한 값으로 묶으면 둘 중 하나가 틀림 */
@@ -1018,7 +1012,7 @@ static void setup_recompute_deadline(struct tr *tr, struct tr_ue_record *ue_reco
 {
 	uint64_t base_ns = ue_record->saw_setup_sent ? ue_record->setup_sent_time_ns : ue_record->request_time_ns;
 	uint32_t timeout_ms = ue_record->saw_setup_sent ? applied_noreply_timeout_ms(tr)
-							: applied_setup_outcome_timeout_ms(tr);
+							: TR_DEF_SETUP_OUTCOME_TIMEOUT_MS;
 	ue_record->deadline_ns = base_ns + (uint64_t)timeout_ms * 1000000ull;
 	if (ue_record->open_in_list) heap_fix(tr, ue_record->open_pos);   // 이미 heap 에 있으면 키가 바뀐 것이라 다시 정렬
 }
@@ -1037,8 +1031,7 @@ static void engine_start(struct tr *tr, uint64_t now_ns)
 	tr->gp_ns = (uint64_t)(tr->tr_cfg.gp_ms ? tr->tr_cfg.gp_ms : DEF_GP_MS) * 1000000ull;
 	tr->cur_start_ns = period_start_for(tr, now_ns);
 	tr->cur_end_ns = tr->cur_start_ns + tr->gp_ns;
-	uint64_t conn_period_ns = (uint64_t)(tr->tr_cfg.conn_sample_period_ms ? tr->tr_cfg.conn_sample_period_ms
-									 : DEF_CONN_SAMPLE_PERIOD_MS) * 1000000ull;
+	uint64_t conn_period_ns = DEF_CONN_SAMPLE_PERIOD_MS * 1000000ull;
 	uint64_t inactive_period_ns = (uint64_t)(tr->tr_cfg.inactive_sample_period_ms ? tr->tr_cfg.inactive_sample_period_ms
 										 : DEF_INACTIVE_SAMPLE_PERIOD_MS) * 1000000ull;
 	// 첫 표본은 now_ns 를 넘는 첫 경계임. 주기는 시작 시각을 빼고 끝 시각을 넣는 구간이기 때문임
@@ -1359,8 +1352,7 @@ static void advance_to(struct tr *tr, uint64_t target_ns)
 	 * 캡처 쪽에서 시각을 검사하더라도 거대한 target 이 어떤 경로로든 들어오면 아래 루프가 주기를
 	 * 끝없이 닫으며 멈추지 않으므로, 루프 밖에서 한 번 묶어 둠 */
 	if (target_ns - tr->now_ns > ADVANCE_MAX_NS) target_ns = tr->now_ns + ADVANCE_MAX_NS;
-	uint64_t conn_period_ns = (uint64_t)(tr->tr_cfg.conn_sample_period_ms ? tr->tr_cfg.conn_sample_period_ms
-									 : DEF_CONN_SAMPLE_PERIOD_MS) * 1000000ull;
+	uint64_t conn_period_ns = DEF_CONN_SAMPLE_PERIOD_MS * 1000000ull;
 	uint64_t inactive_period_ns = (uint64_t)(tr->tr_cfg.inactive_sample_period_ms ? tr->tr_cfg.inactive_sample_period_ms
 										 : DEF_INACTIVE_SAMPLE_PERIOD_MS) * 1000000ull;
 
@@ -2308,10 +2300,12 @@ static void on_release(struct tr *tr, const struct obs_event *event)
 	if (ue_record) emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE | TR_UE_F_RRC_MSG, 0);
 }
 
-/* on_ctx_release_cmd: UE CONTEXT RELEASE COMMAND 를 보고 열린 수립을 실패로 닫고 RRC 상태를 정함.
- *   게이지는 여기서 빼지 않음 - 이탈의 원천만 기록하고 감소는 COMPLETE 에서 함. libobs 가 유예 시간
+/* on_ctx_release_cmd: UE CONTEXT RELEASE COMMAND 를 보고 RRC 상태를 정함.
+ *   수립은 여기서 닫지 않음 - 응답 대기가 해제로 끝났는지는 COMPLETE 가 와야 정해지므로 실패 원인도
+ *     그때 셈. 명령과 완료 사이에 마감이 떨어지면 대기 안에 해제가 끝나지 않은 것이라 무응답이 맞음.
+ *   게이지도 여기서 빼지 않음 - 이탈의 원천만 기록하고 감소는 COMPLETE 에서 함. libobs 가 유예 시간
  *     만료 때 COMPLETE 를 합성해 주므로 늘 COMPLETE 가 옴.
- *   부작용: 실패 원인 카운터 증가, 수립 종결, RRC 상태 갱신, 표 I 줄 방출 */
+ *   부작용: RRC 상태 갱신, 표 I 줄 방출 */
 static void on_ctx_release_cmd(struct tr *tr, const struct obs_event *event)
 {
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
@@ -2319,20 +2313,6 @@ static void on_ctx_release_cmd(struct tr *tr, const struct obs_event *event)
 	// 해제 명령에 RRC 컨테이너가 있었는지만 봄. SRB 번호는 보지 않음
 	if (event->payload.f1_release.rrc_container_kind != TR_RRC_CONTAINER_NONE)
 		ue_record->rel_had_container = 1;
-	// 열린 수립이면 CU 가 먼저 끊은 것임. RRCSetup 을 봤으면 NoReply, 그 전이면 Other
-	if (ue_record->setup_state == SR_OPEN) {
-		int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
-								 : ue_record->req_cell_index;
-		int terminal = SR_OPEN;   // 셀을 모르면 계수할 수 없으므로 상태는 그대로 두고 마감만 해제함
-		if (cell_index >= 0) {
-			struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
-			int fail_cause = ue_record->saw_setup_sent ? FC_NOREPLY : FC_OTHER;
-			cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][fail_cause]++;
-			cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][ue_record->path]++;
-			terminal = ue_record->saw_setup_sent ? SR_NOREPLY : SR_OTHER;
-		}
-		settle_open_setup(tr, ue_record, terminal);
-	}
 	/* 여기 CONNECTED 로 남은 것은 두 경우뿐임. 평문 RRCRelease 는 on_release 가 이미 상태를 잡아
 	 *   걸러짐.
 	 *   RRC 컨테이너가 없는 해제 명령이면 완전 해제가 확실하므로 RELEASED 에 정확 등급임.
@@ -2359,22 +2339,20 @@ static void on_ctx_release_cmd(struct tr *tr, const struct obs_event *event)
  *     N2 와 매칭돼 있으면, 명령과 완료 사이에 그 N2 의 NG 해제가 왔으면 완전 해제로 보고 세고, 안
  *     왔으면 NG 연결이 유지된 것이므로 suspend 로 보고 INACTIVE 로 둠(세지 않음).
  *     표준 순서상 완전 해제에서는 NG 해제가 F1 해제보다 먼저 와 그 표시가 제때 섬.
- *   부작용: 해제 카운터 증가 가능, 게이지 감소, 연결모드 갱신, 닫힘 줄 방출, 레코드 회수 */
+ *   부작용: 수립 실패 원인 카운팅, 해제 카운터 증가 가능, 게이지 감소, 연결모드 갱신, 닫힘 줄 방출,
+ *     레코드 회수 */
 static void on_ctx_release_complete(struct tr *tr, const struct obs_event *event)
 {
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
 	if (!ue_record) return;
 	// 닫힘 줄의 변경 비트는 이 핸들러가 실제로 바꾼 칸만 실음
 	int rrc_state_before = ue_record->rrc_state, nas_conn_mode_before = ue_record->nas_conn_mode;
-	if (ue_record->setup_state == SR_OPEN) {
-		// 명령을 못 본 채 완료가 옴 -> 원인 없는 미상
-		int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
-								 : ue_record->req_cell_index;
-		if (cell_index >= 0)
-			tr->cell_records[cell_index]
-				.cc_unknown_nocause[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE]++;
-		settle_open_setup(tr, ue_record, SR_UNKNOWN);
-	}
+	/* 수립이 아직 열린 채로 완료가 왔으면 응답 대기가 해제로 끝난 것이므로 Other 로 셈.
+	 *   TS 28.552 §5.1.1.15.3 c) "Each expected RRCSetupComplete message unreceived by the gNB
+	 *   after the RRCSetup message is added to the subcounter for cause 'NoReply'; and each failed
+	 *   RRC connection establishment caused by the other reasons is added to measurement cause
+	 *   'Other'." 마감이 먼저 떨어졌으면 상태가 열려 있지 않아 센 무응답이 그대로 남음 */
+	close_setup_other(tr, ue_record);
 	gauge_leave_conn(tr, ue_record);     // 게이지 감소는 명령이 아니라 완료에서 함
 	half_open_leave(tr, ue_record);
 	/* N2 와 매칭된 경우에만 추론함. 매칭이 없으면 추론을 금지하고 명령 핸들러가 남긴 미상을 유지함 -
