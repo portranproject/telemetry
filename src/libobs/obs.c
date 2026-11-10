@@ -902,6 +902,7 @@ static void handle_rrc_container(struct obs *obs, const struct sctp_message *sct
 		ue_state->reest_reactivated = false;
 		break;
 	case TR_EVENT_RRC_REJECT:
+		event.payload.reject.has_wait_time = rrc_msg.has_wait_time;
 		event.payload.reject.wait_time_s = rrc_msg.wait_time_s;
 		event.payload.reject.prior_req = ue_state->prior_req;
 		ue_state->resumed = false;
@@ -947,7 +948,10 @@ static void handle_rrc_container(struct obs *obs, const struct sctp_message *sct
 		}
 		break;
 	case TR_EVENT_RRC_SMC:
-		event.payload.smc.ciph_alg = rrc_msg.ciphering_algorithm.value; event.payload.smc.integ_alg = rrc_msg.integrity_algorithm.value;
+		event.payload.smc.ciph_alg = rrc_msg.ciphering_algorithm.value;
+		event.payload.smc.integ_alg = rrc_msg.integrity_algorithm.value;
+		event.payload.smc.ciph_alg_name = rrc_msg.ciphering_algorithm.name;
+		event.payload.smc.integ_alg_name = rrc_msg.integrity_algorithm.name;
 		ue_state->rrc_sec_state = TR_SEC_CMD_SENT; ue_state->ciph_alg = rrc_msg.ciphering_algorithm.value;   // 고른 알고리즘을 기록. 관문이 이 값으로 가독을 판정함
 		break;
 	case TR_EVENT_RRC_SMC_COMPLETE:
@@ -978,7 +982,10 @@ static void handle_rrc_container(struct obs *obs, const struct sctp_message *sct
 		if (rrc_msg.ciphering_algorithm.value < 0 && rrc_msg.integrity_algorithm.value < 0) kind = TR_EVENT_RRC_OTHER;   // securityConfig 가 없으면 OTHER 로
 		event.kind = kind;
 		if (kind == TR_EVENT_RRC_RECONFIG_SEC) {
-			event.payload.smc.ciph_alg = rrc_msg.ciphering_algorithm.value; event.payload.smc.integ_alg = rrc_msg.integrity_algorithm.value;
+			event.payload.smc.ciph_alg = rrc_msg.ciphering_algorithm.value;
+			event.payload.smc.integ_alg = rrc_msg.integrity_algorithm.value;
+			event.payload.smc.ciph_alg_name = rrc_msg.ciphering_algorithm.name;
+			event.payload.smc.integ_alg_name = rrc_msg.integrity_algorithm.name;
 			/* 세션 중 재키잉(RRCReconfiguration 의 securityConfig)이 알고리즘을 바꾸면 관문이 쓰는 ciph_alg 도
 			 * 갱신해야 함. 안 하면 수립이 NEA0 였다가 실제 암호로 재키된 뒤에도 관문이 계속 평문으로 열려
 			 * 거짓 가독이 상한 없이 남음. NEA0 에서 NEAx 로 바뀌는 것은 드물지만 fail-closed 원칙상 추적함. */
