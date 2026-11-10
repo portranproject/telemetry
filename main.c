@@ -55,11 +55,15 @@
  *
  * [5] 사용법.
  *
- *     sudo ./build/portran [옵션] <interface_name> ...
- *       NIC 하나에 이름 하나씩, 최대 MAX_INTERFACES 개. 같은 NIC 를 두 번 적으면 cap_open 이
- *       -EEXIST 로 거부함 - 패킷이 두 번 잡혀 지표가 두 배가 되기 때문임.
- *       F1 과 N2 를 가르는 것은 SCTP PPID 임(62 F1AP, 60 NGAP, 68/66 은 그 둘의 DTLS).
- *       명령행이 아니므로 둘이 같은 NIC 를 쓰면 그 NIC 를 한 번만 적으면 됨.
+ *     sudo ./build/portran [옵션] f1:<interface_name> n2:<interface_name> ...
+ *       두 역할을 다 적어야 함. 한쪽을 빼먹으면 그 인터페이스의 지표가 0 으로 나가고, 그 0 은
+ *       '그 구간에 사건이 없었다' 와 같은 모양이라 빠뜨린 것을 알 수 없음.
+ *       F1 과 N2 가 같은 NIC 로 흐르면 같은 이름을 두 역할에 적음 - 탭은 한 번만 붙임.
+ *       같은 NIC 를 두 번 붙이면 cap_open 이 -EEXIST 로 거부하고, 거부하지 않더라도 패킷이
+ *       두 번 잡힘. 최대 MAX_INTERFACES 개.
+ *       접두사는 '거기에 그것이 흐른다' 는 선언이고, 올라온 메시지를 F1AP 와 NGAP 로 가르는
+ *       것은 SCTP PPID 임(62 F1AP, 60 NGAP, 68/66 은 그 둘의 DTLS). 선언이 실제와 어긋나면
+ *       종료 보고가 지적하고, 선언한 쪽을 한 건도 못 봤으면 커버리지 불완전으로 끝냄.
  *
  *       -g <gp_ms>                      보고 주기 ms (기본값 단일출처는 tr.h)
  *       --sock <socket_path>            탐지 엔진이 듣는 유닉스 소켓
@@ -70,6 +74,7 @@
  *     닫음. 두 번이면 남은 처리를 건너뜀.
  */
 #include <errno.h>              // errno: 소켓 연결 실패 사유
+#include <net/if.h>             // if_nametoindex: 레코드의 인터페이스 번호를 선언한 이름과 맞춤
 #include <signal.h>             // sigaction: Ctrl+C(SIGINT) 및 SIGTERM
 #include <stdbool.h>
 #include <stdint.h>
@@ -92,6 +97,20 @@
  *   약 46 셀-시간이라, 형식 확인용 녹화가 이 값에 닿는 일은 없음 */
 #define RECORD_MAX_BYTES (1024ull * 1024ull * 1024ull)
 
+/* 명령행으로 선언한 인터페이스 한 칸.
+ *   플래그를 둘로 나눠 두는 이유: 같은 NIC 에 F1 과 N2 가 같이 흐르는 배치가 있어서 한 칸이 두
+ *     역할을 다 가질 수 있음. 역할 하나만 담는 칸으로 두면 그 배치를 적을 수 없음.
+ *   두 계수기를 함께 두는 이유: 선언은 운영자의 주장이고 PPID 가 사실임. 둘을 한 칸에 모아 두면
+ *     종료 보고가 그 자리에서 대조함 */
+struct declared_interface {
+	const char *interface_name;   // argv 를 그대로 가리킴. 프로세스가 끝날 때까지 살아 있어 복사하지 않음
+	uint32_t interface_index;     // cap_record.interface_index 와 맞춰 보는 커널 번호
+	bool is_f1_declared;
+	bool is_n2_declared;
+	uint64_t f1ap_message_count;  // 이 NIC 에서 PPID 62 로 올라온 SCTP 메시지 수
+	uint64_t ngap_message_count;  // 같은 NIC 에서 PPID 60 으로 올라온 수
+};
+
 /* 파이프라인 한 벌. 모든 콜백의 user_ctx 가 이 구조체를 가리킴 */
 struct pipeline {
 	struct cap *cap;                // 캡처(커널 탭). 커버리지 통계를 여기서 읽음
@@ -99,6 +118,10 @@ struct pipeline {
 	struct obs *obs;
 	struct tr *tr;
 	struct sink *sink;
+	/* 명령행으로 선언한 인터페이스 표. main 의 지역 배열을 빌려 씀(main 보다 오래 살지 않음).
+	 *   메시지가 올 때마다 NIC 별 PPID 계수기를 올리는 자리라 콜백에서 닿아야 함 */
+	struct declared_interface *declared_interfaces;
+	int declared_interface_count;
 	uint64_t last_capture_time_ns;  // 마지막으로 본 레코드의 시각. tr_finish 의 끝 시각으로 씀
 	                                //   라이브러리에 "지금 몇 시냐" 를 묻지 않음 - 관측한 시각만 씀
 
@@ -194,9 +217,31 @@ static void on_warning(void *user_ctx, const char *code, const char *detail)
 	fprintf(stderr, "[tr] 경고: %s%s%s\n", code, detail ? " - " : "", detail ? detail : "");
 }
 
+/* count_message_by_interface: 올라온 메시지를 NIC 별로 PPID 로 셈.
+ *   이유: 명령행의 역할 선언이 맞았는지 종료 때 대조하려면 '그 NIC 에서 그 프로토콜을 실제로
+ *     봤는가' 를 알아야 함. cap_stats 는 탭 전체의 합이라 NIC 별로 가를 수 없음.
+ *   분기에는 쓰지 않음 - F1AP 와 NGAP 를 가르는 것은 libobs 의 PPID 비교임.
+ *   표에 없는 NIC 번호는 셀 칸이 없어 버림. 선언한 NIC 만 붙이므로 생기지 않음 */
+static void count_message_by_interface(struct pipeline *pipeline, const struct sctp_message *sctp_message)
+{
+	if (!sctp_message->record)
+		return;
+	for (int i = 0; i < pipeline->declared_interface_count; i++) {
+		struct declared_interface *declared_interface = &pipeline->declared_interfaces[i];
+		if (declared_interface->interface_index != sctp_message->record->interface_index)
+			continue;
+		if (sctp_message->ppid == SCTP_PPID_F1AP)
+			declared_interface->f1ap_message_count++;
+		else if (sctp_message->ppid == SCTP_PPID_NGAP)
+			declared_interface->ngap_message_count++;
+		return;
+	}
+}
+
 static void on_message(void *user_ctx, const struct sctp_message *sctp_message)
 {
 	struct pipeline *pipeline = user_ctx;
+	count_message_by_interface(pipeline, sctp_message);
 	obs_on_sctp(pipeline->obs, sctp_message);
 }
 
@@ -259,10 +304,38 @@ static void on_record(void *user_ctx, const struct cap_record *record)
 	sctp_input(pipeline->sctp, record);                    // on_message -> obs -> on_obs -> tr_on_event -> sink
 }
 
+/* declare_interface: 이름으로 칸을 찾아 역할 플래그를 켬. 없으면 새 칸을 만듦.
+ *   같은 이름을 다시 받으면 칸을 늘리지 않고 플래그만 켜는 이유: 탭은 NIC 당 한 번만 붙여야 함.
+ *   반환: 칸을 확보했으면 true, MAX_INTERFACES 를 넘겼으면 false(부르는 쪽이 종료함) */
+static bool declare_interface(struct declared_interface *declared_interfaces, int *declared_interface_count,
+                              const char *interface_name, bool is_f1)
+{
+	for (int i = 0; i < *declared_interface_count; i++) {
+		if (strcmp(declared_interfaces[i].interface_name, interface_name))
+			continue;
+		if (is_f1)
+			declared_interfaces[i].is_f1_declared = true;
+		else
+			declared_interfaces[i].is_n2_declared = true;
+		return true;
+	}
+	if (*declared_interface_count >= MAX_INTERFACES)
+		return false;
+	struct declared_interface *declared_interface = &declared_interfaces[*declared_interface_count];
+	declared_interface->interface_name = interface_name;
+	declared_interface->is_f1_declared = is_f1;
+	declared_interface->is_n2_declared = !is_f1;
+	(*declared_interface_count)++;
+	return true;
+}
+
 static void usage(const char *program_name)
 {
 	fprintf(stderr,
-	        "사용: sudo %s [옵션] <interface_name> ...\n"
+	        "사용: sudo %s [옵션] f1:<interface_name> n2:<interface_name> ...\n"
+	        "  f1:<interface_name>         F1-C(CU<->DU)가 흐르는 NIC. 하나 이상 필요\n"
+	        "  n2:<interface_name>         N2(CU<->AMF)가 흐르는 NIC. 하나 이상 필요\n"
+	        "                              같은 NIC 로 둘 다 흐르면 같은 이름을 두 역할에 적음\n"
 	        "  -g <gp_ms>                  보고 주기 ms (기본 = 15분)\n"
 	        "  --sock <socket_path>        탐지 엔진이 듣는 유닉스 소켓 (기본 " SINK_DEFAULT_SOCKET_PATH ")\n"
 	        "  --record <file_path|->      보낸 줄을 그대로 남길 파일 (- = stdout). 형식 확인용\n"
@@ -276,8 +349,8 @@ int main(int argc, char **argv)
 {
 	const char *socket_path = NULL, *record_path = NULL, *node_id = NULL;
 	uint64_t gp_ms = 0;                      // 0 = libtelemetry 기본값(15분)
-	struct cap_interface interfaces[MAX_INTERFACES];
-	int interface_count = 0;
+	struct declared_interface declared_interfaces[MAX_INTERFACES] = { 0 };
+	int declared_interface_count = 0;
 
 	for (int i = 1; i < argc; i++) {
 		const char *argument = argv[i];
@@ -302,21 +375,42 @@ int main(int argc, char **argv)
 		else if (!strcmp(argument, "--node")   && has_value) node_id     = argv[++i];
 		else if (argument[0] == '-') { usage(argv[0]); return 2; }
 		else {
-			if (interface_count >= MAX_INTERFACES) {
+			/* 옵션이 아닌 인자는 `f1:<interface_name>` 또는 `n2:<interface_name>` 임.
+			 *   접두사를 요구하는 이유: 어느 NIC 가 어느 인터페이스인지를 운영자가 적게 해서,
+			 *     한쪽을 빼먹거나 거꾸로 적었을 때 종료 보고가 그 사실을 말할 수 있게 함.
+			 *   없는 이름은 cap_open 의 if_nametoindex 가 -ENODEV 로 거름 */
+			bool is_f1 = !strncmp(argument, "f1:", 3);
+			bool is_n2 = !strncmp(argument, "n2:", 3);
+			if (!is_f1 && !is_n2) {
+				fprintf(stderr, "인터페이스는 f1:<interface_name> 또는 n2:<interface_name> 로 적습니다: '%s'\n",
+				        argument);
+				return 2;
+			}
+			const char *interface_name = argument + 3;
+			if (*interface_name == '\0') {
+				fprintf(stderr, "인터페이스 이름이 비었습니다: '%s'\n", argument);
+				return 2;
+			}
+			if (!declare_interface(declared_interfaces, &declared_interface_count, interface_name, is_f1)) {
 				fprintf(stderr, "인터페이스가 너무 많습니다 (상한 %d)\n", MAX_INTERFACES);
 				return 2;
 			}
-			/* 옵션이 아닌 인자는 인터페이스 이름임. argv 는 프로세스가 끝날 때까지 살아 있어
-			 *   복사하지 않고 그대로 가리킴. 없는 이름은 cap_open 의 if_nametoindex 가 -ENODEV 로 거름.
-			 * role 을 상수로 두는 이유: libcap 이 F1/N2 중 하나를 요구하지만(cap.c 의 인자 검증)
-			 *   파이프라인은 이 값을 읽지 않음 - F1AP 와 NGAP 를 가르는 것은 SCTP PPID 임.
-			 *   명령행으로 받던 종전 방식은 틀리게 적어도 출력이 같아, 사용자가 잘못을 알 수 없었음 */
-			interfaces[interface_count].interface_name = argument;
-			interfaces[interface_count].role = CAP_ROLE_F1;
-			interface_count++;
 		}
 	}
-	if (interface_count == 0) { usage(argv[0]); return 2; }
+	/* 두 역할을 다 요구함. 한쪽이 없으면 그 인터페이스를 한 번도 안 봤다는 뜻인데, 출력에서는
+	 *   그 지표가 0 으로 나가 '그 구간에 사건이 없었다' 와 구별되지 않음. 우리는 수동 관측자라
+	 *   다시 달라고 할 수 없으므로 못 본 것을 못 봤다고 남겨야 함 */
+	bool has_f1_interface = false, has_n2_interface = false;
+	for (int i = 0; i < declared_interface_count; i++) {
+		if (declared_interfaces[i].is_f1_declared) has_f1_interface = true;
+		if (declared_interfaces[i].is_n2_declared) has_n2_interface = true;
+	}
+	if (!has_f1_interface || !has_n2_interface) {
+		fprintf(stderr, "F1 과 N2 인터페이스를 둘 다 적어야 합니다 (f1: %s, n2: %s)\n",
+		        has_f1_interface ? "있음" : "없음", has_n2_interface ? "있음" : "없음");
+		usage(argv[0]);
+		return 2;
+	}
 
 	/* 녹화 파일만 엶. 소켓은 출력 층이 스스로 열고 끊기면 다시 붙음 - 그 재접속 상태를 여기서
 	 * 들고 있으면 같은 것을 두 곳이 기억하게 됨 */
@@ -366,11 +460,34 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	int error = cap_open(interfaces, interface_count, &pipeline.cap);
+	/* libcap 에 넘기는 표. cap_interface 의 역할 칸은 F1 과 N2 중 하나만 담으므로 한 NIC 에 둘이
+	 *   다 흐르면 F1 로 넘김. libcap 은 이 값으로 분기하지 않고 인자 검증만 함(cap.c 의 role 검사) -
+	 *   올라온 메시지를 F1AP 와 NGAP 로 가르는 것은 SCTP PPID 임 */
+	struct cap_interface interfaces[MAX_INTERFACES];
+	for (int i = 0; i < declared_interface_count; i++) {
+		interfaces[i].interface_name = declared_interfaces[i].interface_name;
+		interfaces[i].role = declared_interfaces[i].is_f1_declared ? CAP_ROLE_F1 : CAP_ROLE_N2;
+	}
+
+	int error = cap_open(interfaces, declared_interface_count, &pipeline.cap);
 	if (error) {
 		fprintf(stderr, "cap_open: %s (부착은 root 권한이 필요합니다)\n", strerror(-error));
 		return 1;
 	}
+
+	/* 레코드의 인터페이스 번호와 맞출 수 있게 이름을 번호로 바꿔 둠. cap_open 이 통과한 뒤라
+	 *   이름은 전부 존재하지만, 0 이 오면 그 NIC 의 계수기가 영원히 0 이 되어 선언 대조가 거짓으로
+	 *   '못 봤음' 을 말하므로 여기서 멈춤 */
+	for (int i = 0; i < declared_interface_count; i++) {
+		declared_interfaces[i].interface_index = if_nametoindex(declared_interfaces[i].interface_name);
+		if (!declared_interfaces[i].interface_index) {
+			fprintf(stderr, "인터페이스 번호를 읽지 못했습니다: %s: %s\n",
+			        declared_interfaces[i].interface_name, strerror(errno));
+			return 1;
+		}
+	}
+	pipeline.declared_interfaces = declared_interfaces;
+	pipeline.declared_interface_count = declared_interface_count;
 
 	struct sigaction action = { 0 };
 	action.sa_handler = on_signal;
@@ -384,8 +501,11 @@ int main(int argc, char **argv)
 	sigaction(SIGPIPE, &ignore_action, NULL);
 
 	fprintf(stderr, "[+] 탭 부착: ");
-	for (int i = 0; i < interface_count; i++)
-		fprintf(stderr, "%s%s", i ? " " : "", interfaces[i].interface_name);
+	for (int i = 0; i < declared_interface_count; i++)
+		fprintf(stderr, "%s%s(%s%s%s)", i ? " " : "", declared_interfaces[i].interface_name,
+		        declared_interfaces[i].is_f1_declared ? "F1" : "",
+		        declared_interfaces[i].is_f1_declared && declared_interfaces[i].is_n2_declared ? "+" : "",
+		        declared_interfaces[i].is_n2_declared ? "N2" : "");
 	fprintf(stderr, " - Ctrl+C 로 종료\n");
 
 	/* ── 수집 루프 ─────────────────────────────────────────────────────── */
@@ -446,6 +566,48 @@ int main(int argc, char **argv)
 			fprintf(stderr, "%s%llu", slot_index ? "," : "", (unsigned long long)cap_stats.slot_used_count[slot_index]);
 		fputc('\n', stderr);
 	}
+
+	/* 명령행의 역할 선언을 실제로 본 프로토콜과 대조함.
+	 *   왜 필요한가: 선언만 받고 대조하지 않으면 틀리게 적어도 출력이 같아 알 수 없음. 특히 한쪽
+	 *     NIC 를 빼먹으면 그 지표가 0 으로 나가는데, 그 0 은 '그 구간에 사건이 없었다' 와 같은
+	 *     모양임. 못 본 것을 못 봤다고 남기는 것이 관측자의 기능임.
+	 *   선언하지 않은 쪽이 올라온 경우는 커버리지 불완전으로 올리지 않음 - 분기는 PPID 가 하므로
+	 *     지표는 맞게 나오고, 틀린 것은 운영자가 적은 선언뿐임 */
+	fprintf(stderr, "[cap] 인터페이스별 메시지 수(SCTP PPID 로 셈)\n");
+	for (int i = 0; i < pipeline.declared_interface_count; i++) {
+		const struct declared_interface *declared_interface = &pipeline.declared_interfaces[i];
+		fprintf(stderr, "[cap]   %s 선언=%s%s%s F1AP=%llu NGAP=%llu\n",
+		        declared_interface->interface_name,
+		        declared_interface->is_f1_declared ? "F1" : "",
+		        declared_interface->is_f1_declared && declared_interface->is_n2_declared ? "+" : "",
+		        declared_interface->is_n2_declared ? "N2" : "",
+		        (unsigned long long)declared_interface->f1ap_message_count,
+		        (unsigned long long)declared_interface->ngap_message_count);
+		if (declared_interface->is_f1_declared && !declared_interface->f1ap_message_count) {
+			fprintf(stderr, "[cap]   %s: F1 로 선언했으나 F1AP(PPID %d)를 한 건도 못 봤습니다\n",
+			        declared_interface->interface_name, SCTP_PPID_F1AP);
+			coverage_incomplete = 1;
+		}
+		if (declared_interface->is_n2_declared && !declared_interface->ngap_message_count) {
+			fprintf(stderr, "[cap]   %s: N2 로 선언했으나 NGAP(PPID %d)를 한 건도 못 봤습니다\n",
+			        declared_interface->interface_name, SCTP_PPID_NGAP);
+			coverage_incomplete = 1;
+		}
+		if (!declared_interface->is_f1_declared && declared_interface->f1ap_message_count)
+			fprintf(stderr, "[cap]   %s: F1 로 선언하지 않았는데 F1AP 가 올라왔습니다 (선언을 고쳐야 함)\n",
+			        declared_interface->interface_name);
+		if (!declared_interface->is_n2_declared && declared_interface->ngap_message_count)
+			fprintf(stderr, "[cap]   %s: N2 로 선언하지 않았는데 NGAP 가 올라왔습니다 (선언을 고쳐야 함)\n",
+			        declared_interface->interface_name);
+	}
+
+	/* 두 탭이 같은 패킷을 같이 봤는지 알 수 있는 유일한 신호임. libsctp 가 연결 안에서 TSN 으로
+	 *   걸러 지표가 두 배가 되지는 않지만, 그 수를 읽는 곳이 없으면 겹친 사실을 아무도 모름.
+	 *   재전송으로도 올라가므로 0 이 아닌 것 자체가 결함은 아님 - 그래서 종료 코드를 바꾸지 않음 */
+	const struct sctp_stats *sctp_stats = sctp_get_stats(pipeline.sctp);
+	if (sctp_stats && sctp_stats->duplicate_chunk_count)
+		fprintf(stderr, "[sctp] 이미 본 TSN 으로 버린 청크 %llu 개 (재전송이거나 두 탭이 같은 패킷을 본 것)\n",
+		        (unsigned long long)sctp_stats->duplicate_chunk_count);
 
 	/* 관측기 계측을 전부 찍음. 계수기를 올려도 읽는 쪽이 없으면 절반만 한 것임 - 소비자가
 	 *   obs_internal_loss 하나뿐이던 동안 direction_unknown_count 등은 어떤 출력에도 닿지 않는
