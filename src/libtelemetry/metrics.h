@@ -39,6 +39,22 @@
 	Y("mps-PriorityAccess") Y("mcs-PriorityAccess") \
 	Y("spare6") Y("spare5") Y("spare4") \
 	Y("spare3") Y("spare2") Y("spare1")
+/* 수립 원인 칸 번호. 위 TR_CAUSE_EST16 의 순번과 같고, 그 순번은 고정 문법
+ * asn1/nr-rrc-17.3.0.asn1:1397 EstablishmentCause 의 값 순서임. 번호를 쓰는 곳은 이 열거형
+ * 하나뿐이어야 함 - 숫자를 코드에 다시 적으면 문법을 올렸을 때 한쪽만 바뀌어도 컴파일됨.
+ * spare6~spare1(10~15)은 뜻이 없어 이름을 두지 않음 */
+enum tr_est_cause {
+	TR_EST_CAUSE_EMERGENCY            = 0,
+	TR_EST_CAUSE_HIGH_PRIORITY_ACCESS = 1,
+	TR_EST_CAUSE_MT_ACCESS            = 2,
+	TR_EST_CAUSE_MO_SIGNALLING        = 3,
+	TR_EST_CAUSE_MO_DATA              = 4,
+	TR_EST_CAUSE_MO_VOICE_CALL        = 5,
+	TR_EST_CAUSE_MO_VIDEO_CALL        = 6,
+	TR_EST_CAUSE_MO_SMS               = 7,
+	TR_EST_CAUSE_MPS_PRIORITY_ACCESS  = 8,
+	TR_EST_CAUSE_MCS_PRIORITY_ACCESS  = 9
+};
 /* 칸 수는 고정한 문법(asn1/ngap-15.8.0.asn1)의 값 개수와 같아야 함. 그 문법의
  * RRCEstablishmentCause 는 0~10 열한 개이고 notAvailable 이 유일한 확장값임.
  * mo-ExceptionData 는 Release 16 추가라 이 문법으로는 관측 자체가 불가하므로 칸을 두지 않음 -

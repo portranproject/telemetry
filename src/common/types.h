@@ -95,6 +95,15 @@ enum tr_ap_outcome {
 	TR_AP_OUTCOME_FAILURE        /* unsuccessfulOutcome */
 };
 
+/* Overload Action 값. payload.overload.action_mask 의 비트 위치이고, 값 순서는 고정 문법
+ *   asn1/ngap-15.8.0.asn1:4399 OverloadAction 과 같음. 이름은 그 문법의 값 이름을 옮긴 것임 */
+enum tr_overload_action {
+	TR_OVERLOAD_REJECT_NON_EMERGENCY_MO_DT       = 0,
+	TR_OVERLOAD_REJECT_RRC_CR_SIGNALLING         = 1,
+	TR_OVERLOAD_PERMIT_EMERGENCY_AND_MT_ONLY     = 2,
+	TR_OVERLOAD_PERMIT_HIGH_PRIORITY_AND_MT_ONLY = 3
+};
+
 /* ---- 이벤트 종류 (번호 고정) ------------------------------------------------------ */
 enum tr_event_kind {
 	TR_EVENT_RRC_SETUP_REQUEST          = 1,

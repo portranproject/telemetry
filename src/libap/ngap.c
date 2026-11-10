@@ -162,8 +162,8 @@
 // NRCellIdentity ::= BIT STRING (SIZE(36)) (TS 38.413 §9.3.1.7)
 #define NR_CELL_IDENTITY_BITS 36
 
-// asn1c 가 모르는 open type 을 버릴 때마다 +1 
-// TODO: libap 밖 의존. 정의는 asn1/asn1_glue.c (libasn1skel.a 에 링크) 확인 가능 
+// asn1c 가 모르는 open type 을 버릴 때마다 +1
+// TODO: libap 밖 의존. 정의는 asn1/asn1_glue.c (libasn1skel.a 에 링크) 확인 가능
 extern unsigned long asn_portran_opentype_skipped_count;
 
 

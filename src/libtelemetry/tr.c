@@ -849,11 +849,11 @@ static void tr_self_check(struct tr *tr)
 		if (cell_record->ue_context_gauge < 0) inv_fail(tr, "ue_context_gauge<0", cell_index, 0);
 	}
 	// 멤버십 대조표
-	size_t tally_count = cell_count ? cell_count : 1;
-	int32_t (*conn_gauges)[3] = calloc(tally_count, sizeof *conn_gauges);
-	int32_t (*inactive_gauges)[3] = calloc(tally_count, sizeof *inactive_gauges);
-	int32_t  *half_open_gauges     = calloc(tally_count, sizeof *half_open_gauges);
-	int32_t  *ue_context_gauges    = calloc(tally_count, sizeof *ue_context_gauges);
+	size_t gauge_slot_count = cell_count ? cell_count : 1;
+	int32_t (*conn_gauges)[3] = calloc(gauge_slot_count, sizeof *conn_gauges);
+	int32_t (*inactive_gauges)[3] = calloc(gauge_slot_count, sizeof *inactive_gauges);
+	int32_t *half_open_gauges = calloc(gauge_slot_count, sizeof *half_open_gauges);
+	int32_t *ue_context_gauges = calloc(gauge_slot_count, sizeof *ue_context_gauges);
 	if (!conn_gauges || !inactive_gauges || !half_open_gauges || !ue_context_gauges) {
 		// 대조표를 못 잡으면 검사를 건너뜀. 검사 자체가 진단이므로 여기서 중단하지 않음
 		free(conn_gauges); free(inactive_gauges); free(half_open_gauges); free(ue_context_gauges);
@@ -1374,26 +1374,37 @@ static void amf_drop_assoc(struct tr *tr, uint32_t assoc_id)
 		else i++;
 }
 /* Overload Action 값에서 거부되는 수립 원인 집합을 냄(TS 38.413 §8.7.7.2).
- *   action_mask = 1u << overloadAction 이고, 값의 뜻은
- *     0 = 비응급 발신 데이터 거부, 1 = 신호용 연결 거부,
- *     2 = 응급과 착신만 허용,     3 = 고우선과 착신만 허용
+ *   action_mask = 1u << overloadAction 이고 비트 위치는 enum tr_overload_action 임.
  *   종전에는 이 값을 무시하고 모든 action 에 같은 원인 집합을 적용했음. 넷 중 하나만 우연히
- *   맞고 나머지 셋이 틀렸는데, 0 은 신호용 연결을 과잉 거부하고 '만 허용' 두 값은 대부분을
- *   과소 거부했음.
- *   원인 칸 번호: emergency 0, highPriorityAccess 1, mtAccess 2, moSignalling 3, moData 4,
- *   moVoiceCall 5, moVideoCall 6, moSMS 7, mpsPriorityAccess 8, mcsPriorityAccess 9, spare 10~15 */
+ *   맞고 나머지 셋이 틀렸는데, 비응급 발신 데이터 거부는 신호용 연결을 과잉 거부하고
+ *   '만 허용' 두 값은 대부분을 과소 거부했음.
+ *   원인 번호를 여기 적지 않는 이유: 그 번호는 enum tr_est_cause 하나에만 둠. 두 곳에 적으면
+ *     문법을 올렸을 때 한쪽만 바뀌어도 컴파일됨 */
 static int action_covers(uint32_t mask, int est_cause)
 {
-	// 비응급 발신 데이터
-	if (mask & (1u << 0)) return est_cause == 4 || est_cause == 5 || est_cause == 6 || est_cause == 7;
-	// 위에 신호용 연결을 더함
-	if (mask & (1u << 1))
-		return est_cause == 3 || est_cause == 4 || est_cause == 5 || est_cause == 6 || est_cause == 7;
-	// 응급과 착신만 허용이므로 그 둘 외 전부 거부
-	if (mask & (1u << 2)) return !(est_cause == 0 || est_cause == 2);
-	// 고우선과 우선순위 둘, 착신만 허용
-	if (mask & (1u << 3))
-		return !(est_cause == 1 || est_cause == 8 || est_cause == 9 || est_cause == 2);
+	bool is_mo_traffic = est_cause == TR_EST_CAUSE_MO_DATA
+			|| est_cause == TR_EST_CAUSE_MO_VOICE_CALL
+			|| est_cause == TR_EST_CAUSE_MO_VIDEO_CALL
+			|| est_cause == TR_EST_CAUSE_MO_SMS;
+	bool is_emergency_or_mt = est_cause == TR_EST_CAUSE_EMERGENCY
+			|| est_cause == TR_EST_CAUSE_MT_ACCESS;
+	bool is_priority_or_mt = est_cause == TR_EST_CAUSE_HIGH_PRIORITY_ACCESS
+			|| est_cause == TR_EST_CAUSE_MPS_PRIORITY_ACCESS
+			|| est_cause == TR_EST_CAUSE_MCS_PRIORITY_ACCESS
+			|| est_cause == TR_EST_CAUSE_MT_ACCESS;
+
+	// 비응급 발신 데이터를 거부함
+	if (mask & (1u << TR_OVERLOAD_REJECT_NON_EMERGENCY_MO_DT))
+		return is_mo_traffic;
+	// 위에 신호용 연결을 더해 거부함
+	if (mask & (1u << TR_OVERLOAD_REJECT_RRC_CR_SIGNALLING))
+		return is_mo_traffic || est_cause == TR_EST_CAUSE_MO_SIGNALLING;
+	// 응급과 착신만 허용이므로 그 둘 외 전부 거부함
+	if (mask & (1u << TR_OVERLOAD_PERMIT_EMERGENCY_AND_MT_ONLY))
+		return !is_emergency_or_mt;
+	// 고우선과 우선순위 둘과 착신만 허용함
+	if (mask & (1u << TR_OVERLOAD_PERMIT_HIGH_PRIORITY_AND_MT_ONLY))
+		return !is_priority_or_mt;
 	// 빈 마스크나 모르는 값이면 거부 목록을 알 수 없음. 부르는 쪽이 미상으로 처리함
 	return 0;
 }
