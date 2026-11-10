@@ -724,14 +724,14 @@ static enum ngap_result ie_take(struct ngap_msg *ngap_msg, struct ngap_internal 
 		ngap_msg->duplicate_ie_count++;
 		return NGAP_OK;
 	}
-	/* 타입을 **마스크보다 먼저** 봄. 거꾸로 두면 타입이 틀린 IE 가 그 칸을 '봤음' 으로 점유해,
-	   뒤에 온 올바른 IE 가 duplicate_ie_count 로 둔갑함 — 타입 혼동 입력과 중복 송신이 같은 모양이 됨.
+	/* 타입을 마스크보다 먼저 봄. 거꾸로 두면 타입이 틀린 IE 가 그 칸을 '봤음' 으로 점유해, 뒤에 온
+	   올바른 IE 가 duplicate_ie_count 로 둔갑함 — 타입 혼동 입력과 중복 송신이 같은 모양이 됨.
 
-	   도달 가능성: 15.8.0 문법에서는 **도달하지 않음.** ie->type 은 asn1c 가 IE 번호로 고른 CHOICE
-	   가지이고, 이 문법은 IE 번호 151개 전부가 값 타입 하나씩임((ID, TYPE) 항목 395개를 전수로 재서
-	   번호 하나에 타입 둘인 경우 0개). 그래도 분기와 계수기를 두는 이유: 상대가 우리보다 새 판이어서
-	   어떤 번호의 타입이 바뀌면 그때 조용히 틀리기 때문임. 수동 관측자는 다시 달라고 할 수 없어
-	   못 읽은 것을 '없었다' 로 처리하면 지표가 조용히 거짓이 됨(§5 fail-closed 2걸음). */
+	   도달 가능성: 15.8.0 문법에서는 도달하지 않음. ie->type 은 asn1c 가 IE 번호로 고른 CHOICE
+	   가지이고, 이 문법은 최상위 IE 컨테이너가 쓰는 IE 번호 150개 전부가 값 타입 하나씩임
+	   ((ID, TYPE) 항목 395개를 전수로 재서 번호 하나에 타입 둘인 경우 0개). 그래도 분기와 계수기를
+	   두는 이유: 상대가 우리보다 새 판이어서 어떤 번호의 타입이 바뀌면 그때 조용히 틀리기 때문임.
+	   수동 관측자는 다시 달라고 할 수 없어, 못 읽은 것을 '없었다' 로 처리하면 지표가 조용히 거짓이 됨. */
 	if (ie->type != TAKEN_IES[taken_index].type) {
 		ngap_msg->type_mismatch_ie_count++;
 		return NGAP_OK;

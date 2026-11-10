@@ -199,11 +199,11 @@ struct obs_nas_values {
 	int reg_type;            /* REGISTRATION REQUEST 의 5GS 등록 유형(TS 24.501 §9.11.3.7) */
 	int id_type;             /* 5GS mobile identity 의 신원 종류(표 9.11.3.4.1) */
 	int switch_off;          /* DEREGISTRATION REQUEST 의 Switch off 비트(표 9.11.3.20.1) */
-	int mm_cause;            /* 5GMM cause 번호(§9.11.3.2) */
+	int mm_cause;            /* 5GMM cause 번호(TS 24.501 §9.11.3.2) */
 	bool has_stmsi48;        /* 48비트를 담았나. 신원 종류 2(5G-GUTI)와 4(5G-S-TMSI)에서만 참 */
 	uint64_t stmsi48;
-	/* 이 메시지가 NAS SECURITY MODE COMMAND 일 때 **그 SMC 가 고른** 알고리즘.
-	 *   메시지를 **풀 때 쓴** 알고리즘(앞선 SMC 에서 학습한 값)과 다른 개념임. 한 칸이 둘을 겸하면
+	/* 이 메시지가 NAS SECURITY MODE COMMAND 일 때, 그 SMC 가 고른 알고리즘.
+	 *   메시지를 풀 때 쓴 알고리즘(앞선 SMC 에서 학습한 값)과는 다른 개념임. 한 칸이 둘을 겸하면
 	 *   SMC 줄에 학습 이전 값(첫 SMC 면 -1)이 실려 나감 = 조용한 오값.
 	 *   푸는 데 쓴 값은 obs 안에만 있으면 되므로 이벤트로 올리지 않음 */
 	int smc_ciph_alg;
@@ -295,7 +295,7 @@ struct obs_event {
 		/* reset: 22, 46.
 		 *   F1 SETUP 이 RESET 과 같은 칸을 쓰는 이유: F1 SETUP 은 F1 인터페이스 (재)초기화이고
 		 *   (TS 38.473 §8.2.3), 받는 쪽의 UE 컨텍스트를 전부 지움 — RESET(전체)과 같은 효과임.
-		 *   cells 와 ues 는 **빌려 쓰는 포인터**로 콜백이 돌아가는 동안만 유효함. */
+		 *   cells 와 ues 는 빌려 쓰는 포인터임. 콜백이 돌아가는 동안만 유효함. */
 		struct { enum tr_scope scope;                 /* SETUP 은 늘 TR_SCOPE_ALL */
 		         const struct tr_nr_cgi *cells; int cell_count;
 		         bool cells_known;                    /* 거짓 = 그 DU 의 셀을 모름. 읽는 쪽은 '모든 셀' 로 봄 */
