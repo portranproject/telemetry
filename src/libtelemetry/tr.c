@@ -995,3 +995,411 @@ static void inv_soft_succ_le_att(struct tr *tr, const struct tr_cell_record *cel
 	}
 }
 
+// ---- 마감(대기 시간) ----
+/* 무응답 대기는 이 세션 전체에 한 값임. 셀마다 다르게 두지 않는 이유: 출력 쪽이 임계를 광고하는
+ * 지점은 접속마다 한 번뿐이라 셀별 값을 실을 곳이 없고, 광고값과 실제 임계가 어긋나면 읽는 쪽이
+ * 시도 창을 틀린 칸 수만큼 밀어 무응답과 매칭함.
+ * 함수 이름을 설정 필드 이름과 같게 두지 않는 이유: 같으면 지역 변수가 자기 초기화식에서 같은
+ * 이름의 함수를 가리고 그래도 컴파일되는 위치가 생김. 역할을 앞에 붙여 가름 */
+static uint32_t applied_noreply_timeout_ms(const struct tr *tr)
+{
+	return tr->tr_cfg.noreply_timeout_ms ? tr->tr_cfg.noreply_timeout_ms : TR_DEF_NOREPLY_TIMEOUT_MS;
+}
+static uint32_t applied_setup_outcome_timeout_ms(const struct tr *tr)
+{
+	return tr->tr_cfg.setup_outcome_timeout_ms ? tr->tr_cfg.setup_outcome_timeout_ms
+						    : TR_DEF_SETUP_OUTCOME_TIMEOUT_MS;
+}
+
+/* setup_recompute_deadline: 열린 수립 하나의 마감을 다시 잡음.
+ *   구간이 둘이라 값도 둘임(tr.h 가 두 구간을 표로 적어 둠). Msg4 를 봤으면 그 시각부터 무응답
+ *   대기이고, 못 봤으면 Msg3 시각부터 결과를 못 봤다고 포기하는 창임. 한 값으로 묶으면 둘 중 하나가 틀림 */
+static void setup_recompute_deadline(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	uint64_t base_ns = ue_record->saw_setup_sent ? ue_record->setup_sent_time_ns : ue_record->request_time_ns;
+	uint32_t timeout_ms = ue_record->saw_setup_sent ? applied_noreply_timeout_ms(tr)
+							: applied_setup_outcome_timeout_ms(tr);
+	ue_record->deadline_ns = base_ns + (uint64_t)timeout_ms * 1000000ull;
+	if (ue_record->open_in_list) heap_fix(tr, ue_record->open_pos);   // 이미 heap 에 있으면 키가 바뀐 것이라 다시 정렬
+}
+
+// ---- 주기 머신 ----
+static uint64_t period_start_for(struct tr *tr, uint64_t now_ns)
+{
+	// 원점이 0 이면 벽시계의 주기 배수에 맞춤. 0 이 아니면 그 시각을 원점으로 삼아 다른 구현과 대조할 때 씀
+	uint64_t gp_origin_ns = tr->tr_cfg.gp_origin_ns;
+	// 원점이 미래면 빼기가 음수로 돌아가므로 첫 주기를 원점에서 시작함
+	if (now_ns <= gp_origin_ns) return gp_origin_ns;
+	return gp_origin_ns + ((now_ns - gp_origin_ns) / tr->gp_ns) * tr->gp_ns;
+}
+static void engine_start(struct tr *tr, uint64_t now_ns)
+{
+	tr->gp_ns = (uint64_t)(tr->tr_cfg.gp_ms ? tr->tr_cfg.gp_ms : DEF_GP_MS) * 1000000ull;
+	tr->cur_start_ns = period_start_for(tr, now_ns);
+	tr->cur_end_ns = tr->cur_start_ns + tr->gp_ns;
+	uint64_t conn_period_ns = (uint64_t)(tr->tr_cfg.conn_sample_period_ms ? tr->tr_cfg.conn_sample_period_ms
+									 : DEF_CONN_SAMPLE_PERIOD_MS) * 1000000ull;
+	uint64_t inactive_period_ns = (uint64_t)(tr->tr_cfg.inactive_sample_period_ms ? tr->tr_cfg.inactive_sample_period_ms
+										 : DEF_INACTIVE_SAMPLE_PERIOD_MS) * 1000000ull;
+	// 첫 표본은 now_ns 를 넘는 첫 경계임. 주기는 시작 시각을 빼고 끝 시각을 넣는 구간이기 때문임
+	tr->next_conn_sample_ns = (now_ns / conn_period_ns + 1) * conn_period_ns;
+	tr->next_inactive_sample_ns = (now_ns / inactive_period_ns + 1) * inactive_period_ns;
+	tr->now_ns = now_ns; tr->started = 1; tr->first_period = 1;
+}
+
+static void sample_conn(struct tr *tr)
+{
+	tr->conn_sample_count++;   // 주기 도중에 생긴 셀의 앞쪽 0 표본을 채우는 기준임
+	for (uint32_t i = 0; i < tr->cell_count; i++) {
+		struct tr_cell_record *cell_record = &tr->cell_records[i];
+		uint64_t lower = (uint64_t)(cell_record->conn_gauge[LV_EXACT] > 0 ? cell_record->conn_gauge[LV_EXACT] : 0);
+		uint64_t value = lower
+			+ (uint64_t)(cell_record->conn_gauge[LV_INFERRED] > 0 ? cell_record->conn_gauge[LV_INFERRED] : 0);
+		uint64_t half_open = (uint64_t)(cell_record->half_open_gauge > 0 ? cell_record->half_open_gauge : 0);
+		uint64_t upper = value
+			+ (uint64_t)(cell_record->conn_gauge[LV_UNKNOWN] > 0 ? cell_record->conn_gauge[LV_UNKNOWN] : 0)
+			+ half_open;
+		cell_record->conn_sum[0] += lower; cell_record->conn_sum[1] += value; cell_record->conn_sum[2] += upper;
+		cell_record->conn_sample_count++;
+		if ((uint32_t)lower  > cell_record->conn_max[0]) cell_record->conn_max[0] = (uint32_t)lower;
+		if ((uint32_t)value > cell_record->conn_max[1]) cell_record->conn_max[1] = (uint32_t)value;
+		if ((uint32_t)upper  > cell_record->conn_max[2]) cell_record->conn_max[2] = (uint32_t)upper;
+		cell_record->half_open_sum += half_open;
+		if ((uint32_t)half_open > cell_record->half_open_max) cell_record->half_open_max = (uint32_t)half_open;
+	}
+}
+static void sample_inactive(struct tr *tr)
+{
+	tr->inactive_sample_count++;
+	for (uint32_t i = 0; i < tr->cell_count; i++) {
+		struct tr_cell_record *cell_record = &tr->cell_records[i];
+		uint64_t lower = (uint64_t)(cell_record->inactive_gauge[LV_EXACT] > 0
+						? cell_record->inactive_gauge[LV_EXACT] : 0);
+		uint64_t value = lower + (uint64_t)(cell_record->inactive_gauge[LV_INFERRED] > 0
+							? cell_record->inactive_gauge[LV_INFERRED] : 0);
+		uint64_t upper = value + (uint64_t)(cell_record->inactive_gauge[LV_UNKNOWN] > 0
+							? cell_record->inactive_gauge[LV_UNKNOWN] : 0);
+		cell_record->inactive_sum[0] += lower; cell_record->inactive_sum[1] += value;
+		cell_record->inactive_sum[2] += upper; cell_record->inactive_sample_count++;
+		if ((uint32_t)lower  > cell_record->inactive_max[0]) cell_record->inactive_max[0] = (uint32_t)lower;
+		if ((uint32_t)value > cell_record->inactive_max[1]) cell_record->inactive_max[1] = (uint32_t)value;
+		if ((uint32_t)upper  > cell_record->inactive_max[2]) cell_record->inactive_max[2] = (uint32_t)upper;
+	}
+}
+
+static void fill_si_mean(struct tr_si *si_stats, const uint64_t sums[3], uint32_t sample_count,
+			 int upper_invalid, int unbounded)
+{
+	memset(si_stats, 0, sizeof *si_stats);
+	si_stats->si_sum[0] = sums[0]; si_stats->si_sum[1] = sums[1]; si_stats->si_sum[2] = sums[2];
+	si_stats->sample_count = sample_count;
+	si_stats->upper_valid = !upper_invalid; si_stats->upper_unbounded = unbounded;
+	if (sample_count) {
+		si_stats->has_value = true;
+		si_stats->lower = (double)sums[0] / sample_count;
+		si_stats->value = (double)sums[1] / sample_count;
+		si_stats->upper = (double)sums[2] / sample_count;
+		si_stats->floor_value = (int64_t)(sums[1] / sample_count);
+	}
+}
+static void fill_si_max(struct tr_si *si_stats, const uint32_t max_values[3], const uint64_t sums[3],
+			uint32_t sample_count, int upper_invalid, int unbounded)
+{
+	memset(si_stats, 0, sizeof *si_stats);
+	si_stats->si_sum[0] = sums[0]; si_stats->si_sum[1] = sums[1]; si_stats->si_sum[2] = sums[2];
+	si_stats->sample_count = sample_count;
+	si_stats->upper_valid = !upper_invalid; si_stats->upper_unbounded = unbounded;
+	if (sample_count) {
+		si_stats->has_value = true;
+		si_stats->lower = (double)max_values[0]; si_stats->value = (double)max_values[1];
+		si_stats->upper = (double)max_values[2];
+		si_stats->floor_value = (int64_t)max_values[1];
+	}
+}
+
+static void emit_cell_period(struct tr *tr, struct tr_cell_record *cell_record, int partial)
+{
+	inv_soft_succ_le_att(tr, cell_record);   // 경고만 하는 진단. 셀마다 succ <= att 를 봄
+	if (!tr->sink_ops.on_period) return;
+	struct tr_report_header report_header;
+	memset(&report_header, 0, sizeof report_header);
+	report_header.cell = cell_record->cell;
+	report_header.period_start_ns = tr->cur_start_ns; report_header.period_end_ns = tr->cur_end_ns;
+	report_header.gp_ms = tr->tr_cfg.gp_ms ? tr->tr_cfg.gp_ms : DEF_GP_MS;
+	report_header.partial = partial || tr->first_period;
+	// 주기 끝까지 확인됐을 때만 참임. 중간까지만 확인된 주기는 뒷부분을 못 본 것이라 0 으로 셀 수 없음
+	report_header.capture_alive = tr->capture_alive_until_ns >= report_header.period_end_ns;
+	report_header.late_join = cell_record->late_join;
+	report_header.n2_observed = tr->n2_observed;
+	report_header.assume_no_inactive = tr->tr_cfg.assume_no_inactive;
+	report_header.late_event_count = tr->late_event_count;
+	report_header.lost_evicted_count = tr->lost_evicted_count;
+	report_header.inactive_alarm_count = tr->inactive_alarm_count;
+	report_header.release_basis_observed_count = tr->release_basis_observed_count;
+	report_header.release_basis_assumed_count = tr->release_basis_assumed_count;
+	/* 관측 맹점 신호는 이 주기의 델타임(누적 - 주기 시작 스냅샷). 링 버퍼 넘침과 IP 조각은 어느 셀의
+	 * 것인지 가릴 수 없어 모든 셀에 같은 값을 복제함.
+	 * 정상 입력은 한 번의 실행 안에서 단조증가라 누적 >= 스냅샷이 보장되지만, 줄어든 누적이 들어오면
+	 * uint64 가 거꾸로 돌아가므로 0 으로 막음 */
+	#define COVERAGE_DELTA(cur, snap) ((cur) >= (snap) ? (cur) - (snap) : 0)
+	report_header.tsn_gap_count        = COVERAGE_DELTA(tr->coverage_tsn_gap_count,
+							   tr->coverage_snapshot_tsn_gap_count);
+	report_header.ringbuf_full_count    = COVERAGE_DELTA(tr->coverage_ringbuf_full_count,
+							 tr->coverage_snapshot_ringbuf_full_count);
+	report_header.esp_seen_count        = COVERAGE_DELTA(tr->coverage_esp_seen_count,
+							 tr->coverage_snapshot_esp_seen_count);
+	report_header.ip_frag_skipped_count = COVERAGE_DELTA(tr->coverage_ip_frag_skipped_count,
+							 tr->coverage_snapshot_ip_frag_skipped_count);
+	report_header.obs_lost_count        = COVERAGE_DELTA(tr->coverage_obs_lost_count,
+							 tr->coverage_snapshot_obs_lost_count);
+	#undef COVERAGE_DELTA
+	// 위 다섯 칸은 탭 전체의 값을 모든 셀에 복제한 것임. 읽는 쪽은 셀 사이에 더하지 말고 최댓값이나 첫 값을 쓸 것
+	report_header.coverage_tapwide     = true;
+	report_header.noreply_timeout_ms = applied_noreply_timeout_ms(tr);
+	/* 재개가 하나도 없었다고 증명하려면 네 조건이 모두 서야 함 - 재개 요청 0, 넘어온 미완 재개 0,
+	 * 유실 0, 늦게 붙은 레코드 0. 그중 넘어온 미완 재개와 늦게 붙은 UL SRB1 레코드는 관측 층이
+	 * 알려 주지 않아 추적할 수 없으므로 false 로 둠. 모르는 조건을 증명됐다고 주장하지 않음 */
+	report_header.resume_none_proven = false;
+	report_header.late_join_ul_srb1_count = 0;   // 관측 층이 이 수를 내보내지 않아 추적 불가
+	report_header.reset_unresolved_count = tr->reset_unresolved_count;
+
+	struct tr_period_report report;
+	memset(&report, 0, sizeof report);
+	report.report_header = &report_header;
+	report.ue_context_max = cell_record->ue_context_max;
+	report.initial_ul_count = cell_record->initial_ul_count;
+	report.no_du_to_cu_count = cell_record->no_du_to_cu_count;
+	report.diag_half_open.si_sum[2] = cell_record->half_open_sum;
+	{
+		struct tr_si *si_stats = &report.diag_half_open;
+		si_stats->sample_count = cell_record->conn_sample_count;
+		if (cell_record->conn_sample_count) {
+			si_stats->has_value = true;
+			si_stats->value = si_stats->lower =
+				(double)cell_record->half_open_sum / cell_record->conn_sample_count;
+			si_stats->upper = (double)cell_record->half_open_max;
+			si_stats->floor_value = (int64_t)(cell_record->half_open_sum / cell_record->conn_sample_count);
+		}
+	}
+
+	for (int metric_index = 0; metric_index < TR_METRIC__COUNT; metric_index++) {
+		if (metric_is_cc((enum tr_metric)metric_index)) {
+			int cause_count = tr_cause_count((enum tr_metric)metric_index);
+			for (int cause_index = 0; cause_index < cause_count; cause_index++) {
+				struct tr_cc_cell *cc_cell = &tr->scratch_cc[metric_index][cause_index];
+				memset(cc_cell, 0, sizeof *cc_cell);
+				cc_cell->exact = cell_record->cc_value[metric_index][cause_index]
+					- cell_record->cc_inferred[metric_index][cause_index];
+				cc_cell->inferred = cell_record->cc_inferred[metric_index][cause_index];
+				cc_cell->value = cell_record->cc_value[metric_index][cause_index];   // value = exact + inferred
+				cc_cell->unknown = cell_record->cc_unknown[metric_index][cause_index];
+				for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++)
+					cc_cell->excluded[excl_index] =
+						cell_record->cc_excluded[metric_index][excl_index][cause_index];
+				for (int overlap_index = 0; overlap_index < TR_OVERLAP__COUNT; overlap_index++)
+					cc_cell->overlap[overlap_index] =
+						cell_record->cc_overlap[metric_index][cause_index][overlap_index];
+			}
+			report.cc_cells[metric_index] = tr->scratch_cc[metric_index];
+			report.cc_unknown_nocause[metric_index] = cell_record->cc_unknown_nocause[metric_index];
+			report.path_value[metric_index] = metric_has_path((enum tr_metric)metric_index)
+							 ? cell_record->path_value[metric_index] : NULL;
+		} else {
+			report.cc_cells[metric_index] = NULL; report.path_value[metric_index] = NULL;
+		}
+	}
+	// SI 네 지표
+	fill_si_mean(&report.si_stats[TR_METRIC_RRC_CONN_MEAN], cell_record->conn_sum,
+		     cell_record->conn_sample_count, cell_record->evicted_this_period, 0);
+	fill_si_max (&report.si_stats[TR_METRIC_RRC_CONN_MAX],  cell_record->conn_max, cell_record->conn_sum,
+		     cell_record->conn_sample_count, cell_record->evicted_this_period, 0);
+	// INACTIVE 를 쓰지 않는 망이라고 설정하지 않았으면 상한을 모름
+	int inactive_unbounded = !tr->tr_cfg.assume_no_inactive;
+	fill_si_mean(&report.si_stats[TR_METRIC_RRC_INACTIVE_CONN_MEAN], cell_record->inactive_sum,
+		     cell_record->inactive_sample_count, cell_record->evicted_this_period, inactive_unbounded);
+	fill_si_max (&report.si_stats[TR_METRIC_RRC_INACTIVE_CONN_MAX],  cell_record->inactive_max,
+		     cell_record->inactive_sum, cell_record->inactive_sample_count,
+		     cell_record->evicted_this_period, inactive_unbounded);
+	tr->sink_ops.on_period(tr->user_ctx, &report);
+}
+
+/* 셀이 하나도 없는 주기에도 유실이 있으면 탭 전체 커버리지만 담은 보고를 냄. 제어평면이 전부
+ * 암호화됐거나 첫 F1 셀이 만들어지기 전에 스톰이 오면 이 상태가 됨.
+ *   종전에는 주기 보고를 셀 단위로만 냈으므로 셀이 0 개면 보고도 0 개였음. 유실이 있어도 읽는
+ *   쪽에는 아무 일 없는 것과 같은 모양이 되어, 암호화된 구간에서만 돌던 시나리오의 유실 신호가
+ *   통째로 사라졌음.
+ * 유실이 0 이면 내지 않음. 할 일 없는 주기마다 빈 보고를 내지 않으려고임.
+ * 셀 칸은 valid=false 인 빈 값이고 지표는 비움. 델타 계산식은 emit_cell_period 와 같은 식이므로
+ * 커버리지 칸 집합이 바뀌면 두 곳을 같이 고칠 것 */
+static void emit_coverage_only_period(struct tr *tr, int partial)
+{
+	if (!tr->sink_ops.on_period) return;
+	#define COVERAGE_DELTA(cur, snap) ((cur) >= (snap) ? (cur) - (snap) : 0)
+	uint64_t tsn_gap_count = COVERAGE_DELTA(tr->coverage_tsn_gap_count, tr->coverage_snapshot_tsn_gap_count);
+	uint64_t ringbuf_full_count  = COVERAGE_DELTA(tr->coverage_ringbuf_full_count,
+						      tr->coverage_snapshot_ringbuf_full_count);
+	uint64_t esp_seen_count = COVERAGE_DELTA(tr->coverage_esp_seen_count, tr->coverage_snapshot_esp_seen_count);
+	uint64_t ip_frag_skipped_count = COVERAGE_DELTA(tr->coverage_ip_frag_skipped_count,
+							tr->coverage_snapshot_ip_frag_skipped_count);
+	uint64_t obs_lost_count = COVERAGE_DELTA(tr->coverage_obs_lost_count, tr->coverage_snapshot_obs_lost_count);
+	#undef COVERAGE_DELTA
+	/* 유실도 경보도 근거 수도 없으면 내지 않음. 경보나 근거 수만 있는 주기는 내보내야 하므로
+	 * 그 둘도 조건에 넣음 */
+	if (!(tsn_gap_count || ringbuf_full_count || esp_seen_count || ip_frag_skipped_count || obs_lost_count
+		  || tr->late_event_count || tr->lost_evicted_count || tr->inactive_alarm_count
+		  || tr->release_basis_observed_count || tr->release_basis_assumed_count)) return;
+	struct tr_report_header report_header;
+	memset(&report_header, 0, sizeof report_header);   // 셀 칸은 valid=false 인 빈 값으로 남음
+	report_header.period_start_ns = tr->cur_start_ns; report_header.period_end_ns = tr->cur_end_ns;
+	report_header.gp_ms = tr->tr_cfg.gp_ms ? tr->tr_cfg.gp_ms : DEF_GP_MS;
+	report_header.partial = partial || tr->first_period;
+	// 주기 끝까지 확인됐을 때만 참임. 중간까지만 확인된 주기는 뒷부분을 못 본 것이라 0 으로 셀 수 없음
+	report_header.capture_alive = tr->capture_alive_until_ns >= report_header.period_end_ns;
+	report_header.n2_observed = tr->n2_observed; report_header.assume_no_inactive = tr->tr_cfg.assume_no_inactive;
+	report_header.late_event_count = tr->late_event_count; report_header.lost_evicted_count = tr->lost_evicted_count;
+	report_header.inactive_alarm_count = tr->inactive_alarm_count;
+	report_header.release_basis_observed_count = tr->release_basis_observed_count;
+	report_header.release_basis_assumed_count = tr->release_basis_assumed_count;
+	report_header.tsn_gap_count = tsn_gap_count; report_header.ringbuf_full_count = ringbuf_full_count;
+	report_header.esp_seen_count = esp_seen_count; report_header.ip_frag_skipped_count = ip_frag_skipped_count;
+	report_header.obs_lost_count = obs_lost_count;
+	report_header.coverage_tapwide = true;
+	struct tr_period_report report;
+	memset(&report, 0, sizeof report);
+	report.report_header = &report_header;   // memset 으로 cc_cells, si_stats, path_value 가 전부 비어 커버리지만 담김
+	tr->sink_ops.on_period(tr->user_ctx, &report);
+}
+
+static void close_period(struct tr *tr, int partial)
+{
+	for (uint32_t i = 0; i < tr->cell_count; i++)
+		emit_cell_period(tr, &tr->cell_records[i], partial);
+	if (tr->cell_count == 0) emit_coverage_only_period(tr, partial);
+	// 주기 리셋. CC 와 SI 누적, 주기 헤더 누적을 0 으로 돌리고 게이지는 그대로 둠
+	for (uint32_t i = 0; i < tr->cell_count; i++) {
+		struct tr_cell_record *cell_record = &tr->cell_records[i];
+		memset(cell_record->cc_value, 0, sizeof cell_record->cc_value);
+		memset(cell_record->cc_inferred, 0, sizeof cell_record->cc_inferred);
+		memset(cell_record->cc_unknown, 0, sizeof cell_record->cc_unknown);
+		memset(cell_record->cc_unknown_nocause, 0, sizeof cell_record->cc_unknown_nocause);
+		memset(cell_record->cc_excluded, 0, sizeof cell_record->cc_excluded);
+		memset(cell_record->cc_overlap, 0, sizeof cell_record->cc_overlap);
+		memset(cell_record->path_value, 0, sizeof cell_record->path_value);
+		memset(cell_record->conn_sum, 0, sizeof cell_record->conn_sum);
+		cell_record->conn_sample_count = 0;
+		memset(cell_record->conn_max, 0, sizeof cell_record->conn_max);
+		memset(cell_record->inactive_sum, 0, sizeof cell_record->inactive_sum);
+		cell_record->inactive_sample_count = 0;
+		memset(cell_record->inactive_max, 0, sizeof cell_record->inactive_max);
+		cell_record->half_open_sum = 0; cell_record->half_open_max = 0;
+		cell_record->evicted_this_period = 0;
+		/* 계수기는 0 으로 돌리고, UE 컨텍스트 최댓값은 주기가 시작될 때 이미 있던 수에서 시작함.
+		 * 그 주기에 아무 일도 없으면 그 수가 그대로 최댓값이어야 하기 때문임 */
+		cell_record->initial_ul_count = 0; cell_record->no_du_to_cu_count = 0;
+		cell_record->ue_context_max = (uint32_t)(cell_record->ue_context_gauge > 0
+							 ? cell_record->ue_context_gauge : 0);
+		cell_record->late_join = 0;
+	}
+	tr->late_event_count = 0; tr->n2_observed = 0; tr->lost_evicted_count = 0;
+	tr->inactive_alarm_count = 0;
+	tr->release_basis_observed_count = 0; tr->release_basis_assumed_count = 0;
+	tr->reset_unresolved_count = 0;
+	// 셀별 표본 수 리셋과 같이 돌려야 한 주기의 표본 수가 맞음
+	tr->conn_sample_count = 0; tr->inactive_sample_count = 0;
+	// 다음 주기 델타의 기준점은 지금 누적임. 이 주기분은 위에서 이미 헤더에 실렸음
+	tr->coverage_snapshot_tsn_gap_count = tr->coverage_tsn_gap_count;
+	tr->coverage_snapshot_ringbuf_full_count = tr->coverage_ringbuf_full_count;
+	tr->coverage_snapshot_esp_seen_count = tr->coverage_esp_seen_count;
+	tr->coverage_snapshot_ip_frag_skipped_count = tr->coverage_ip_frag_skipped_count;
+	tr->coverage_snapshot_obs_lost_count = tr->coverage_obs_lost_count;
+	tr->first_period = 0;
+	tr_self_check(tr);   // 주기를 리셋한 뒤에도 게이지가 유지되고 멤버십과 맞는지 확인
+}
+
+// 마감이 발화해 열린 수립을 닫음
+static void fire_deadline(struct tr *tr, struct tr_ue_record *ue_record)
+{
+	// 무응답 실패도 요청 셀에 귀속함. 시도를 센 셀과 같아야 형제 대칭이 맞음
+	int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index : ue_record->req_cell_index;
+	if (cell_index >= 0) {
+		struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
+		if (ue_record->saw_setup_sent) {
+			// RRCSetup 을 봤으므로 무응답임
+			cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_NOREPLY]++;
+			cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][ue_record->path]++;
+			ue_record->setup_state = SR_NOREPLY;
+		} else {
+			// RRCSetup 을 못 봤으므로 원인 없는 unknown 임
+			cell_record->cc_unknown_nocause[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE]++;
+			ue_record->setup_state = SR_UNKNOWN;
+		}
+	} else {
+		ue_record->setup_state = ue_record->saw_setup_sent ? SR_NOREPLY : SR_UNKNOWN;
+	}
+	/* 이 마감은 진행 중인 수립 절차의 끝이고 반쯤 열린 연결의 끝이 아님. 무응답으로 판정해도 그 UE 의
+	 * 컨텍스트는 F1 해제까지 CU 에 남으므로 두 구간은 일부러 다르게 둠.
+	 * 그래서 여기서 half_open_leave 를 부르지 않음. 불렀다면 마감 시각부터 실제 해제까지의 구간이
+	 * ConnMean 과 ConnMax 의 상한, 반열림 진단에서 빠져 과소 집계가 됨. 형제인 연결 게이지도 해제
+	 * COMPLETE 에서 빠지므로 여기서 안 빼는 것이 수명 대칭임.
+	 * 반열림은 실제 끝 신호에서만 빠짐 - RRCSetupComplete 수신, 해제 명령과 완료, F1 RESET,
+	 * SCTP 종료, 번호 재사용, 축출. 그 경로들은 on_setup_complete, on_reject,
+	 * on_ctx_release_complete, teardown_all_gauges, on_ue_evicted 가 보장함 */
+	open_list_remove(tr, ue_record);
+}
+
+/* advance_to: 시간을 target 까지 진행하며 표본, 마감, 주기 경계를 시간순으로 처리함.
+ *   같은 시각에 겹치면 우선순위는 표본(conn, inactive) < 주기 끝 < 마감 임. 근거: 표본은 시작을
+ *   빼고 끝을 넣는 구간이라 주기 끝에서 닫는 주기에 들고, 주기 끝 뒤에 발화한 마감은 다음 주기에 듦 */
+static void advance_to(struct tr *tr, uint64_t target_ns)
+{
+	if (!tr->started) { engine_start(tr, target_ns); return; }
+	if (target_ns <= tr->now_ns) return;
+	/* 한 번의 전진이 1일을 넘으면 손상된 시각으로 보고 상한으로 자름. 정상 캡처의 이벤트 간격은
+	 * 이보다 훨씬 작아 영향이 없고, 라이브는 커널 단조시계라 해당되지 않음.
+	 * 캡처 쪽에서 시각을 검사하더라도 거대한 target 이 어떤 경로로든 들어오면 아래 루프가 주기를
+	 * 끝없이 닫으며 멈추지 않으므로, 루프 밖에서 한 번 묶어 둠 */
+	if (target_ns - tr->now_ns > ADVANCE_MAX_NS) target_ns = tr->now_ns + ADVANCE_MAX_NS;
+	uint64_t conn_period_ns = (uint64_t)(tr->tr_cfg.conn_sample_period_ms ? tr->tr_cfg.conn_sample_period_ms
+									 : DEF_CONN_SAMPLE_PERIOD_MS) * 1000000ull;
+	uint64_t inactive_period_ns = (uint64_t)(tr->tr_cfg.inactive_sample_period_ms ? tr->tr_cfg.inactive_sample_period_ms
+										 : DEF_INACTIVE_SAMPLE_PERIOD_MS) * 1000000ull;
+
+	for (;;) {
+		// 가장 이른 마감은 heap 루트라 O(1) 로 읽음. 빼는 것은 fire_deadline 안의 open_list_remove 가 O(log n) 으로 함
+		uint64_t earliest_deadline_ns = (uint64_t)-1; uint32_t deadline_ue_index = UINT32_MAX;
+		if (tr->open_count > 0) {
+			deadline_ue_index = tr->open_list[0];
+			earliest_deadline_ns = tr->ue_records[deadline_ue_index].deadline_ns;
+		}
+		// 후보 시각을 우선순위 순으로 늘어놓음. conn 표본, inactive 표본, 주기 끝, 마감
+		uint64_t candidate_ns[4] = { tr->next_conn_sample_ns, tr->next_inactive_sample_ns,
+					     tr->cur_end_ns, earliest_deadline_ns };
+		uint64_t next_ns = candidate_ns[0];
+		for (int i = 1; i < 4; i++) if (candidate_ns[i] < next_ns) next_ns = candidate_ns[i];
+		if (next_ns > target_ns) { tr->now_ns = target_ns; break; }
+		// 같은 시각이면 앞쪽 후보가 이김
+		int fired_candidate = (candidate_ns[0] == next_ns) ? 0
+				    : (candidate_ns[1] == next_ns) ? 1
+				    : (candidate_ns[2] == next_ns) ? 2 : 3;
+		tr->now_ns = next_ns;
+		switch (fired_candidate) {
+		case 0:
+			sample_conn(tr);
+			tr->next_conn_sample_ns += conn_period_ns;
+			break;
+		case 1:
+			sample_inactive(tr);
+			tr->next_inactive_sample_ns += inactive_period_ns;
+			break;
+		case 2:
+			close_period(tr, 0);
+			tr->cur_start_ns = tr->cur_end_ns;
+			tr->cur_end_ns += tr->gp_ns;
+			break;
+		case 3:
+			fire_deadline(tr, &tr->ue_records[deadline_ue_index]);
+			break;
+		}
+	}
+}
+
