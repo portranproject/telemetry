@@ -1300,3 +1300,520 @@ static void handle_f1ap(struct obs *obs, const struct sctp_message *sctp_message
 		handle_rrc_container(obs, sctp_message, f1ap_msg, ue_state, direction, &f1ap_msg->rrc_containers[item_index]);
 }
 
+// ---- N2 단말 레코드와 이벤트 ------------------------------------------------------------
+static uint32_t n2_bucket(uint32_t assoc_id, uint64_t ran_ue_ngap_id, uint32_t bucket_count)
+{
+	uint64_t hash_key = ((uint64_t)assoc_id << 32) ^ ran_ue_ngap_id;
+	hash_key = (hash_key ^ (hash_key >> 30)) * 0xbf58476d1ce4e5b9ULL; hash_key ^= hash_key >> 27;
+	return (uint32_t)(hash_key % bucket_count);
+}
+static void n2_lru_unlink(struct obs *obs, int i)
+{
+	struct obs_n2_state *n2_state = &obs->n2_states[i];
+	if (n2_state->lru_prev >= 0) obs->n2_states[n2_state->lru_prev].lru_next = n2_state->lru_next; else obs->n2_lru_head = n2_state->lru_next;
+	if (n2_state->lru_next >= 0) obs->n2_states[n2_state->lru_next].lru_prev = n2_state->lru_prev; else obs->n2_lru_tail = n2_state->lru_prev;
+	n2_state->lru_prev = n2_state->lru_next = -1;
+}
+static void n2_lru_push(struct obs *obs, int i)
+{
+	struct obs_n2_state *n2_state = &obs->n2_states[i];
+	n2_state->lru_prev = obs->n2_lru_tail; n2_state->lru_next = -1;
+	if (obs->n2_lru_tail >= 0) obs->n2_states[obs->n2_lru_tail].lru_next = i; else obs->n2_lru_head = i;
+	obs->n2_lru_tail = i;
+}
+static void n2_touch(struct obs *obs, int i) { n2_lru_unlink(obs, i); n2_lru_push(obs, i); }
+
+static int n2_find(struct obs *obs, uint32_t assoc_id, uint64_t ran_ue_ngap_id)
+{
+	for (int i = obs->n2_hash_buckets[n2_bucket(assoc_id, ran_ue_ngap_id, obs->n2_hash_bucket_count)]; i >= 0; i = obs->n2_states[i].hash_next)
+		if (obs->n2_states[i].used && obs->n2_states[i].assoc_id == assoc_id && obs->n2_states[i].ran_ue_ngap_id == ran_ue_ngap_id) return i;
+	return -1;
+}
+static void n2_hash_remove(struct obs *obs, int idx)
+{
+	uint32_t bucket = n2_bucket(obs->n2_states[idx].assoc_id, obs->n2_states[idx].ran_ue_ngap_id, obs->n2_hash_bucket_count);
+	int *hash_link = &obs->n2_hash_buckets[bucket];
+	while (*hash_link >= 0) { if (*hash_link == idx) { *hash_link = obs->n2_states[idx].hash_next; return; } hash_link = &obs->n2_states[*hash_link].hash_next; }
+}
+static void n2_remove(struct obs *obs, int idx)   // 표에서만 제거함. 이벤트는 호출자가 냄
+{
+	n2_hash_remove(obs, idx);
+	n2_lru_unlink(obs, idx);
+	obs->n2_states[idx].used = false;   // record_id 로 슬롯 재사용을 가리므로 세대 번호는 두지 않음
+	obs->n2_states[idx].hash_next = obs->n2_free; obs->n2_free = idx;
+	obs->n2_count--;
+}
+static void fill_n2ue(struct obs_event *event, const struct obs_n2_state *n2_state)
+{
+	event->n2ue.valid = true;
+	event->n2ue.assoc_id = n2_state->assoc_id;
+	event->n2ue.ran_ue_ngap_id = n2_state->ran_ue_ngap_id;
+	if (n2_state->has_amf_ue_ngap_id) { event->n2ue.has_amf_ue_ngap_id = true; event->n2ue.amf_ue_ngap_id = n2_state->amf_ue_ngap_id; }
+	event->cell = n2_state->cell;
+}
+/* attach_f1_pair: N2 레코드가 기억해 둔 F1 단말을 다시 찾아 이벤트에 붙이고 등급을 교차추론으로 내림.
+ *   이유: N2 에서 본 사실을 F1 쪽 표 I 에 귀속시켜야 하는데, N2 레코드는 (키, record_id) 만 들고 있어
+ *     재조회가 필요함. 그 F1 레코드가 이미 치워졌으면 아무것도 하지 않음 — 없는 귀속을 지어내지 않음.
+ *   부작용: event->f1ue, event->cell, event->quality 를 덮어씀. */
+static void attach_f1_pair(struct obs *obs, struct obs_event *event, const struct obs_n2_state *n2_state)
+{
+	if (!n2_state->has_f1_pair)
+		return;
+	int f1_index = ue_find_record_id(obs, n2_state->f1_pair_assoc, n2_state->f1_pair_du_ue_id, n2_state->f1_pair_record_id);
+	if (f1_index < 0)
+		return;
+	fill_f1ue(event, &obs->ue_states[f1_index]);
+	event->quality = TR_QUALITY_CROSS;   // F1 에서 직접 본 값이 아니라 N2 를 거쳐 귀속한 값임
+}
+static void n2_evict_one(struct obs *obs)
+{
+	int i = obs->n2_lru_head; if (i < 0) return;
+	struct obs_event event; memset(&event, 0, sizeof event);
+	event.kind = TR_EVENT_OBS_UE_EVICTED; event.wallclock_ns = obs->now_ns; event.iface = TR_IFACE_N2; event.assoc_id = obs->n2_states[i].assoc_id;
+	fill_n2ue(&event, &obs->n2_states[i]);
+	emit(obs, &event);
+	obs->stats.ue_evicted_count++;
+	n2_remove(obs, i);
+}
+static int n2_create(struct obs *obs, uint32_t assoc_id, uint64_t ran_ue_ngap_id)
+{
+	if (obs->n2_count >= obs->obs_cfg.n2_capacity) n2_evict_one(obs);
+	if (obs->n2_free < 0) return -1;
+	int i = obs->n2_free; obs->n2_free = obs->n2_states[i].hash_next;
+	struct obs_n2_state *n2_state = &obs->n2_states[i];
+	memset(n2_state, 0, sizeof *n2_state);
+	n2_state->record_id = ++obs->next_record_id;   // 생성마다 전역에서 유일한 번호. 슬롯이 재사용돼도 겹치지 않음
+	n2_state->nas_ciph_alg = -1;   // 모름. 0 은 5G-EA0 이라는 정당한 값이라 센티널을 둠. SMC 에서 학습함
+	n2_state->nas_ciph_alg_before_smc = -1;
+	n2_state->used = true; n2_state->assoc_id = assoc_id; n2_state->ran_ue_ngap_id = ran_ue_ngap_id;
+	n2_state->created_ns = n2_state->last_ns = obs->now_ns;
+	n2_state->lru_prev = n2_state->lru_next = -1;
+	uint32_t bucket = n2_bucket(assoc_id, ran_ue_ngap_id, obs->n2_hash_bucket_count);
+	n2_state->hash_next = obs->n2_hash_buckets[bucket]; obs->n2_hash_buckets[bucket] = i;
+	n2_lru_push(obs, i);
+	obs->n2_count++;
+	return i;
+}
+
+/* amf_id_for: AMF Name 으로 그 AMF 의 키 번호를 돌려줌(없으면 새로 매김). 못 매기면 0.
+ *   왜 이름인가: 한 AMF 가 TNL 연결(TNLA)을 여럿 둘 수 있어서(TS 38.413 §8.7), 연결 번호로 AMF 를
+ *     대리하면 한 연결로 온 OVERLOAD START 가 같은 AMF 의 다른 연결에 안 걸림.
+ *     Served GUAMI List 는 AMF CONFIGURATION UPDATE 로 바뀌므로 신원으로 쓰면 같은 AMF 가 둘로 갈림.
+ *     AMF Name 은 NG SETUP RESPONSE 의 필수 IE 임(TS 38.413 §9.2.6.2).
+ *   0 을 '모름' 으로 쓰므로 번호는 1부터 매김. 상한을 넘기면 0 을 돌려주고 셈(추측 금지, fail-closed). */
+static uint32_t amf_id_for(struct obs *obs, const uint8_t *amf_name, size_t amf_name_len)
+{
+	if (!amf_name || amf_name_len == 0) return 0;
+	uint64_t name_hash, unused_hi;
+	nas_hash128(amf_name, amf_name_len, &name_hash, &unused_hi);
+	for (uint32_t i = 0; i < obs->amf_key_count; i++)
+		if (obs->amf_keys[i].used && obs->amf_keys[i].name_hash == name_hash) return obs->amf_keys[i].amf_id;
+	if (obs->amf_key_count == AMF_KEY_MAX) { obs->stats.amf_key_table_full_count++; return 0; }
+	uint32_t i = obs->amf_key_count++;
+	obs->amf_keys[i].name_hash = name_hash;
+	obs->amf_keys[i].amf_id = i + 1;
+	obs->amf_keys[i].used = true;
+	return obs->amf_keys[i].amf_id;
+}
+
+static void fill_event_header_n2(struct obs_event *event, struct obs *obs, const struct sctp_message *sctp_message,
+					enum tr_event_kind kind, enum tr_direction direction)
+{
+	fill_event_header(event, obs, sctp_message, kind, direction);
+	event->iface = TR_IFACE_N2;
+	/* AMF 키 번호를 그 연결에서 꺼내 모든 N2 이벤트에 실음. 아직 NG SETUP RESPONSE 를 못 봤으면 0(모름)이고,
+	 *   집계 쪽은 그때만 연결 번호로 대리함. */
+	const struct obs_assoc_record *assoc_record = assoc_get(obs, sctp_message->assoc_id);
+	event->amf_id = assoc_record ? assoc_record->amf_id : 0;
+}
+
+/* ngap_proc_direction: NGAP 절차 코드와 PDU 종류로 방향을 정함 — F1 쪽 f1ap_proc_direction 과 같은 모양.
+ *   근거(1차 출처): asn1/ngap-15.8.0.asn1 의 NGAP-ELEMENTARY-PROCEDURE 구성(어느 메시지가 INITIATING /
+ *     SUCCESSFUL / UNSUCCESSFUL 인지)과 절차 코드 값 — 이 열거형의 14개 값 전부를 그 파일과 대조해 확인.
+ *   'AMF 가 개시했나' 를 bool 로만 들고 있으면 두 가지가 틀림:
+ *     (1) PATH SWITCH(25)가 기본 분기로 떨어져 언제나 상행이 됨 — PathSwitchRequestAcknowledge 와 Failure 는
+ *         AMF 에서 CU 로 옴(문법에 SUCCESSFUL 과 UNSUCCESSFUL 이 있음).
+ *     (2) 모르는 절차까지 'RAN 개시 = 상행' 으로 추측함. bool 에는 미상을 담을 칸이 없음.
+ *   NG RESET(20)은 양쪽이 개시할 수 있어 절차로는 정해지지 않음(TS 38.413 §8.7.4.2.1 과 §8.7.4.2.2).
+ *   반환: TR_DIRECTION_DOWN(AMF -> CU) / TR_DIRECTION_UP(CU -> AMF) / TR_DIRECTION_UNKNOWN. */
+static enum tr_direction ngap_proc_direction(long proc_code, enum ngap_pdu_type pdu_type)
+{
+	bool initiating = pdu_type == NGAP_PDU_INITIATING;
+	switch (proc_code) {
+	// AMF 가 개시하고 INITIATING 만 있는 절차 → AMF→CU(DOWN)
+	case NP_DL_NAS: case NP_PAGING: case NP_OVERLOAD_START: case NP_OVERLOAD_STOP: case NP_REROUTE_NAS:
+		return initiating ? TR_DIRECTION_DOWN : TR_DIRECTION_UNKNOWN;
+	// AMF 가 개시: REQUEST/COMMAND = AMF→CU, RESPONSE/COMPLETE/FAILURE = CU→AMF
+	/*   UE CONTEXT MODIFICATION(40)도 AMF 가 개시함(TS 38.413 §8.3.4, 문법의 uEContextModification 에 성공과
+	 *   실패 결과가 있음). 이 표에 없으면 와이어 포트 규칙에만 기대게 되고, IANA 포트를 쓰지 않는 망에서는
+	 *   미상이 돼 IE 40(New AMF-UE-NGAP-ID) 학습이 빠짐. */
+	case NP_INITIAL_CONTEXT_SETUP: case NP_PDU_SESSION_SETUP: case NP_UE_CONTEXT_RELEASE: case NP_UE_CONTEXT_MODIFICATION:
+		return initiating ? TR_DIRECTION_DOWN : TR_DIRECTION_UP;
+	// RAN(CU)이 개시: REQUEST = CU→AMF, RESPONSE/ACK/FAILURE = AMF→CU
+	case NP_NG_SETUP: case NP_PATH_SWITCH:
+		return initiating ? TR_DIRECTION_UP : TR_DIRECTION_DOWN;
+	/* RAN(CU)이 개시하고 INITIATING 만 있는 절차 → CU→AMF(UP).
+	 *   RRC INACTIVE TRANSITION REPORT(37)이 여기 드는 근거: asn1/ngap-15.8.0.asn1 의
+	 *   `rRCInactiveTransitionReport NGAP-ELEMENTARY-PROCEDURE ::= { INITIATING MESSAGE … }` 에
+	 *   successfulOutcome/unsuccessfulOutcome 이 없고, 상태를 보고하는 쪽이 NG-RAN 노드임. */
+	case NP_INITIAL_UE_MESSAGE: case NP_UPLINK_NAS: case NP_NAS_NON_DELIVERY: case NP_RRC_INACTIVE_TRANSITION:
+		return initiating ? TR_DIRECTION_UP : TR_DIRECTION_UNKNOWN;
+	default:
+		return TR_DIRECTION_UNKNOWN;   /* NG RESET(양방향), 그 밖의 미확인 절차: 추측 금지 → 와이어 규칙 */
+	}
+}
+
+// corr_on_n2: INITIAL UE MESSAGE 가 도착하면 대기 중인 F1 항목과 매칭함. 성사되면 N2 레코드에 상대 키를 적음.
+static void corr_on_n2(struct obs *obs, const struct tr_nr_cgi *cell, int est_cause, const uint8_t *nas_bytes, uint32_t nas_ie_len,
+					   uint64_t wallclock_ns, uint32_t assoc_id, uint64_t ran_ue_ngap_id)
+{
+	if (!nas_bytes || nas_ie_len == 0 || est_cause < 0 || !cell || !cell->valid) return;
+	uint32_t plmn_packed = plmn_pack(cell->plmn_bytes);
+	uint64_t hash_lo, hash_hi; nas_hash128(nas_bytes, nas_ie_len, &hash_lo, &hash_hi);
+	struct corr_key *corr_key = corr_key_get(obs, plmn_packed, cell->cell_id, est_cause, nas_ie_len, hash_lo, hash_hi, false);
+	if (!corr_key) corr_key = corr_key_get(obs, plmn_packed, cell->cell_id, CORR_EST_CAUSE_ANY, nas_ie_len, hash_lo, hash_hi, false);   // 정확한 키가 없으면 폴백 세션이 쓰는 원인 없는 키로 한 번 더 찾음
+	if (!corr_key) { obs->stats.corr_unmatched_n2_count++; return; }
+	if (corr_key->ambiguous_until_ns >= wallclock_ns) { obs->stats.corr_ambiguous_count++; corr_key->ambiguous_until_ns = wallclock_ns + obs->correlation_window_ns; return; }
+	corr_key_expire_items(obs, corr_key, wallclock_ns);
+	int pending_count = corr_key->pending_count;
+	if (pending_count == 0) { obs->stats.corr_unmatched_n2_count++; corr_key_free_if_empty(obs, corr_key, wallclock_ns); return; }
+	if (pending_count == 1) {
+		struct corr_item *corr_item = &obs->corr_items[corr_key->item_head];
+		if (corr_item->wallclock_ns > wallclock_ns) { obs->stats.corr_unmatched_n2_count++; return; }   // F1 항목이 N2 보다 늦게 찍힌 짝은 버림. 시간 순서가 거꾸로임
+		uint32_t f1_assoc = corr_item->assoc_id, f1_du_ue_id = corr_item->du_ue_id; uint64_t f1_record_id = corr_item->f1_record_id;
+		int head = corr_key->item_head; corr_key->item_head = corr_item->next_index; corr_key->pending_count--; corr_item_free_one(obs, head);   /* 대기열에서 빼기 */
+		int f1_index = ue_find_record_id(obs, f1_assoc, f1_du_ue_id, f1_record_id);   // record_id 로 슬롯 재사용을 걸러 남의 단말에 귀속되는 것을 막음
+		int n2_index = n2_find(obs, assoc_id, ran_ue_ngap_id);
+		if (f1_index >= 0 && n2_index >= 0) {   // 양쪽 다 있을 때만 키를 적음
+			/* 매칭 결과를 N2 레코드에만 적음. 읽는 쪽이 N2 에서 F1 한 방향뿐이라 반대 방향은 둘 이유가 없음.
+			 *   record_id 를 같이 적는 이유: 나중에 그 F1 슬롯이 다른 단말에게 재사용됐는지 가리기 위해서임. */
+			struct obs_n2_state *n2_state = &obs->n2_states[n2_index];
+			n2_state->has_f1_pair      = true;
+			n2_state->f1_pair_assoc     = f1_assoc;
+			n2_state->f1_pair_du_ue_id  = f1_du_ue_id;
+			n2_state->f1_pair_record_id = obs->ue_states[f1_index].record_id;
+			obs->stats.corr_unique_count++;
+		} else {
+			obs->stats.corr_unmatched_n2_count++;   // F1 단말이 재사용된 슬롯이거나 N2 를 못 찾음. 매칭하지 않아 오귀속을 막음
+		}
+		corr_key_free_if_empty(obs, corr_key, wallclock_ns);
+		return;
+	}
+	/* 대기 항목이 둘 이상이면 모호함. 전부 빼고 표지만 남김 — 어떤 것을 골라도 셀과 원인 칸이 같아서
+	 * 고를 근거가 없음. 지어내는 대신 모호로 카운팅함. */
+	obs->stats.corr_ambiguous_count += (uint64_t)pending_count + 1;
+	while (corr_key->item_head >= 0) { int next_index = obs->corr_items[corr_key->item_head].next_index; corr_item_free_one(obs, corr_key->item_head); corr_key->item_head = next_index; }
+	corr_key->pending_count = 0; corr_key->ambiguous_until_ns = wallclock_ns + obs->correlation_window_ns;
+}
+
+// n2_find_by_amf_ue_ngap_id: 같은 연결에서 AMF-UE-NGAP-ID 로 N2 레코드를 찾음. 없으면 -1. 해제, 리셋 경로뿐이라 선형 탐색.
+static int n2_find_by_amf_ue_ngap_id(const struct obs *obs, uint32_t assoc_id, uint64_t amf_ue_ngap_id)
+{
+	for (uint32_t i = 0; i < obs->n2_capacity; i++)
+		if (obs->n2_states[i].used && obs->n2_states[i].assoc_id == assoc_id && obs->n2_states[i].has_amf_ue_ngap_id && obs->n2_states[i].amf_ue_ngap_id == amf_ue_ngap_id)
+			return (int)i;
+	return -1;
+}
+
+// n2_reset_all: NG RESET(reset-all)로 그 연결의 N2 레코드를 전부 지움.
+static void n2_reset_all(struct obs *obs, uint32_t assoc_id)
+{
+	for (uint32_t i = 0; i < obs->n2_capacity; i++)
+		if (obs->n2_states[i].used && obs->n2_states[i].assoc_id == assoc_id) { n2_remove(obs, (int)i); obs->stats.ng_reset_removed_count++; }
+}
+
+/* n2_reset_part: NG RESET(partOfNG-Interface)로 목록의 UE 만 지움. 항목은 RAN ID 또는 AMF ID 한쪽만, 또는 둘 다 없을 수 있음
+ *   (TS 38.413 §9.3.3.25 둘 다 OPTIONAL). 둘 다 없는 항목은 지울 대상이 없어 지나감. */
+static void n2_reset_part(struct obs *obs, uint32_t assoc_id, const struct ngap_msg *ngap_msg)
+{
+	for (int reset_index = 0; reset_index < ngap_msg->reset_ue_count; reset_index++) {
+		const struct ngap_reset_ue *reset_ue = &ngap_msg->reset_ues[reset_index];
+		int found = reset_ue->has_ran_ue_ngap_id ? n2_find(obs, assoc_id, reset_ue->ran_ue_ngap_id) : -1;
+		if (found < 0 && reset_ue->has_amf_ue_ngap_id) found = n2_find_by_amf_ue_ngap_id(obs, assoc_id, reset_ue->amf_ue_ngap_id);
+		if (found >= 0) { n2_remove(obs, found); obs->stats.ng_reset_removed_count++; }
+	}
+}
+
+// ---- NGAP 메시지 하나 처리 --------------------------------------------------------------
+/* handle_ngap: NGAP 메시지 하나를 이벤트로 바꿈. handle_f1ap 과 같은 모양 — 연결 수준 절차는 거기서
+ *   끝나고, 단말 수준 절차만 아래로 내려가 N2 레코드를 만지고 NAS-PDU 를 품.
+ *
+ *     방향 판정 --> IE 계수기 누적 --> 연결 수준 절차 --여기서 끝남--> return
+ *                                  --> 단말 수준 절차 --> 레코드 찾기, 생성 --> NAS 운반 루프
+ *
+ *     연결 수준   NG RESET               범위가 전체면 그 연결의 N2 표를 비우고, 일부면 목록의 단말만
+ *                 NG SETUP               RESPONSE 의 AMF Name 으로 그 AMF 의 키 번호를 매김
+ *                 OVERLOAD START, STOP   AMF 과부하. 레코드는 건드리지 않음
+ *                 PAGING                 레코드가 변하지 않아 바로 돌아감
+ *     단말 수준   INITIAL UE MESSAGE     N2 레코드 생성. 대기 중인 F1 항목과 매칭
+ *                 DL NAS, UL NAS 등      NAS-PDU 하나마다 이벤트. 알고리즘 학습과 보안 헤더 방향 판정
+ *                 UE CONTEXT RELEASE     COMMAND 는 유예 표시만 하고, COMPLETE 에서 레코드를 지움
+ *                 RRC INACTIVE TRANSITION REPORT   RRC 상태를 올림
+ *
+ *   부작용: 이벤트 방출, obs->stats 갱신, N2 표와 연결 레코드 변경. */
+static void handle_ngap(struct obs *obs, const struct sctp_message *sctp_message, const struct ngap_msg *ngap_msg)
+{
+	long proc_code = ngap_msg->procedure_code;
+	// 방향은 절차와 PDU 종류로 먼저, 다음에 와이어 포트 규칙, 그래도 모르면 미상. handle_f1ap 과 같은 순서
+	enum tr_direction direction = decide_direction(obs, sctp_message->record, TR_IFACE_N2,
+									   ngap_proc_direction(proc_code, ngap_msg->pdu_type));
+
+	/* 문법 15.8.0 에 없는 (절차, PDU 종류) 짝은 여기 오지 않음 — ngap_parse 가 NGAP_UNKNOWN_MESSAGE 를
+	 *   돌려주고 obs_on_sctp 가 ap_body_unknown_count 로 카운팅함. 그래서 `20 16 40 02 de ad`(successfulOutcome,
+	 *   절차 22, 쓰레기) 같은 입력이 OVERLOAD START 이벤트가 되지 않음. */
+
+	/* ngap.c 가 '있었지만 담지 않은' IE 를 센 값. 여기서 누적하지 않으면 libap 밖으로 나가지 않아,
+	 * 버렸다는 사실이 아무 데도 남지 않음. */
+	obs->stats.ngap_unknown_ie_count += (uint64_t)ngap_msg->unknown_ie_count;
+	obs->stats.ngap_rejected_ie_count += (uint64_t)ngap_msg->rejected_ie_count;
+	obs->stats.ngap_duplicate_ie_count += (uint64_t)ngap_msg->duplicate_ie_count;
+	obs->stats.ngap_type_mismatch_ie_count += (uint64_t)ngap_msg->type_mismatch_ie_count;
+
+	/* NG RESET(reset-all, initiatingMessage): 그 연결의 N2 레코드를 전부 지움(TS 38.413 §8.7.4.2.1 AMF 개시, §8.7.4.2.2 NG-RAN 개시 — 받은 쪽이 가리킨 UE 연결을 전부 해제).
+	 * 지우지 않으면 리셋 뒤 재사용된 RAN-UE-NGAP-ID 가 '옛 종료 놓침(교체)' 으로 세어짐. 부분 리셋(UE 목록)은 목록의 UE 만 지움. */
+	if (proc_code == NP_NG_RESET) {
+		if (ngap_msg->pdu_type != NGAP_PDU_INITIATING) return;   // ACKNOWLEDGE 에는 ResetType 이 없음
+		if (ngap_msg->reset_type == RESET_TYPE_ALL) n2_reset_all(obs, sctp_message->assoc_id);
+		if (ngap_msg->reset_type == RESET_TYPE_PART) n2_reset_part(obs, sctp_message->assoc_id, ngap_msg);
+		return;
+	}
+
+	// --- 비-UE-associated: AMF 레벨 ---
+	if (proc_code == NP_NG_SETUP) {
+		/* AMF Name 과 Served GUAMI 는 RESPONSE 에만 있음. UE Retention(IE 147)은 REQUEST 에도 실릴 수 있지만,
+		 * REQUEST 에는 AMF 를 가릴 값이 없어 이벤트를 내지 않음. */
+		if (ngap_msg->pdu_type != NGAP_PDU_INITIATING) {
+			// AMF 키 학습은 이벤트 헤더를 채우기 전에 — 이 NG SETUP 자신도 그 번호를 달고 나가야 함
+			if (ngap_msg->pdu_type == NGAP_PDU_SUCCESSFUL) {
+				struct obs_assoc_record *assoc_record = assoc_get(obs, sctp_message->assoc_id);
+				if (assoc_record)
+					assoc_record->amf_id = amf_id_for(obs, (const uint8_t *)ngap_msg->amf_name, ngap_msg->amf_name_len);
+			}
+			struct obs_event event; fill_event_header_n2(&event, obs, sctp_message, TR_EVENT_NG_SETUP, direction);
+			if (ngap_msg->amf_name) { event.payload.ng_setup.amf_name.bytes = (const uint8_t *)ngap_msg->amf_name; event.payload.ng_setup.amf_name.len = ngap_msg->amf_name_len; }
+			event.payload.ng_setup.guami_digest = ngap_msg->guami_digest;
+			event.payload.ng_setup.ue_contexts_retained = ngap_msg->ue_contexts_retained;
+			event.payload.ng_setup.outcome_failure = (ngap_msg->pdu_type == NGAP_PDU_UNSUCCESSFUL);
+			emit(obs, &event);
+		}
+		return;
+	}
+	if (proc_code == NP_OVERLOAD_START || proc_code == NP_OVERLOAD_STOP) {
+		struct obs_event event;
+		fill_event_header_n2(&event, obs, sctp_message, proc_code == NP_OVERLOAD_START ? TR_EVENT_NG_OVERLOAD_START : TR_EVENT_NG_OVERLOAD_STOP, direction);
+		if (proc_code == NP_OVERLOAD_START) {
+			event.payload.overload.has_action = ngap_msg->overload_response_present;
+			event.payload.overload.action_mask = ngap_msg->overload_action_mask;
+			event.payload.overload.traffic_load_reduction_pct = ngap_msg->traffic_load_reduction_percent;
+			event.payload.overload.nssai_list_present = ngap_msg->overload_nssai_list_present;
+		}
+		emit(obs, &event);
+		return;
+	}
+	if (proc_code == NP_PAGING) return;   // 단말에 묶이지 않는 절차이고 레코드도 변하지 않음
+
+	// --- UE-associated: RAN-UE-NGAP-ID 필요 ---
+	uint32_t assoc_id = sctp_message->assoc_id; uint64_t ran_ue_ngap_id = ngap_msg->ran_ue_ngap_id; bool has_ran_ue_ngap_id = ngap_msg->has_ran_ue_ngap_id;
+	/* UE CONTEXT RELEASE COMMAND 의 UE-NGAP-IDs 는 (AMF ID, RAN ID) 짝이거나 AMF ID 단독임(TS 38.413 §9.2.2.5).
+	 * 단독 형태를 통째로 버리면 그 단말의 해제 이벤트와 등록 해제 원인이 사라짐. 같은 연결에서 AMF ID 로
+	 * 레코드를 찾아 RAN ID 를 되찾음(해제 경로뿐이라 선형 탐색으로 충분). */
+	if (!has_ran_ue_ngap_id && proc_code == NP_UE_CONTEXT_RELEASE && ngap_msg->pdu_type == NGAP_PDU_INITIATING && ngap_msg->has_amf_ue_ngap_id) {
+		int by_amf_index = n2_find_by_amf_ue_ngap_id(obs, assoc_id, ngap_msg->amf_ue_ngap_id);
+		if (by_amf_index >= 0) { ran_ue_ngap_id = obs->n2_states[by_amf_index].ran_ue_ngap_id; has_ran_ue_ngap_id = true; }
+	}
+	if (!has_ran_ue_ngap_id) return;
+	int idx = n2_find(obs, assoc_id, ran_ue_ngap_id);
+
+	// 레코드 생성은 INITIAL UE MESSAGE 에서만. 살아 있는 키가 다시 오면 재사용이므로 옛 레코드를 닫고 새로 만듦
+	if (proc_code == NP_INITIAL_UE_MESSAGE) {
+		/* 이 블록이 아래 nas_pdu_mandatory 검사보다 먼저 돌아가므로, NAS-PDU 가 필수인 네 절차 중 INITIAL UE
+		 * MESSAGE 만 거기서 세어지지 않음. 그래서 여기서 따로 셈 — 넷 중 셋만 세고 있던 비대칭을 없앰.
+		 * 와이어 사실이라 레코드를 만들기 전에 셈(아래 idx<0 return 보다 앞). TS 38.413 §9.2.5.1 에서 M 임. */
+		if (ngap_msg->nas_ie_count == 0) obs->stats.nas_pdu_absent_count++;
+		if (idx >= 0) { n2_remove(obs, idx); obs->stats.ue_replaced_count++; }   // 옛 종료를 놓친 것이므로 닫음. 옛 record_id 는 이제 유효하지 않음
+		idx = n2_create(obs, assoc_id, ran_ue_ngap_id);
+		if (idx < 0) return;
+		if (ngap_msg->uli_nr_cgi.is_valid) obs->n2_states[idx].cell = tr_nr_cgi_from(&ngap_msg->uli_nr_cgi);
+		struct obs_event event; fill_event_header_n2(&event, obs, sctp_message, TR_EVENT_NG_INITIAL_UE_MESSAGE, direction); fill_n2ue(&event, &obs->n2_states[idx]);
+		event.payload.initial_ue.est_cause = ngap_msg->rrc_establishment_cause;
+		if (ngap_msg->nas_ie_count > 0) {
+			/* 여기서 디코드하는 이유는 값이 아니라 계수기임. 이 위치의 NAS 는 RRCSetupComplete 과 같은 바이트이고
+			 * (CU 는 해석 없이 넘김 — TS 38.413 §9.3.3.4 "transferred without interpretation in the NG-RAN node"),
+			 * 표 I 는 F1 단말로 키를 매기는데 이 이벤트에는 매칭된 F1 단말이 아직 없음(매칭은 아래 corr_on_n2 가 함).
+			 * 그래서 꺼낸 값을 실을 칸이 없음. 그래도 N2 만 탭하는 배치에서는 이 위치가 NAS 가시성의 유일한
+			 * 출처이므로, 해석하지 못한 것과 방향이 어긋난 것은 카운팅함. */
+			struct nas_msg nas_msg;
+			int parse_result = nas_parse(ngap_msg->nas_ies[0].data, ngap_msg->nas_ies[0].len, obs->n2_states[idx].nas_ciph_alg, &nas_msg);
+			// INITIAL UE MESSAGE 는 UE→AMF 뿐임(TS 38.413 §8.6.1)
+			nas_accept_result(obs, &nas_msg, TR_DIRECTION_UP);
+			/* SMC 는 AMF→UE 라서(표 8.2.25.1.1) 여기 SMC 모양의 NAS 가 있다면 단말이 만든 것임 —
+			 * 학습하면 그 단말이 자기 암호문을 평문으로 읽히게 만들 수 있으므로 학습하지 않고 셈. */
+			if (parse_result != 0)          obs->stats.nas_malformed_count++;
+			else if (nas_msg.has_sec_alg)   obs->stats.nas_smc_learn_skipped_count++;
+		}
+		emit(obs, &event);
+		// INITIAL UE MESSAGE 의 NAS 와 셀과 원인으로 대기 중인 F1 항목(RRCSetupComplete)과 매칭
+		if (ngap_msg->nas_ie_count > 0) {
+			struct tr_nr_cgi uli_cell = tr_nr_cgi_from(&ngap_msg->uli_nr_cgi);
+			corr_on_n2(obs, &uli_cell, ngap_msg->rrc_establishment_cause, ngap_msg->nas_ies[0].data, (uint32_t)ngap_msg->nas_ies[0].len,
+					   event.wallclock_ns, assoc_id, ran_ue_ngap_id);
+		}
+		return;   // CU 에서 AMF 로 가는 메시지라 아래 NAS 운반과 해제 처리에 해당 없음
+	}
+	// 수립을 못 본 단말의 해제로는 레코드를 만들지 않음. 만들면 없던 단말이 생겨 수립 없는 종료가 흘러감
+	if (idx < 0 && proc_code == NP_UE_CONTEXT_RELEASE) return;
+	if (idx < 0) {   // INITIAL UE MESSAGE 를 못 보고 등장(late join). AMF 쪽 번호는 미상
+		idx = n2_create(obs, assoc_id, ran_ue_ngap_id);
+		if (idx < 0) return;
+	}
+	struct obs_n2_state *n2_state = &obs->n2_states[idx];
+	n2_state->last_ns = obs->now_ns; n2_touch(obs, idx);
+	if (ngap_msg->uli_nr_cgi.is_valid) n2_state->cell = tr_nr_cgi_from(&ngap_msg->uli_nr_cgi);
+
+	/* AMF 쪽 단말 번호 학습. AMF 에서 CU 로 온 메시지가 amf_ue_ngap_id 를 실었고 레코드가 아직 모를 때임.
+	 * REROUTE NAS REQUEST 는 연결을 세우는 것이 아니라 다른 AMF 로 돌리는 것이라 성공 신호에서 뺌. */
+	if (direction == TR_DIRECTION_DOWN && ngap_msg->has_amf_ue_ngap_id && proc_code != NP_REROUTE_NAS) {
+		if (!n2_state->has_amf_ue_ngap_id) { n2_state->has_amf_ue_ngap_id = true; n2_state->amf_ue_ngap_id = ngap_msg->amf_ue_ngap_id; }   // 신원 학습은 모든 하행에서 함
+		/* 단말 연결 수립의 성공으로 세는 것은 CU 가 AMF 쪽 번호를 그 단말에 연관시키는 두 메시지뿐임 —
+		 * DOWNLINK NAS TRANSPORT 와 INITIAL CONTEXT SETUP REQUEST. 해제 명령이나 PDU 세션 같은 다른 하행은
+		 * 이미 있는 번호를 참조하는 것이라 성공이 아님. 그래서 신원 학습과 분리해 한 번만 발화함. */
+		bool first_for_ran_ue_ngap_id = !n2_state->uecntx_succ_sent && (proc_code == NP_DL_NAS || proc_code == NP_INITIAL_CONTEXT_SETUP);
+		if (first_for_ran_ue_ngap_id) n2_state->uecntx_succ_sent = true;
+		struct obs_event event; fill_event_header_n2(&event, obs, sctp_message, TR_EVENT_NG_AMF_DL_UE_MSG, direction); fill_n2ue(&event, n2_state);
+		event.payload.amf_dl.proc_code = (int)proc_code;
+		event.payload.amf_dl.has_amf_ue_ngap_id = true;
+		event.payload.amf_dl.first_for_ran_ue_ngap_id = first_for_ran_ue_ngap_id;
+		emit(obs, &event);
+	} else if (ngap_msg->has_amf_ue_ngap_id && !n2_state->has_amf_ue_ngap_id) {
+		n2_state->has_amf_ue_ngap_id = true; n2_state->amf_ue_ngap_id = ngap_msg->amf_ue_ngap_id;   // 상행에서 먼저 보이면 학습만 하고 성공으로 세지 않음
+	}
+
+	/* New AMF-UE-NGAP-ID(IE 40, UE CONTEXT MODIFICATION REQUEST, AMF→CU): 이 UE 의 AMF 쪽 ID 가 바뀜(TS 38.413 §8.3.4.2).
+	 *   안 배우면 이후 AMF ID 만 오는 UE CONTEXT RELEASE COMMAND 의 역조회가 옛 ID 로 실패함. */
+	if (direction == TR_DIRECTION_DOWN && ngap_msg->has_new_amf_ue_ngap_id) { n2_state->has_amf_ue_ngap_id = true; n2_state->amf_ue_ngap_id = ngap_msg->new_amf_ue_ngap_id; }
+
+	/* NAS-PDU 가 필수인 네 절차(TS 38.413 §9.2.5.1, §9.2.5.3, §9.2.5.4, §9.2.5.5 에서 IE 38 이 M).
+	 *   IE 컨테이너가 SEQUENCE OF 라 asn1c 가 mandatory 를 강제하지 못하므로, 없는 입력이 들어옴. */
+	// INITIAL UE MESSAGE(15)는 위 전용 블록에서 세고 여기 도달하지 못하므로 이 목록에 두지 않음.
+	bool nas_pdu_mandatory = (proc_code == NP_DL_NAS || proc_code == NP_UPLINK_NAS
+						   || proc_code == NP_NAS_NON_DELIVERY);
+	if (nas_pdu_mandatory && ngap_msg->nas_ie_count == 0) obs->stats.nas_pdu_absent_count++;
+
+	// NAS-PDU(IE 38) 하나마다 이벤트 하나. 보안 헤더 형은 암호와 무관하게 보임
+	for (int nas_index = 0; nas_index < ngap_msg->nas_ie_count; nas_index++) {
+		struct obs_event event; fill_event_header_n2(&event, obs, sctp_message, TR_EVENT_NG_NAS, direction); fill_n2ue(&event, n2_state);
+		/* NASNonDeliveryIndication(19) 의 NAS 는 UE 에 '전달 실패'한 DL NAS →
+		 * non_delivered 표식(tr on_nas 가 이것으로 5GMM 상태 전진을 막음). 그 외 proc_code=전달됨(false). */
+		nas_values_init(&event.payload.nas);
+		event.payload.nas.non_delivered = (proc_code == NP_NAS_NON_DELIVERY);
+		/* NGAP 메시지의 방향과 그 안에 실린 NAS-PDU 의 방향은 다른 개념임.
+		 * NASNonDeliveryIndication(19) 은 NG-RAN -> AMF 로 올라오지만(TS 38.413 9.2.5.4 "Direction:
+		 * NG-RAN node -> AMF") 그 안의 NAS 는 "reporting the non-delivery of a NAS PDU previously
+		 * received within a DOWNLINK NAS TRANSPORT message" 라 하행임. 아래 다섯 판정은 전부 NAS 계층
+		 * 사실이므로 NGAP 방향이 아니라 이 방향으로 해야 함. 안 가르면 전달 실패한 정상 하행 NAS 가
+		 * (1) 타입을 빼앗기고 방향 위반으로 세어지고 (2) SHT 짝이 어긋남으로 올라가고
+		 * (3) 하행 SHT 4 가 'UE 가 보낸 SECURITY MODE COMPLETE' 로 지어내짐 = 확신 있는 오값. */
+		enum tr_direction nas_pdu_direction = event.payload.nas.non_delivered ? TR_DIRECTION_DOWN : direction;
+		/* 매칭된 F1 레코드가 있으면 그 신원을 실어, 집계 층이 N2 에서 본 NAS 를 F1 쪽 표 I 에 귀속시킴.
+		 * (키, record_id) 로 재조회해 슬롯이 재사용된 경우를 걸러 오귀속을 막음. AS 암호가 걸려 F1 쪽 RRC 가
+		 * 안 보이는 구간에서도 N2 의 NAS 는 보이므로, 이 귀속이 그 구간의 유일한 NAS 출처임. */
+		attach_f1_pair(obs, &event, n2_state);
+		/* 그 단말에서 학습한 NAS 암호 알고리즘으로 가시성을 판정함(fail-closed). SMC 가 고른 알고리즘은
+		 * 학습해 이후 보호 NAS 의 가독 판정에 씀 — 5G-EA0(0)일 때만 안쪽을 읽음. */
+		struct nas_msg nas_msg;
+		int parse_result = nas_parse(ngap_msg->nas_ies[nas_index].data, ngap_msg->nas_ies[nas_index].len, n2_state->nas_ciph_alg, &nas_msg);
+		event.payload.nas.parse_ok = (parse_result == 0);   // 형식이 정상인지. 잘리거나 깨진 PDU 를 '암호라 못 읽음' 과 구분함
+		bool msg_type_usable = nas_accept_result(obs, &nas_msg, nas_pdu_direction);
+		/* 실패 경로에서도 sht, epd 를 그대로 씀: libnas 가 "음수 반환 시에도 epd, sht 는 읽은 만큼 유효하고
+		 * 없으면 -1" 을 계약으로 적어 두었음. 바이트를 다시 뜯으면 예약 SHT(5~15) 판정이 두 계층에서 갈림. */
+		event.payload.nas.sht = nas_msg.sht;                 event.payload.nas.epd = nas_msg.epd;
+		/* 보안 헤더 형과 방향의 짝은 규격이 메시지로 못박았음(obs.h 의 표). 어긋난 짝은 조작으로만
+		 * 생기고 방향을 아는 계층이 여기뿐이므로, 가독 여부와 무관하게 여기서 한 번 셈.
+		 * 하류(tr)는 이 짝으로 NAS 보안상태를 전진시키지 않음.
+		 *   parse_result 관문 밖에 두는 이유: libnas 가 "음수 반환 시에도 sht 는 읽은 만큼 유효" 를 계약했고
+		 *   (nas.h) 위에서 이미 그 계약으로 sht 를 이벤트에 실었음. 관문 안에 두면 PDU 를 자르는 것만으로
+		 *   조작 증거가 사라짐 — 형제 비대칭. 못 읽은 sht 는 -1 이라 걸리지 않음. */
+		if (nas_msg.sht == 3 || nas_msg.sht == 4) {
+			bool spec_direction_down = (nas_msg.sht == 3);
+			if (nas_pdu_direction != TR_DIRECTION_DOWN && nas_pdu_direction != TR_DIRECTION_UP) {
+				obs->stats.nas_sec_header_direction_unjudged_count++;
+				event.payload.nas.sec_header_direction_ok = false;
+			} else if ((nas_pdu_direction == TR_DIRECTION_DOWN) != spec_direction_down) {
+				obs->stats.nas_sec_header_direction_mismatch_count++;
+				event.payload.nas.sec_header_direction_ok = false;
+			}
+		}
+		if (parse_result == 0) {
+			/* NAS SMC 에서 학습. 조건: AMF→UE 방향이고 SHT 3(새 컨텍스트로 무결성 보호). SMC 는 그 방향, 그 SHT 로만 옴
+			 * (TS 24.501 Table 8.2.25.1.1, Table 9.3.1 NOTE 1). UL 이나 다른 SHT 의 SMC 모양은 단말이 만든 것이라
+			 * 학습하지 않고 셈 — 규격상 없는 조합이므로 조작의 증거임(아래 SHT 4 건과 짝). */
+			if (nas_msg.has_sec_alg) {
+				/* 전달 실패한 SMC 는 단말이 받지 못했으므로 그 알고리즘을 적용하지 않음. 학습하면 이후
+				 * 보호 NAS 의 가시성을 단말이 쓰지 않는 알고리즘으로 판정하게 됨 = 확신 있는 오값. */
+				if (nas_pdu_direction == TR_DIRECTION_DOWN && nas_msg.sht == 3
+					&& !event.payload.nas.non_delivered) {
+					n2_state->nas_ciph_alg_before_smc = n2_state->nas_ciph_alg;
+					n2_state->nas_ciph_alg = nas_msg.nas_ciph_alg;
+				} else {
+					obs->stats.nas_smc_learn_skipped_count++;
+				}
+			}
+			/* 거절되면 SMC 로 배운 알고리즘을 버리고 직전 맥락으로 되돌림(TS 24.501 §5.4.2.5). 안 되돌리면
+			 * 이후 보호 NAS 의 가시성 판정이 쓰이지 않는 알고리즘을 기준으로 돌아감 - 평문이 아닌
+			 * 것을 평문으로 읽거나(확신 있는 오값) 읽을 수 있는 것을 못 읽음. REJECT 는 옛 맥락으로
+			 * 보내므로 옛 알고리즘이 5G-EA0 이면 여기서 읽힘. */
+			if (nas_msg.msg_type == NAS_MM_SECURITY_MODE_REJECT && nas_pdu_direction == TR_DIRECTION_UP) {
+				n2_state->nas_ciph_alg = n2_state->nas_ciph_alg_before_smc;
+				n2_state->nas_ciph_alg_before_smc = -1;
+			}
+			nas_values_take(&event.payload.nas, &nas_msg, msg_type_usable);
+				/* 안쪽을 못 읽은 SHT 4 는 SECURITY MODE COMPLETE 로 추론함. 조건은 상행임 —
+				 * 표 9.3.1 NOTE 2 가 SHT 4 를 그 메시지에만 묶고, 그 메시지는 UE 에서 AMF 로만 감(§8.2.26).
+				 * 위 SMC 학습(하행, SHT 3)과 짝이 되는 반대 판정이라 같은 곳에 둠 — 방향을 아는 계층이 여기뿐임.
+				 * 추론을 안 한 경우는 위 방향 판정이 이미 카운팅했음. */
+			if (nas_msg.sht == 4 && !nas_msg.inner_readable && nas_pdu_direction == TR_DIRECTION_UP) {
+				event.payload.nas.msg_type = NAS_MM_SECURITY_MODE_COMPLETE;
+				event.payload.nas.msg_type_inferred = true;
+			}
+		} else {
+			/* 값 칸은 손대지 않음 — nas_values_init 이 이미 '안 읽음' 으로 두었고, 해석에 실패한 길에서는
+			 * nas_values_take 가 돌지 않으므로 그대로 남음. 센티널을 두 번 적으면 한쪽만 늘어남. */
+			obs->stats.nas_malformed_count++;   // 이벤트의 parse_ok=false 와 같은 사실의 합계. 전체 몇 건인지는 여기서만 보임
+		}
+		emit(obs, &event);
+	}
+
+	// UE CONTEXT RELEASE. COMMAND 는 AMF 에서 CU 로, COMPLETE 는 CU 에서 AMF 로 옴
+	if (proc_code == NP_UE_CONTEXT_RELEASE) {
+		if (ngap_msg->pdu_type == NGAP_PDU_INITIATING) {
+			struct obs_event event; fill_event_header_n2(&event, obs, sctp_message, TR_EVENT_NG_UE_CTX_RELEASE_CMD, direction); fill_n2ue(&event, n2_state);
+			event.payload.ng_cause.cause_group = ngap_msg->cause.group; event.payload.ng_cause.cause_value = ngap_msg->cause.value;
+			// 해제 원인이 F1 쪽 표 I 의 5GMM 상태를 바꾸므로(등록 해제 원인이면 DEREGISTERED) 매칭된 F1 에 귀속시킴
+			attach_f1_pair(obs, &event, n2_state);
+			emit(obs, &event);
+			n2_state->releasing = true; n2_state->release_cmd_ns = obs->now_ns;   // 유예 대기. COMPLETE 나 유예 만료에서 정리함
+		} else {
+			struct obs_event event; fill_event_header_n2(&event, obs, sctp_message, TR_EVENT_NG_UE_CTX_RELEASE_COMPLETE, direction); fill_n2ue(&event, n2_state);
+			emit(obs, &event);
+			n2_remove(obs, idx);   // COMPLETE 에서 레코드를 지움
+		}
+	}
+
+	/* RRC INACTIVE TRANSITION REPORT 를 이벤트로 냄.
+	 *   왜 내는가: 이 보고에 RRCState=inactive 가 오면 그 단말에 suspendConfig 가 있었다고 바로 확정할 수
+	 *     있음. 암호 때문에 RRCRelease 를 못 읽은 구간에서는 이것이 suspend 를 가리는 유일한 증거임.
+	 *   매칭된 F1 에 귀속시키는 이유: suspend 판정에 쓰는 값이라 위 해제 경로와 같은 방식으로 붙임.
+	 *   fail-closed: IE 92 가 없으면(rrc_state<0) 상태를 지어내지 않고 이벤트를 내지 않음. 대신 그 수를 세어
+	 *     "보고는 왔는데 상태를 못 읽었음" 을 신호로 남김. */
+	if (proc_code == NP_RRC_INACTIVE_TRANSITION && ngap_msg->pdu_type == NGAP_PDU_INITIATING) {
+		if (ngap_msg->rrc_state < 0) {
+			obs->stats.rrc_state_report_no_ie_count++;
+		} else {
+			struct obs_event event; fill_event_header_n2(&event, obs, sctp_message, TR_EVENT_NG_RRC_STATE_REPORT, direction); fill_n2ue(&event, n2_state);
+			event.payload.rrc_state_report.rrc_state = ngap_msg->rrc_state;
+			attach_f1_pair(obs, &event, n2_state);
+			emit(obs, &event);
+		}
+	}
+}
+
