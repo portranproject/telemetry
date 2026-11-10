@@ -76,8 +76,6 @@
 #include <stdio.h>
 #include <stdlib.h>             // calloc, free, strtoull
 #include <string.h>             // strcmp, strlen, memcpy, strerror
-#include <sys/socket.h>         // socket, connect: --sock
-#include <sys/un.h>             // struct sockaddr_un
 #include <time.h>               // clock_gettime: 레코드가 없는 동안에도 시간을 진행시킴
 #include <unistd.h>             // close
 
@@ -88,6 +86,11 @@
 #include <libsink/sink.h>
 
 #define MAX_INTERFACES 8        // 인터페이스 수 상한. CU 한 대의 F1/N2 NIC 는 보통 1~2 개임
+
+/* RECORD_MAX_BYTES: --record 로 남기는 파일의 상한. 디스크를 채우지 않으려고 둠 - 넘으면 출력 층이
+ *   녹화만 멈추고 소켓 전송은 이어감(sink.h). 1 GiB 는 sink.h 가 적은 셀 하나 1시간 약 23 MB 기준으로
+ *   약 46 셀-시간이라, 형식 확인용 녹화가 이 값에 닿는 일은 없음 */
+#define RECORD_MAX_BYTES (1024ull * 1024ull * 1024ull)
 
 /* 파이프라인 한 벌. 모든 콜백의 user_ctx 가 이 구조체를 가리킴 */
 struct pipeline {
@@ -329,12 +332,17 @@ int main(int argc, char **argv)
 	 * 쪽은 광고값으로 칸 길이를 검사하므로, 두 층이 다른 값을 쓰면 받는 쪽 판정이 조용히 틀림.
 	 * 그래서 기본값으로 해소한 값을 양쪽에 넘김 - 0 을 넘기면 두 층이 서로 다른 기본값을 지어냄 */
 	uint32_t period_ms = (uint32_t)(gp_ms ? gp_ms : TR_DEF_GP_MS);
-	struct tr_cfg tr_cfg = { .gp_ms = gp_ms, .noreply_timeout_ms = TR_DEF_NOREPLY_TIMEOUT_MS };
+	uint32_t noreply_timeout_ms = TR_DEF_NOREPLY_TIMEOUT_MS;
+	struct tr_cfg tr_cfg = {
+		.gp_ms              = period_ms,
+		.noreply_timeout_ms = noreply_timeout_ms,
+	};
 	struct sink_cfg sink_cfg = {
 		.socket_path        = socket_path,
 		.record_file        = record_file,
+		.record_max_bytes   = RECORD_MAX_BYTES,
 		.period_ms          = period_ms,
-		.noreply_timeout_ms = TR_DEF_NOREPLY_TIMEOUT_MS,
+		.noreply_timeout_ms = noreply_timeout_ms,
 		.producer           = "PortRAN",
 		.node_id            = node_id,
 	};
@@ -350,7 +358,6 @@ int main(int argc, char **argv)
 		.on_warning  = on_warning,
 	};
 	pipeline.tr = tr_new(&tr_cfg, &sink_ops, pipeline.sink);
-	uint32_t late_slack_ms = TR_DEF_LATE_SLACK_MS;   // 설정으로 바꿀 일이 없어 상수를 그대로 씀
 	struct obs_cfg obs_cfg = { 0 };                 // 전부 0 = libobs 기본값
 	pipeline.obs = obs_new(&obs_cfg, on_obs, &pipeline);
 	pipeline.sctp = sctp_new(on_message, on_assoc, &pipeline);
@@ -393,7 +400,7 @@ int main(int argc, char **argv)
 			exit_code = 1;   // 감시 프로세스가 재시작하거나 경보할 수 있게 종료코드로 알림
 			break;   // 생존 워터마크를 올리지 않고 나감 - 이 뒤 주기는 '확인되지 않음' 임
 		}
-		advance_idle(&pipeline, late_slack_ms);   // 트래픽이 없어도 주기는 닫혀 나가야 함
+		advance_idle(&pipeline, TR_DEF_LATE_SLACK_MS);   // 트래픽이 없어도 주기는 닫혀 나가야 함
 	}
 
 	/* 종료 순서. 바꾸면 "넘긴 수 < captured_count" 가 되어 유실로 오해됨.
@@ -696,6 +703,10 @@ int main(int argc, char **argv)
 			        (unsigned long long)sink_stats->spec_warning_count);
 			coverage_incomplete = 1;
 		}
+		if (record_file)
+			fprintf(stderr, "[sink] 녹화 %llu 바이트 (상한 %llu)\n",
+			        (unsigned long long)sink_stats->record_bytes,
+			        (unsigned long long)RECORD_MAX_BYTES);
 		if (sink_stats->is_record_stopped)
 			fprintf(stderr, "[sink] 녹화를 멈췄습니다 (상한 초과 또는 파일 쓰기 실패). 전송은 계속했습니다\n");
 	}
