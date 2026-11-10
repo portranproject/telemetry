@@ -23,11 +23,10 @@
  *                                                   |           F1 과 N2 매칭
  *                 on_obs      <---------------------+         관측 이벤트 하나
  *                                  |
- *                                  +-> sink_kpm2_on_obs_event       표 I ue_evt 줄
- *                                  +-> tr_on_event -> libtelemetry  표 I/II 집계
- *                                                        |
+ *                                  +-> tr_on_event -> libtelemetry  셀 카운터 집계와
+ *                                                        |             탐지 줄 세 가지로 변환
  *                                                        v
- *                                                     libsink       JSONL 또는 kpm2
+ *                                                     libsink       JSON Lines 한 줄로 쓰고 소켓에 보냄
  *
  *     struct pipeline 이 그 다섯 핸들을 한 벌로 묶고, 모든 콜백의 user_ctx 로 그 포인터를 넘김.
  *
@@ -62,14 +61,10 @@
  *       F1 과 N2 를 가르는 것은 SCTP PPID 임(62 F1AP, 60 NGAP, 68/66 은 그 둘의 DTLS).
  *       명령행이 아니므로 둘이 같은 NIC 를 쓰면 그 NIC 를 한 번만 적으면 됨.
  *
- *       --ii <file_path>                표 II 출력 (기본 stdout)              [sink_jsonl]
- *       --i  <file_path>                표 I  출력 (기본 stderr)              [sink_jsonl]
  *       -g <gp_ms>                      보고 주기 ms (기본값 단일출처는 tr.h)
- *       --kpm2 <file_path|->            kpm2 스트림을 파일 또는 stdout 으로   [탐지 엔진]
- *       --kpm2-sock <kpm2_socket_path>  kpm2 스트림을 유닉스 스트림 소켓으로  [탐지 엔진]
- *       --session <session>             kpm2 session (기본 "portran")
- *       --node <node_id>                kpm2 hello.node_id
- *       --ue-evt                        kpm2 에서 표 I ue_evt 줄도 냄(2단계 룰)
+ *       --sock <socket_path>            탐지 엔진이 듣는 유닉스 소켓
+ *       --record <file_path|->          보낸 줄을 그대로 남길 파일(- = stdout). 형식 확인용
+ *       --node <node_id>                접속 인사의 node_id
  *
  *     Ctrl+C 한 번이면 부착을 풀고 링 버퍼에 남은 레코드를 마저 처리한 뒤 마지막 미완 주기를
  *     닫음. 두 번이면 남은 처리를 건너뜀.
@@ -81,7 +76,7 @@
 #include <stdio.h>
 #include <stdlib.h>             // calloc, free, strtoull
 #include <string.h>             // strcmp, strlen, memcpy, strerror
-#include <sys/socket.h>         // socket, connect: --kpm2-sock
+#include <sys/socket.h>         // socket, connect: --sock
 #include <sys/un.h>             // struct sockaddr_un
 #include <time.h>               // clock_gettime: 레코드가 없는 동안에도 시간을 진행시킴
 #include <unistd.h>             // close
@@ -91,7 +86,6 @@
 #include <libobs/obs.h>
 #include <libtelemetry/tr.h>
 #include <libsink/sink.h>
-#include <libsink/sink_kpm2.h>
 
 #define MAX_INTERFACES 8        // 인터페이스 수 상한. CU 한 대의 F1/N2 NIC 는 보통 1~2 개임
 
@@ -165,13 +159,36 @@ static void feed_coverage(struct pipeline *pipeline)
 	tr_set_obs_coverage(pipeline->tr, obs_internal_loss(pipeline->obs) + sctp_lost_count);
 }
 
-/* on_obs: 관측 이벤트 하나를 탐지 엔진용 ue_evt 줄과 지표 집계 양쪽으로 넘김.
- *   sink_kpm2_on_obs_event 는 kpm2 sink 가 아니면 스스로 아무 일도 안 하므로 조건 없이 부름 */
+/* on_obs: 관측 이벤트 하나를 집계 층으로 넘김.
+ *   단말 줄과 DU 줄을 여기서 따로 내지 않는 이유: 집계 층이 그 변환을 함께 함. 두 곳에서 내면
+ *   주기 줄과의 순서를 여기서 다시 맞춰야 하고, 둘 중 한쪽만 고치면 조용히 어긋남 */
 static void on_obs(void *user_ctx, const struct obs_event *event)
 {
 	struct pipeline *pipeline = user_ctx;
-	sink_kpm2_on_obs_event(pipeline->sink, event);
 	tr_on_event(pipeline->tr, event);
+}
+
+/* 아래 넷은 집계 층의 콜백 서명을 출력 층 함수에 맞추는 자리임. 서명이 다른 이유는 출력 층이
+ *   첫 인자로 자기 타입을 받고 버린 이유를 반환하기 때문임 - 그 반환값은 출력 층이 이미 이유별로
+ *   세고 있어 여기서 다시 보지 않고, 종료 보고가 그 수를 읽음 */
+static void on_period(void *user_ctx, const struct report_period *period)
+{
+	sink_on_period(user_ctx, period);
+}
+static void on_ue_event(void *user_ctx, const struct report_ue_event *event)
+{
+	sink_on_ue_event(user_ctx, event);
+}
+static void on_f1_event(void *user_ctx, const struct report_f1_event *event)
+{
+	sink_on_f1_event(user_ctx, event);
+}
+/* on_warning: 집계 층이 자기 불변식이 깨진 것을 알릴 때 부름. 줄로 내보내지 않고 stderr 로만 냄 -
+ *   받는 쪽 규약에 그 줄이 없고, 이것은 우리 계산이 어긋났다는 신호라 사람이 봐야 함 */
+static void on_warning(void *user_ctx, const char *code, const char *detail)
+{
+	(void)user_ctx;
+	fprintf(stderr, "[tr] 경고: %s%s%s\n", code, detail ? " - " : "", detail ? detail : "");
 }
 
 static void on_message(void *user_ctx, const struct sctp_message *sctp_message)
@@ -203,7 +220,7 @@ static uint64_t wallclock_ns(void)
  *   이유: 트래픽이 없던 주기도 줄은 내보내되 카운터를 null 로 실어야 함. 그래야 읽는 쪽이 건수 0 과
  *     그 구간을 못 봤음을 가릴 수 있음. 내보내려면 먼저 주기가 닫혀야 하고, 주기는 시간이 흘러야 닫힘.
  *   워터마크를 slack 만큼 뒤로 물리는 이유: 링 버퍼에서 늦게 올라오는 레코드가 이미 닫은 주기에
- *     떨어지면 late_event_count 로 샘. tr_cfg.late_slack_ms 가 그 여유임.
+ *     떨어지면 late_event_count 로 샘. TR_DEF_LATE_SLACK_MS 가 그 여유임.
  *   생존 근거: cap_poll 이 음수가 아니면 탭이 아직 붙어 있음 - 떨어지면 1초 안에 -ENODEV 임(cap.c). */
 static void advance_idle(struct pipeline *pipeline, uint32_t late_slack_ms)
 {
@@ -239,51 +256,14 @@ static void on_record(void *user_ctx, const struct cap_record *record)
 	sctp_input(pipeline->sctp, record);                    // on_message -> obs -> on_obs -> tr_on_event -> sink
 }
 
-/* open_unix_stream: 탐지 엔진이 듣고 있는 유닉스 스트림 소켓에 붙어 FILE* 로 감쌈.
- *   이유: kpm2 sink 는 FILE* 에 줄 단위로 씀. 소켓을 fdopen 하면 같은 sink 를 그대로 쓸 수 있음.
- *   반환: 실패하면 NULL(사유는 stderr). 성공하면 호출자가 fclose 로 닫음 */
-static FILE *open_unix_stream(const char *kpm2_socket_path)
-{
-	struct sockaddr_un address;
-	memset(&address, 0, sizeof(address));
-	address.sun_family = AF_UNIX;
-	if (strlen(kpm2_socket_path) >= sizeof(address.sun_path)) {
-		fprintf(stderr, "--kpm2-sock 경로가 너무 깁니다 (상한 %zu): %s\n", sizeof(address.sun_path) - 1, kpm2_socket_path);
-		return NULL;
-	}
-	memcpy(address.sun_path, kpm2_socket_path, strlen(kpm2_socket_path));
-
-	int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (socket_fd < 0) {
-		fprintf(stderr, "socket(AF_UNIX): %s\n", strerror(errno));
-		return NULL;
-	}
-	if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-		fprintf(stderr, "connect(%s): %s - 탐지 엔진이 먼저 듣고 있어야 합니다\n", kpm2_socket_path, strerror(errno));
-		close(socket_fd);
-		return NULL;
-	}
-	FILE *kpm2_stream = fdopen(socket_fd, "w");
-	if (!kpm2_stream) {
-		fprintf(stderr, "fdopen: %s\n", strerror(errno));
-		close(socket_fd);
-		return NULL;
-	}
-	return kpm2_stream;
-}
-
 static void usage(const char *program_name)
 {
 	fprintf(stderr,
 	        "사용: sudo %s [옵션] <interface_name> ...\n"
-	        "  --ii <file_path>                Table II 출력 (기본 stdout)\n"
-	        "  --i  <file_path>                Table I  출력 (기본 stderr)\n"
-	        "  -g <gp_ms>                      보고 주기 ms (기본 = 15분)\n"
-	        "  --kpm2 <file_path|->            탐지 엔진 kpm2 스트림을 파일로(- = stdout)\n"
-	        "  --kpm2-sock <kpm2_socket_path>  탐지 엔진 kpm2 스트림을 유닉스 소켓으로\n"
-	        "  --session <session>             kpm2 세션 이름 (기본 portran)\n"
-	        "  --node <node_id>                kpm2 hello.node_id\n"
-	        "  --ue-evt                        kpm2 에서 Table I ue_evt 줄도 내보냄\n"
+	        "  -g <gp_ms>                  보고 주기 ms (기본 = 15분)\n"
+	        "  --sock <socket_path>        탐지 엔진이 듣는 유닉스 소켓 (기본 " SINK_DEFAULT_SOCKET_PATH ")\n"
+	        "  --record <file_path|->      보낸 줄을 그대로 남길 파일 (- = stdout). 형식 확인용\n"
+	        "  --node <node_id>            hello 의 node_id\n"
 	        "\n"
 	        "종료 코드: 0 = 정상, 측정 완전 / 1 = 운영 실패(탭, 통계, 스트림) / 2 = 커버리지 불완전\n",
 	        program_name);
@@ -291,10 +271,7 @@ static void usage(const char *program_name)
 
 int main(int argc, char **argv)
 {
-	const char *table_two_path = NULL, *table_one_path = NULL;
-	const char *kpm2_file_path = NULL, *kpm2_socket_path = NULL;
-	const char *session = NULL, *node_id = NULL;
-	bool ue_evt = false;
+	const char *socket_path = NULL, *record_path = NULL, *node_id = NULL;
 	uint64_t gp_ms = 0;                      // 0 = libtelemetry 기본값(15분)
 	struct cap_interface interfaces[MAX_INTERFACES];
 	int interface_count = 0;
@@ -302,9 +279,7 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		const char *argument = argv[i];
 		bool has_value = i + 1 < argc;
-		if      (!strcmp(argument, "--ii")  && has_value) table_two_path   = argv[++i];
-		else if (!strcmp(argument, "--i")   && has_value) table_one_path  = argv[++i];
-		else if (!strcmp(argument, "-g")    && has_value) {
+		if      (!strcmp(argument, "-g")    && has_value) {
 			/* 범위 검사가 필요한 이유: libtelemetry 가 gp_ms * 1000000 을 ns 로 쓰므로(tr.c 의 gp_ns)
 			 *   큰 값은 곱셈이 넘쳐 gp_ns 가 0 이 되고 첫 레코드에서 0 으로 나눔(SIGFPE). 음수는
 			 *   strtoull 이 ULLONG_MAX 로 감싸 주기가 수백 년이 되어 아무 출력도 안 나옴.
@@ -319,11 +294,9 @@ int main(int argc, char **argv)
 			}
 			gp_ms = parsed_gp_ms;
 		}
-		else if (!strcmp(argument, "--kpm2") && has_value) kpm2_file_path  = argv[++i];
-		else if (!strcmp(argument, "--kpm2-sock") && has_value) kpm2_socket_path = argv[++i];
-		else if (!strcmp(argument, "--session") && has_value) session      = argv[++i];
-		else if (!strcmp(argument, "--node") && has_value) node_id         = argv[++i];
-		else if (!strcmp(argument, "--ue-evt")) ue_evt = true;
+		else if (!strcmp(argument, "--sock")   && has_value) socket_path = argv[++i];
+		else if (!strcmp(argument, "--record") && has_value) record_path = argv[++i];
+		else if (!strcmp(argument, "--node")   && has_value) node_id     = argv[++i];
 		else if (argument[0] == '-') { usage(argv[0]); return 2; }
 		else {
 			if (interface_count >= MAX_INTERFACES) {
@@ -341,50 +314,43 @@ int main(int argc, char **argv)
 		}
 	}
 	if (interface_count == 0) { usage(argv[0]); return 2; }
-	if (kpm2_file_path && kpm2_socket_path) {
-		fprintf(stderr, "--kpm2 와 --kpm2-sock 은 함께 쓸 수 없습니다\n");
-		return 2;
-	}
 
-	/* ── 출력 스트림 열기 ───────────────────────────────────────────────── */
-	FILE *table_two_file = stdout, *table_one_file = stderr, *kpm2_stream = NULL;
-	if (kpm2_socket_path) {
-		kpm2_stream = open_unix_stream(kpm2_socket_path);
-		if (!kpm2_stream) return 1;
-	} else if (kpm2_file_path) {
-		kpm2_stream = !strcmp(kpm2_file_path, "-") ? stdout : fopen(kpm2_file_path, "w");
-		if (!kpm2_stream) { perror(kpm2_file_path); return 1; }
-	} else {
-		if (table_two_path && !(table_two_file = fopen(table_two_path, "w"))) { perror(table_two_path); return 1; }
-		if (table_one_path && !(table_one_file = fopen(table_one_path, "w"))) { perror(table_one_path); return 1; }
+	/* 녹화 파일만 엶. 소켓은 출력 층이 스스로 열고 끊기면 다시 붙음 - 그 재접속 상태를 여기서
+	 * 들고 있으면 같은 것을 두 곳이 기억하게 됨 */
+	FILE *record_file = NULL;
+	if (record_path) {
+		record_file = !strcmp(record_path, "-") ? stdout : fopen(record_path, "w");
+		if (!record_file) { perror(record_path); return 1; }
 	}
 
 	// ---- 파이프라인 조립 (아래에서 위로: sink, tr, obs, sctp, cap) ----
 	struct pipeline pipeline = { 0 };
-	if (kpm2_stream) {
-		struct sink_kpm2_cfg kpm2_cfg = {
-			.session   = session,
-			.producer  = "PortRAN",
-			.node_id   = node_id,
-			// period_ms 는 gp_ms 와 같은 양의 kpm2 와이어 이름임. ue_evt 모드에선 hello 가 주기보다
-			//   먼저 나갈 수 있어 미리 알려 줌.
-			//   기본값으로 해소한 값을 넘길 것. 0 을 넘기면 sink_kpm2 가 1 ms 를 지어내고(hello.period_ms=1)
-			//   실제 주기는 900000 ms 라, 탐지 엔진이 모든 줄에서 PeriodMismatch 로 전 규칙을 영구
-			//   보류함. 기본값 단일출처는 tr.h 임
-			.period_ms = gp_ms ? gp_ms : TR_DEF_GP_MS,
-			.ue_evt    = ue_evt,
-		};
-		pipeline.sink = sink_kpm2(kpm2_stream, &kpm2_cfg);
-	} else {
-		pipeline.sink = sink_jsonl(table_two_file, table_one_file);
-	}
+	/* 주기 길이와 무응답 대기를 두 층에 같은 값으로 넘김. 출력 층은 그 둘을 hello 로 광고하고 받는
+	 * 쪽은 광고값으로 칸 길이를 검사하므로, 두 층이 다른 값을 쓰면 받는 쪽 판정이 조용히 틀림.
+	 * 그래서 기본값으로 해소한 값을 양쪽에 넘김 - 0 을 넘기면 두 층이 서로 다른 기본값을 지어냄 */
+	uint32_t period_ms = (uint32_t)(gp_ms ? gp_ms : TR_DEF_GP_MS);
+	struct tr_cfg tr_cfg = { .gp_ms = gp_ms, .noreply_timeout_ms = TR_DEF_NOREPLY_TIMEOUT_MS };
+	struct sink_cfg sink_cfg = {
+		.socket_path        = socket_path,
+		.record_file        = record_file,
+		.period_ms          = period_ms,
+		.noreply_timeout_ms = TR_DEF_NOREPLY_TIMEOUT_MS,
+		.producer           = "PortRAN",
+		.node_id            = node_id,
+	};
+	pipeline.sink = sink_new(&sink_cfg);
 	if (!pipeline.sink) {
-		fprintf(stderr, "출력 어댑터 초기화 실패 (메모리 부족)\n");
+		fprintf(stderr, "출력 어댑터 초기화 실패 (설정이 잘못됐거나 메모리 부족)\n");
 		return 1;
 	}
-	struct tr_cfg tr_cfg = { .gp_ms = gp_ms };
-	pipeline.tr = tr_new(&tr_cfg, &pipeline.sink->ops, pipeline.sink->user_ctx);
-	uint32_t late_slack_ms = tr_cfg.late_slack_ms ? tr_cfg.late_slack_ms : TR_DEF_LATE_SLACK_MS;
+	struct tr_sink_ops sink_ops = {
+		.on_period   = on_period,
+		.on_ue_event = on_ue_event,
+		.on_f1_event = on_f1_event,
+		.on_warning  = on_warning,
+	};
+	pipeline.tr = tr_new(&tr_cfg, &sink_ops, pipeline.sink);
+	uint32_t late_slack_ms = TR_DEF_LATE_SLACK_MS;   // 설정으로 바꿀 일이 없어 상수를 그대로 씀
 	struct obs_cfg obs_cfg = { 0 };                 // 전부 0 = libobs 기본값
 	pipeline.obs = obs_new(&obs_cfg, on_obs, &pipeline);
 	pipeline.sctp = sctp_new(on_message, on_assoc, &pipeline);
@@ -403,7 +369,7 @@ int main(int argc, char **argv)
 	action.sa_handler = on_signal;
 	sigaction(SIGINT, &action, NULL);
 	sigaction(SIGTERM, &action, NULL);
-	/* SIGPIPE 무시. --kpm2-sock 의 상대인 탐지 엔진이 재시작하면 첫 쓰기에서 SIGPIPE 가 오는데
+	/* SIGPIPE 무시. --sock 의 상대인 탐지 엔진이 재시작하면 첫 쓰기에서 SIGPIPE 가 오는데
 	 *   기본 동작이 즉사라, cap_detach 부터 tr_finish 까지 종료 경로가 전부 건너뛰어지고 미완
 	 *   주기가 사라짐. 무시해 두면 write 가 -EPIPE 로 돌아오고 아래 ferror 검사가 그것을 잡음 */
 	struct sigaction ignore_action = { 0 };
@@ -616,120 +582,130 @@ int main(int argc, char **argv)
 		        (unsigned long long)pipeline.cap_stats_error_count);
 		coverage_incomplete = 1;
 	}
-	uint64_t coverage_only_dropped_count = sink_kpm2_coverage_only_dropped_count(pipeline.sink);
-	if (coverage_only_dropped_count) {
-		fprintf(stderr, "[coverage] 경고: 손실만 있던 주기 %llu 개가 kpm2 규약상 형식이 없어 스트림에 나가지 못했습니다 "
-		                "(탐지 엔진이 그 구간을 못 봅니다)\n", (unsigned long long)coverage_only_dropped_count);
-		coverage_incomplete = 1;
+	/* 내보내지 못한 줄과 주기를 이유별로 보고함. 출처가 둘인 이유: 집계 층은 자기가 안 넘긴 것을
+	 * 세고, 출력 층은 넘겨받은 뒤 버린 것을 셈. 한쪽만 보면 어느 단계에서 사라졌는지 알 수 없음.
+	 * 수동 관측자는 다시 달라고 할 수 없으므로, 이 수들이 그 구간의 지표가 하한이라는 유일한 신호임 */
+	const struct tr_stats *tr_stats = tr_get_stats(pipeline.tr);
+	if (tr_stats) {
+		static const char *const skip_reason[TR_UE_EVENT_SKIP__COUNT] = {
+			"셀(NR-CGI) 미상", "단말 키(DU UE F1AP ID) 미상", "방향(UL/DL) 미상", "관측자가 합성한 해제 완료",
+			"전달되지 않은 NAS", "NAS 해석 실패 또는 보안 헤더 방향 위반",
+			"아는 5GMM 메시지 번호가 아님", "5GMM 이 아닌 판별자",
+		};
+		for (int reason = 0; reason < TR_UE_EVENT_SKIP__COUNT; reason++) {
+			if (!tr_stats->ue_event_skipped_count[reason]) continue;
+			fprintf(stderr, "[tr] 단말 줄 %llu 개를 내보내지 않음: %s\n",
+			        (unsigned long long)tr_stats->ue_event_skipped_count[reason], skip_reason[reason]);
+			coverage_incomplete = 1;
+		}
+		if (tr_stats->unreported_period_count)
+			fprintf(stderr, "[tr] 길이가 온전하지 않아 내보내지 않은 주기 %llu 개 "
+			                "(기동 또는 종료 시각이 주기 경계가 아님)\n",
+			        (unsigned long long)tr_stats->unreported_period_count);
+		if (tr_stats->ue_event_direction_disagree_count) {
+			fprintf(stderr, "[tr] 경고: 관측 층이 알려 준 방향과 규격상 방향이 다른 메시지 %llu 건 "
+			                "(줄은 규격 쪽 방향으로 냈습니다 - 관측 층 결함 신호입니다)\n",
+			        (unsigned long long)tr_stats->ue_event_direction_disagree_count);
+			coverage_incomplete = 1;
+		}
+		if (tr_stats->cell_number_collision_count) {
+			fprintf(stderr, "[tr] 경고: PLMN 이 다른 셀 %llu 건이 같은 NR Cell Identity 를 써 "
+			                "셀 번호가 겹쳐 나갔습니다 (그 구간의 셀별 줄을 믿을 수 없습니다)\n",
+			        (unsigned long long)tr_stats->cell_number_collision_count);
+			coverage_incomplete = 1;
+		}
+		if (tr_stats->lost_evicted_count) {
+			fprintf(stderr, "[tr] 표가 꽉 차 밀어낸 단말 레코드 %llu 개 "
+			                "(그 단말의 뒤 이벤트는 수립 이력 없이 처리됐습니다)\n",
+			        (unsigned long long)tr_stats->lost_evicted_count);
+			coverage_incomplete = 1;
+		}
+		if (tr_stats->reset_unresolved_count) {
+			fprintf(stderr, "[tr] RESET 이 가리켰지만 우리 색인으로 닫지 못한 단말 %llu 개 "
+			                "(연결 수 지표가 그만큼 과대일 수 있습니다)\n",
+			        (unsigned long long)tr_stats->reset_unresolved_count);
+			coverage_incomplete = 1;
+		}
+		if (tr_stats->inactive_observed_count) {
+			fprintf(stderr, "[tr] 이 망이 RRC_INACTIVE 를 쓴다고 확인된 %llu 건 "
+			                "(연결 수 지표는 하한입니다 - INACTIVE 에서 돌아오는 것을 볼 수 없습니다)\n",
+			        (unsigned long long)tr_stats->inactive_observed_count);
+			coverage_incomplete = 1;
+		}
+		if (tr_stats->release_basis_observed_count || tr_stats->release_basis_assumed_count)
+			fprintf(stderr, "[tr] 완전 해제 판정 근거: 평문 관측 %llu, 구조 추론 %llu\n",
+			        (unsigned long long)tr_stats->release_basis_observed_count,
+			        (unsigned long long)tr_stats->release_basis_assumed_count);
+		if (tr_stats->nas_msg_type_inferred_count)
+			fprintf(stderr, "[tr] NAS 메시지 종류를 와이어에서 읽지 못하고 보안 헤더와 방향으로 추론한 줄 %llu 개 "
+			                "(줄에는 추론임을 적을 칸이 없습니다)\n",
+			        (unsigned long long)tr_stats->nas_msg_type_inferred_count);
+		if (tr_stats->rrc_malformed_count || tr_stats->ap_decode_fail_count) {
+			fprintf(stderr, "[tr] 해석 실패로 어느 줄에도 못 들어간 수: RRC %llu, F1AP/NGAP %llu\n",
+			        (unsigned long long)tr_stats->rrc_malformed_count,
+			        (unsigned long long)tr_stats->ap_decode_fail_count);
+			coverage_incomplete = 1;
+		}
+		if (tr_stats->f1_event_cells_unknown_count || tr_stats->f1_event_du_ue_id_missing_count)
+			fprintf(stderr, "[tr] DU 줄: 셀 번호를 못 준 셀 %llu 건(모든 셀로 내림), "
+			                "DU 번호가 없어 단말 목록에서 뺀 항목 %llu 건\n",
+			        (unsigned long long)tr_stats->f1_event_cells_unknown_count,
+			        (unsigned long long)tr_stats->f1_event_du_ue_id_missing_count);
+		static const char *const excl_reason[TR_EXCLUDED__COUNT] = {
+			"마감 안에 같은 단말이 다시 요청", "AMF 과부하 구간",
+			"결판은 났지만 어느 셀의 시도인지 모름",
+			"폴백으로 열린 수립의 Complete", "이미 결판난 시도에 다시 온 Complete",
+		};
+		for (int reason = 0; reason < TR_EXCLUDED__COUNT; reason++) {
+			if (!tr_stats->excluded_count[reason]) continue;
+			fprintf(stderr, "[tr] 카운팅 규칙이 제외한 사건 %llu 건: %s\n",
+			        (unsigned long long)tr_stats->excluded_count[reason], excl_reason[reason]);
+		}
+		/* 주기 줄에 값으로 못 싣는 지표의 센 수. 재수립과 재개는 측정 가능성이 형제 칸마다 달라
+		 * 값 없이 내보내므로, 센 수가 여기에만 남음 */
+		for (int metric = 0; metric < TR_METRIC__COUNT; metric++) {
+			if (!tr_stats->value_count[metric] && !tr_stats->unknown_count[metric]
+			    && !tr_stats->unknown_nocause_count[metric]) continue;
+			fprintf(stderr, "[tr] %-34s 본값 %llu, 근거 없음 %llu, 원인 미상 %llu\n",
+			        tr_metric_name(metric),
+			        (unsigned long long)tr_stats->value_count[metric],
+			        (unsigned long long)tr_stats->unknown_count[metric],
+			        (unsigned long long)tr_stats->unknown_nocause_count[metric]);
+		}
 	}
-	uint64_t unknown_direction_dropped_count = sink_kpm2_unknown_direction_dropped_count(pipeline.sink);
-	if (unknown_direction_dropped_count) {
-		// 정상 망에서는 0 임(RRC 컨테이너를 싣는 F1AP 메시지는 방향이 모두 확정). 0 이 아니면 관측 지점이나 입력 쪽 신호임
-		fprintf(stderr, "[coverage] 경고: 방향(UL/DL)을 못 정해 ue_evt 줄 %llu 개를 내보내지 않았습니다 "
-		                "(추측해 적지 않습니다 - 비표준 포트나 루프백 관측 지점이거나 기형 입력일 수 있습니다)\n",
-		        (unsigned long long)unknown_direction_dropped_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t no_cell_dropped_count = sink_kpm2_no_cell_dropped_count(pipeline.sink);
-	if (no_cell_dropped_count) {
-		/* 중간합류 UE 는 NR-CGI 를 실은 F1AP 메시지를 못 봐 셀이 미상이고, kpm2 의 ue_evt 는 cell_id 를
-		 *   필수로 요구함 -> 줄을 못 냄. 돌아가는 CU 에 탭을 붙이는 정상 배치가 바로 이 경우라,
-		 *   조용히 버리면 그 단말이 탐지 엔진에 아예 존재하지 않게 됨 */
-		fprintf(stderr, "[coverage] 경고: 셀(NR-CGI)을 못 정해 ue_evt 줄 %llu 개를 내보내지 않았습니다 "
-		                "(중간합류 UE - NR-CGI 를 싣는 F1AP 메시지를 탭 부착 전에 놓친 경우입니다)\n",
-		        (unsigned long long)no_cell_dropped_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t direction_disagree_count = sink_kpm2_direction_disagree_count(pipeline.sink);
-	if (direction_disagree_count) {
-		// 줄은 sink 가 고정한 방향으로 나갔음. 0 이 아니면 obs 의 방향 판정이나 합성 경로를 볼 것
-		fprintf(stderr, "[coverage] 경고: obs 가 올린 방향이 F1AP 메시지의 확정 방향과 어긋난 ue_evt 줄 %llu 개 "
-		                "(줄은 확정 방향으로 나갔습니다 - obs 의 방향 판정이나 grace 만료 합성 경로를 보십시오)\n",
-		        (unsigned long long)direction_disagree_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t synthetic_release_skipped_count = sink_kpm2_synthetic_release_skipped_count(pipeline.sink);
-	if (synthetic_release_skipped_count) {
-		/* 합성분을 와이어에 섞지 않은 것은 설계대로임. 다만 '해제 COMPLETE 를 못 봤다' 는 사실 자체가
-		 *   관측 구멍이라 커버리지 불완전으로 표시함 - 형제 경고들과 같은 기준임 */
-		fprintf(stderr, "[coverage] 경고: 해제 COMPLETE 를 못 봐 합성한 종료 %llu 건은 ue_evt 로 내보내지 않았습니다 "
-		                "(관측한 줄과 섞지 않습니다 - 엔진은 si.RRC.ConnMax 기준 유령 정리로 그 연결을 닫습니다)\n",
-		        (unsigned long long)synthetic_release_skipped_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t plmn_mismatch_count = sink_kpm2_plmn_mismatch_count(pipeline.sink);
-	if (plmn_mismatch_count) {
-		/* cell_id 에 싣는 NR Cell Identity 는 PLMN 안에서만 유일함(TS 38.413 §9.3.1.7). PLMN 이 섞이면
-		 *   서로 다른 셀이 같은 cell_id 로 보여 탐지 엔진이 둘을 한 셀로 합쳐 셈. 줄은 나갔으므로
-		 *   드롭은 아니지만 지표가 틀렸을 수 있어 커버리지 불완전으로 표시함 */
-		fprintf(stderr, "[coverage] 경고: 처음 본 PLMN 과 다른 PLMN 으로 나간 줄이 %llu 개입니다 "
-		                "(cell_id 는 PLMN 안에서만 유일해 서로 다른 셀이 같은 값으로 보였을 수 있습니다)\n",
-		        (unsigned long long)plmn_mismatch_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t noreply_mismatch_count = sink_kpm2_noreply_mismatch_count(pipeline.sink);
-	if (noreply_mismatch_count) {
-		fprintf(stderr, "[coverage] 경고: hello 광고 무응답 대기와 실제 적용값이 다른 주기 %llu 개 "
-		                "- 탐지 엔진의 시도와 NoReply 매칭이 어긋납니다\n",
-		        (unsigned long long)noreply_mismatch_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t cause_omitted_count = sink_kpm2_cause_omitted_count(pipeline.sink);
-	if (cause_omitted_count) {
-		fprintf(stderr, "[coverage] 경고: Cause 값의 이름을 몰라 ue_evt %llu 줄에서 f.cause 를 생략했습니다 "
-		                "(고정 문법이 모르는 값입니다 - 줄 자체는 나갔습니다)\n",
-		        (unsigned long long)cause_omitted_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t nas_unmapped_dropped_count = sink_kpm2_nas_unmapped_dropped_count(pipeline.sink);
-	if (nas_unmapped_dropped_count) {
-		fprintf(stderr, "[coverage] 경고: 엔진 철자표에 없는 5GMM 타입이라 NAS 줄 %llu 개를 내보내지 않았습니다 "
-		                "(표 9.7.1 중 어댑터가 아직 안 적은 타입입니다)\n",
-		        (unsigned long long)nas_unmapped_dropped_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t capture_unconfirmed_period_count = sink_kpm2_capture_unconfirmed_period_count(pipeline.sink);
-	if (capture_unconfirmed_period_count) {
-		fprintf(stderr, "[coverage] 경고: 캡처 생사를 확인하지 못해 주기 %llu 개의 카운터를 null 로 보냈습니다 "
-		                "(그 구간은 '0건' 이 아니라 '안 셈' 입니다)\n",
-		        (unsigned long long)capture_unconfirmed_period_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t nas_f_unnamed_count = sink_kpm2_nas_f_unnamed_count(pipeline.sink);
-	if (nas_f_unnamed_count) {
-		fprintf(stderr, "[coverage] 경고: 값의 이름을 몰라 NAS 줄의 f 키 %llu 개를 뺐습니다 "
-		                "(줄 자체는 나갔습니다 - 엔진에서는 그 IE 가 없었던 것과 같은 모양입니다)\n",
-		        (unsigned long long)nas_f_unnamed_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t f1_evt_cells_unknown_count = sink_kpm2_f1_evt_cells_unknown_count(pipeline.sink);
-	if (f1_evt_cells_unknown_count) {
-		fprintf(stderr, "[coverage] 경고: 재시작 알림 %llu 줄에 셀 목록 대신 '모든 셀' 을 실었습니다 "
-		                "(엔진이 그 DU 와 무관한 셀의 단말까지 닫습니다)\n",
-		        (unsigned long long)f1_evt_cells_unknown_count);
-		coverage_incomplete = 1;
-	}
-	uint64_t f1_evt_du_ue_id_missing_count = sink_kpm2_f1_evt_du_ue_id_missing_count(pipeline.sink);
-	if (f1_evt_du_ue_id_missing_count) {
-		fprintf(stderr, "[coverage] 경고: 일부 RESET 의 단말 %llu 개를 번호가 없어 알림에 싣지 못했습니다 "
-		                "(엔진이 그만큼 덜 닫습니다)\n",
-		        (unsigned long long)f1_evt_du_ue_id_missing_count);
-		coverage_incomplete = 1;
+
+	const struct sink_stats *sink_stats = sink_get_stats(pipeline.sink);
+	if (sink_stats) {
+		fprintf(stderr, "[sink] 보낸 줄 %llu (hello %llu), 재접속 %llu, inferred 합 %llu\n",
+		        (unsigned long long)sink_stats->line_count, (unsigned long long)sink_stats->hello_count,
+		        (unsigned long long)sink_stats->reconnect_count, (unsigned long long)sink_stats->inferred_count);
+		if (sink_stats->invalid_drop_count || sink_stats->disconnected_drop_count
+		    || sink_stats->too_long_drop_count || sink_stats->write_error_count) {
+			fprintf(stderr, "[sink] 버린 줄: 형식 %llu, 미접속 %llu, 길이 초과 %llu, 쓰기 실패 %llu\n",
+			        (unsigned long long)sink_stats->invalid_drop_count,
+			        (unsigned long long)sink_stats->disconnected_drop_count,
+			        (unsigned long long)sink_stats->too_long_drop_count,
+			        (unsigned long long)sink_stats->write_error_count);
+			coverage_incomplete = 1;
+		}
+		if (sink_stats->write_error_count) exit_code = 1;
+		/* 보냈지만 받는 쪽이 경고를 낼 모양이었던 줄. 우리 계산이 어긋난 흔적임 */
+		if (sink_stats->spec_warning_count) {
+			fprintf(stderr, "[sink] 경고: 규약과 어긋난 모양으로 나간 줄 %llu 개 "
+			                "(원인 합이 total 과 다르거나 칸 길이가 광고값과 다름)\n",
+			        (unsigned long long)sink_stats->spec_warning_count);
+			coverage_incomplete = 1;
+		}
+		if (sink_stats->is_record_stopped)
+			fprintf(stderr, "[sink] 녹화를 멈췄습니다 (상한 초과 또는 파일 쓰기 실패). 전송은 계속했습니다\n");
 	}
 
 	/* 쓰기 오류 검사. 탐지 엔진이 재시작해 소켓이 닫히면 모든 write 가 EPIPE 로 실패하는데,
 	 *   fprintf 반환을 버리면 스트림 전체가 조용히 사라진 채 exit 0 으로 나감(= 전량 유실 +
 	 *   성공 종료, 가장 나쁜 등급). fclose 반환으로는 못 잡음 - 그쪽은 0 을 돌려줌.
 	 *   stdio 가 래치하는 ferror 가 유일한 신호임 */
-	struct { FILE *stream; const char *label; } output_streams[] = {
-		{ kpm2_stream,     "kpm2" },
-		{ table_two_file,  "Table II" },
-		{ table_one_file,  "Table I" },
-	};
-	for (size_t i = 0; i < sizeof output_streams / sizeof output_streams[0]; i++) {
-		if (!output_streams[i].stream || !ferror(output_streams[i].stream)) continue;
-		fprintf(stderr, "[io] 오류: %s 스트림 쓰기가 실패했습니다 - 그 뒤 내용이 상대에게 닿지 않았습니다 "
-		                "(탐지 엔진 재시작, 소켓 닫힘, 디스크 가득 등)\n", output_streams[i].label);
+	if (record_file && ferror(record_file)) {
+		fprintf(stderr, "[io] 오류: 녹화 파일 쓰기가 실패했습니다 (디스크 가득 등). 전송은 별개입니다\n");
 		exit_code = 1;
 	}
 
@@ -739,16 +715,8 @@ int main(int argc, char **argv)
 	tr_free(pipeline.tr);
 	sink_free(pipeline.sink);
 	/* fclose 반환도 검사함. 버퍼에 남은 내용을 내보내다 실패할 수 있고, 그건 위 ferror 뒤에 생길 수도 있음 */
-	if (kpm2_stream && kpm2_stream != stdout && fclose(kpm2_stream) != 0) {
-		fprintf(stderr, "[io] 오류: kpm2 스트림 닫기 실패: %s (마지막 버퍼가 상대에게 닿지 않았습니다)\n", strerror(errno));
-		exit_code = 1;
-	}
-	if (table_two_file != stdout && fclose(table_two_file) != 0) {
-		fprintf(stderr, "[io] 오류: Table II 스트림 닫기 실패: %s\n", strerror(errno));
-		exit_code = 1;
-	}
-	if (table_one_file != stderr && fclose(table_one_file) != 0) {
-		fprintf(stderr, "[io] 오류: Table I 스트림 닫기 실패: %s\n", strerror(errno));
+	if (record_file && record_file != stdout && fclose(record_file) != 0) {
+		fprintf(stderr, "[io] 오류: 녹화 파일 닫기 실패: %s\n", strerror(errno));
 		exit_code = 1;
 	}
 	if (exit_code) return exit_code;                 /* 1 = 운영 실패 */
