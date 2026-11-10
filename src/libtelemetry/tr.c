@@ -3082,3 +3082,290 @@ static void on_nas(struct tr *tr, const struct obs_event *event)
 	}
 	emit_ue_line(tr, ue_record, event, changed_mask, 0);
 }
+// ---- 공개 API ----
+/* tr_new: 집계 엔진 하나를 만듬.
+ *   설정과 출력 함수 표는 값으로 복사하므로 부르는 쪽이 들고 있을 필요가 없음. user_ctx 는 그 표의
+ *     콜백에 그대로 되돌려 주는 포인터이고 수명은 부르는 쪽이 책임짐.
+ *   반환: 실패하면 NULL(할당 실패). 실패 시 해제할 것 없음 */
+struct tr *tr_new(const struct tr_cfg *tr_cfg, const struct tr_sink_ops *sink_ops, void *user_ctx)
+{
+	struct tr *tr = calloc(1, sizeof *tr);
+	if (!tr) return NULL;
+	if (tr_cfg) tr->tr_cfg = *tr_cfg;
+	if (sink_ops) tr->sink_ops = *sink_ops;
+	tr->user_ctx = user_ctx;
+	tr->overflow_cell_index = -1;
+	// 자기 검사는 설정이나 환경변수 어느 쪽으로도 켤 수 있음
+	tr->self_check = (tr_cfg && tr_cfg->self_check) || getenv("TR_SELF_CHECK") != NULL;
+	if (hash_map_init(&tr->cell_map, 64) < 0 || hash_map_init(&tr->ue_map, 256) < 0 ||
+		hash_map_init(&tr->setup_idx, 256) < 0 || hash_map_init(&tr->n2_map, 128) < 0 ||
+		hash_map_init(&tr->amf_map, 16) < 0) {
+		tr_free(tr); return NULL;
+	}
+	return tr;
+}
+
+// tr_advance: 이벤트 없이 시각만 밀어 주기 경계를 넘김. 조용한 구간에도 0건 주기가 나가게 함
+void tr_advance(struct tr *tr, uint64_t now_ns)
+{
+	if (!tr) return;
+	advance_to(tr, now_ns);
+}
+
+/* tr_on_event: 관측 이벤트 하나를 받아 해당 핸들러로 보냄.
+ *   시각을 먼저 미는 이유: 부르는 쪽이 tr_advance 를 빼먹어도 주기 경계가 밀리게 함. 이미 밀었으면
+ *     아무 일도 하지 않음.
+ *   이미 닫힌 주기의 이벤트는 반영할 칸이 없으므로 버리고 그 수를 셈 - 버린 사실을 남기지 않으면
+ *     "그런 이벤트가 없었다" 와 같은 모양이 됨.
+ *   부작용: 주기 경계를 넘으면 그 주기를 방출함. 처리 뒤 자기 검사를 돌림 */
+void tr_on_event(struct tr *tr, const struct obs_event *event)
+{
+	if (!tr || !event) return;
+	advance_to(tr, event->wallclock_ns);
+	if (event->wallclock_ns < tr->cur_start_ns) { tr->late_event_count++; return; }
+
+	switch (event->kind) {
+	case TR_EVENT_RRC_SETUP_REQUEST:
+		on_setup_request(tr, event);
+		break;
+	case TR_EVENT_RRC_SETUP:
+		on_rrc_setup(tr, event);
+		break;
+	case TR_EVENT_RRC_SETUP_COMPLETE:
+		on_setup_complete(tr, event);
+		break;
+	case TR_EVENT_RRC_DCCH_OPAQUE:
+		on_rrc_dcch_opaque(tr, event);
+		break;   // 중간 합류 암호 SRB1 -> 미상 연결 모집단
+	case TR_EVENT_RRC_REJECT:
+		on_reject(tr, event);
+		break;
+	case TR_EVENT_RRC_REEST_REQUEST:
+		on_reest_request(tr, event);
+		break;
+	case TR_EVENT_RRC_REEST:
+		on_reest(tr, event);
+		break;
+	case TR_EVENT_RRC_REEST_COMPLETE:
+		on_reest_complete(tr, event);
+		break;
+	case TR_EVENT_RRC_RESUME_REQUEST:
+		on_resume_request(tr, event);
+		break;
+	case TR_EVENT_RRC_RESUME_COMPLETE:
+		on_resume_complete(tr, event);
+		break;
+	case TR_EVENT_RRC_RELEASE:
+		on_release(tr, event);
+		break;
+	case TR_EVENT_F1_UE_CTX_RELEASE_CMD:
+		on_ctx_release_cmd(tr, event);
+		break;
+	case TR_EVENT_F1_UE_CTX_RELEASE_COMPLETE:
+		on_ctx_release_complete(tr, event);
+		break;
+	case TR_EVENT_F1_INITIAL_UL:
+		on_initial_ul(tr, event);
+		break;
+	case TR_EVENT_F1_UE_CTX_RELEASE_REQ:
+		// DU 가 먼저 해제를 요청함. 열린 수립이 있으면 결과를 모르는 실패로 닫음
+		{
+			struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
+			if (ue_record) close_setup_other(tr, ue_record);
+		}
+		break;
+	case TR_EVENT_F1_RESET:
+	case TR_EVENT_F1_SETUP:
+		on_reset(tr, event);
+		break;
+	case TR_EVENT_SCTP_ASSOC_END:
+		// AMF 레코드는 N2 연결로 색인되므로 N2 종료에서 회수함. F1 종료는 그 키와 맞지 않음
+		if (event->iface == TR_IFACE_N2) {
+			n2_remove(tr, event->assoc_id, event->n2ue.ran_ue_ngap_id);
+			amf_drop_assoc(tr, event->assoc_id);
+		}
+		else on_assoc_end(tr, event);
+		break;
+	case TR_EVENT_OBS_UE_REPLACED:
+		on_ue_replaced(tr, event);
+		break;
+	case TR_EVENT_OBS_UE_EVICTED:
+		if (event->iface == TR_IFACE_N2)
+			n2_remove(tr, event->assoc_id, event->n2ue.ran_ue_ngap_id);
+		else on_ue_evicted(tr, event);
+		break;
+	case TR_EVENT_F1_UE_TRANSFER:
+		on_ue_transfer(tr, event);
+		break;
+	case TR_EVENT_F1_CELL_CONFIG:
+		on_cell_config(tr, event);
+		break;
+	case TR_EVENT_RRC_SMC:
+	case TR_EVENT_RRC_RECONFIG_SEC:
+		on_smc(tr, event);
+		break;
+	case TR_EVENT_RRC_SMC_COMPLETE:
+	case TR_EVENT_RRC_SMC_FAILURE:
+		on_smc_result(tr, event);
+		break;   // AS 보안 상태 확정
+	case TR_EVENT_F1_ALG_CHANGE_OPPORTUNITY:
+		on_alg_opportunity(tr, event);
+		break;
+	case TR_EVENT_F1_UE_CTX_SETUP:
+		on_ue_ctx_setup(tr, event);
+		break;
+	case TR_EVENT_NG_INITIAL_UE_MESSAGE:
+		on_initial_ue_msg(tr, event);
+		break;
+	case TR_EVENT_NG_AMF_DL_UE_MSG:
+		on_amf_dl(tr, event);
+		break;
+	case TR_EVENT_NG_UE_CTX_RELEASE_CMD:
+		on_ng_release_cmd(tr, event);
+		break;   // 해제 원인이 NAS 해제면 5GMM DEREGISTERED 로
+	case TR_EVENT_NG_UE_CTX_RELEASE_COMPLETE:
+		n2_remove(tr, event->assoc_id, event->n2ue.ran_ue_ngap_id);
+		break;   // 실제 완료와 libobs 가 유예 만료로 합성한 것 둘 다 N2 레코드를 회수함
+	case TR_EVENT_NG_RRC_STATE_REPORT:
+		on_rrc_state_report(tr, event);
+		break;   // INACTIVE 즉시 확정 + 전제 위반 경보
+	case TR_EVENT_NG_OVERLOAD_START:
+		on_overload_start(tr, event);
+		break;
+	case TR_EVENT_NG_OVERLOAD_STOP:
+		on_overload_stop(tr, event);
+		break;
+	case TR_EVENT_NG_SETUP:
+		on_ng_setup(tr, event);
+		break;
+	case TR_EVENT_NAS_F1:
+	case TR_EVENT_NG_NAS:
+		on_nas(tr, event);
+		break;
+	default:
+		break;   // 그 밖(오류 표시 등)은 지금 지표에 쓰이지 않음
+	}
+	tr_self_check(tr);   // 게이지, 소속, 열린 수립 목록이 정합한지 검사(시험과 새니타이저 빌드에서만)
+}
+
+/* period_has_content: 지금 열려 있는 주기에 표 II 로 방출할 내용이 있는가.
+ *   내용의 정의: close_period 가 주기마다 리셋하는 누적 중 실제 수치가 비어 있지 않은 것. 카운터와
+ *     그 제외, 중첩, 경로 분해, 표본 수, 반쯤 열림 합, 엔진 수준의 늦은 이벤트와 축출 수가 여기 듦.
+ *     순수 상태 플래그는 내용이 아니므로 뺌.
+ *   이 집합은 close_period 의 리셋 집합을 그대로 비춤 - 누적을 하나 추가하면 양쪽을 같이 고칠 것.
+ *     한쪽만 고치면 그 값이 유일한 내용인 주기가 조용히 사라짐.
+ *   반환: 내용이 있으면 1, 없으면 0 */
+static int period_has_content(const struct tr *tr)
+{
+	if (tr->late_event_count || tr->lost_evicted_count) return 1;
+	/* 전제 위반 경보와 해제 근거 수도 보고 헤더에 실리는 내용임. 이들이 유일한 내용인 주기 -
+	 * suspendConfig 를 본 해제만 있었던 주기처럼 카운터가 하나도 오르지 않은 경우 - 가 종전엔
+	 * 조용히 드롭돼 '깨끗한 주기' 로 보였음 */
+	if (tr->inactive_alarm_count || tr->release_basis_observed_count
+	    || tr->release_basis_assumed_count) return 1;
+	/* 탭 전체의 커버리지 증가분도 내용임. 종전엔 늦은 이벤트, 축출, 셀 카운터와 표본만 봐서
+	 * tr_finish 의 길이 0 최종 주기가 TSN 공백, 링 버퍼 포화, ESP, IP 조각, 관측자 내부 유실을
+	 * 조용히 드롭했음. emit_coverage_only_period 의 손실 관문과 같은 집합으로 맞춤 */
+	#define COVERAGE_DELTA(cur, snap) ((cur) >= (snap) ? (cur) - (snap) : 0)
+	int has_coverage =
+		COVERAGE_DELTA(tr->coverage_tsn_gap_count, tr->coverage_snapshot_tsn_gap_count) ||
+		COVERAGE_DELTA(tr->coverage_ringbuf_full_count, tr->coverage_snapshot_ringbuf_full_count) ||
+		COVERAGE_DELTA(tr->coverage_esp_seen_count, tr->coverage_snapshot_esp_seen_count) ||
+		COVERAGE_DELTA(tr->coverage_ip_frag_skipped_count, tr->coverage_snapshot_ip_frag_skipped_count) ||
+		COVERAGE_DELTA(tr->coverage_obs_lost_count, tr->coverage_snapshot_obs_lost_count);
+	#undef COVERAGE_DELTA
+	if (has_coverage) return 1;
+	for (uint32_t i = 0; i < tr->cell_count; i++) {
+		const struct tr_cell_record *cell_record = &tr->cell_records[i];
+		if (cell_record->conn_sample_count || cell_record->inactive_sample_count
+		    || cell_record->half_open_sum) return 1;
+		for (int metric_index = 0; metric_index < TR_METRIC__COUNT; metric_index++) {
+			if (cell_record->cc_unknown_nocause[metric_index]) return 1;
+			for (int path_index = 0; path_index < PATH__COUNT; path_index++)
+				if (cell_record->path_value[metric_index][path_index]) return 1;
+			for (int cause_index = 0; cause_index < MAX_CAUSE; cause_index++) {
+				if (cell_record->cc_value[metric_index][cause_index]
+				    || cell_record->cc_unknown[metric_index][cause_index]) return 1;
+				for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++)
+					if (cell_record->cc_excluded[metric_index][excl_index][cause_index]) return 1;
+				for (int overlap_index = 0; overlap_index < TR_OVERLAP__COUNT; overlap_index++)
+					if (cell_record->cc_overlap[metric_index][cause_index][overlap_index]) return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+/* tr_finish: 마지막 주기를 닫고 방출함.
+ *   끝 시각이 주기 경계에 정확히 떨어지면 advance_to 가 그 주기를 닫고 길이 0 인 주기로 넘어감.
+ *     그 주기가 비었으면 방출이 잡음이라 생략하되, 끝 시각에 기록된 이벤트가 있으면 유실 없이
+ *     방출해야 함. 길이가 있는 빈 주기는 늘 유지함 - 시도 0 과 커버리지도 뜻이 있는 값임.
+ *   부작용: 마지막 주기를 부분 주기로 표시해 방출함. 종료 상태 자기 검사를 돌림 */
+void tr_finish(struct tr *tr, uint64_t end_ns)
+{
+	if (!tr) return;
+	advance_to(tr, end_ns);
+	if (tr->started && (tr->cur_start_ns < end_ns ||
+					   (tr->cur_start_ns == end_ns && period_has_content(tr))))
+		close_period(tr, 1);
+	tr_self_check(tr);
+}
+
+/* tr_set_capture_alive: 캡처가 살아 있다고 확인된 시각을 올림.
+ *   값을 내리지 않는 이유: 보고 헤더의 '캡처 확인' 은 '적어도 이 시각까지는 살아 있었다' 는 뜻이라
+ *     단조 증가여야 함 */
+void tr_set_capture_alive(struct tr *tr, uint64_t capture_alive_until_ns)
+{
+	if (!tr) return;
+	if (capture_alive_until_ns > tr->capture_alive_until_ns) tr->capture_alive_until_ns = capture_alive_until_ns;
+}
+
+/* tr_set_coverage: 캡처 쪽 누적 카운터 넷을 받아 저장함. 주기를 닫을 때 증가분으로 헤더에 실림.
+ *   역행을 경고하는 이유: 누적 카운터는 한 번 돌리는 동안 단조 증가여야 함. 역행은 탭 재부착이나
+ *     커널 카운터 리셋을 뜻하고, 그때 증가분 계산이 그 주기를 0 으로 묶음. 0 으로 묶는 것은 '그
+ *     구간의 유실이 없었다' 로 읽히므로 맹점을 숨기지 않도록 한 번 경고를 올림 */
+void tr_set_coverage(struct tr *tr, uint64_t coverage_tsn_gap_count, uint64_t coverage_ringbuf_full_count,
+					 uint64_t coverage_esp_seen_count, uint64_t coverage_ip_frag_skipped_count)
+{
+	if (!tr) return;
+	if (!tr->warned_coverage_reset &&
+	    (coverage_tsn_gap_count < tr->coverage_tsn_gap_count ||
+	     coverage_ringbuf_full_count < tr->coverage_ringbuf_full_count ||
+	     coverage_esp_seen_count < tr->coverage_esp_seen_count ||
+	     coverage_ip_frag_skipped_count < tr->coverage_ip_frag_skipped_count)) {
+		warn(tr, "coverage_reset", "coverage counter decreased (tap reattach/counter reset); period delta clamped to 0");
+		tr->warned_coverage_reset = 1;
+	}
+	tr->coverage_tsn_gap_count = coverage_tsn_gap_count;
+	tr->coverage_ringbuf_full_count = coverage_ringbuf_full_count;
+	tr->coverage_esp_seen_count = coverage_esp_seen_count;
+	tr->coverage_ip_frag_skipped_count = coverage_ip_frag_skipped_count;
+}
+
+// tr_set_obs_coverage: 관측자 내부 유실 누적을 저장함. 주기를 닫을 때 증가분으로 헤더에 실림
+void tr_set_obs_coverage(struct tr *tr, uint64_t coverage_obs_lost_count)
+{
+	if (!tr) return;
+	tr->coverage_obs_lost_count = coverage_obs_lost_count;
+}
+
+/* tr_period_pending_close: 지금 tr_advance 를 부르면 주기가 닫히는가.
+ *   이유: 부르는 쪽이 주기가 닫히기 직전에만 커버리지를 갱신하게 해, 라이브 경로에서 레코드마다
+ *     커널 카운터를 조회하는 비용을 없앰. 증가분은 누적과 스냅샷의 차이로 계산하므로 그 주기 전체의
+ *     손실은 그대로 잡힘.
+ *   반환: 아직 시작하지 않았으면 거짓(첫 레코드는 엔진을 시작하기만 함) */
+bool tr_period_pending_close(const struct tr *tr, uint64_t now_ns)
+{
+	return tr && tr->started && now_ns >= tr->cur_end_ns;
+}
+
+// tr_free: 엔진과 그 안의 모든 배열을 해제함. NULL 이어도 안전함
+void tr_free(struct tr *tr)
+{
+	if (!tr) return;
+	hash_map_free(&tr->cell_map); hash_map_free(&tr->ue_map); hash_map_free(&tr->setup_idx);
+	hash_map_free(&tr->n2_map); hash_map_free(&tr->amf_map);
+	free(tr->cell_records); free(tr->ue_records); free(tr->n2_records);
+	free(tr->amf_records); free(tr->open_list);
+	free(tr);
+}
