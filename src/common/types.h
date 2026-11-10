@@ -53,7 +53,7 @@ enum tr_sec_state {
  * UNKNOWN=0 이 있어야 하는 이유: 루프백처럼 한 패킷을 두 훅이 모두 보는 장치에서는 방향을
  *   미상으로 두고 그 수를 세야 함. 또 Reset(F1AP proc_code 0)은
  *   TS 38.473 §8.2.1 상 CU 와 DU 양쪽이 개시할 수 있어 절차만으로는 방향이 안 정해짐. UNKNOWN 이
- *   없으면 그런 경우에도 UP/DOWN 중 하나를 **추측해 사실처럼 싣게 됨**(= 조용한 오값).
+ *   없으면 그런 경우에도 UP/DOWN 중 하나를 추측해 사실처럼 싣게 됨(= 조용한 오값).
  *   번호를 0 으로 둔 이유: 구조체를 0 으로 초기화하면 자동으로 미상이 됨 - 채우는 것을 잊어도 거짓이 아님 */
 enum tr_direction { TR_DIRECTION_UNKNOWN = 0, TR_DIRECTION_UP = 1, TR_DIRECTION_DOWN = 2 };
 
@@ -72,7 +72,7 @@ struct tr_f1ue {
 	uint32_t cu_ue_id;       /* gNB-CU UE F1AP ID */
 	bool     has_cu_ue_id;
 	/* crnti: 그 단말의 C-RNTI. INITIAL UL RRC MESSAGE TRANSFER 에서 배워 단말 레코드가 들고 있음.
-	 *   키마다 한 번 배우면 그 단말의 **모든** 이벤트에 같이 실림 - 탐지 명세가 모든 줄에 요구하고,
+	 *   키마다 한 번 배우면 그 단말의 모든 이벤트에 같이 실림 - 모든 줄에서 그 단말을 C-RNTI 로 가릴 수 있게 하고,
 	 *   출력 층이 단말 표를 또 만들어 같은 값을 다시 기억하지 않게 하려는 것임. 못 배웠으면 false */
 	uint32_t crnti;
 	bool     has_crnti;
@@ -90,7 +90,7 @@ struct tr_n2ue {
 
 /* F1AP 및 NGAP PDU 의 세 갈래. bool 하나로 줄이면 '실패' 가 '성공' 과 같은 값이 되어
  *   출력이 UEContextSetupFailure 를 UEContextSetupResponse 로 내보냄(= 조용한 오값).
- *   번호는 ap.h 의 F1AP_PDU_* 와 같은 순서지만 **별개 타입**임([2] 경계) */
+ *   번호는 ap.h 의 F1AP_PDU_* 와 같은 순서지만 별개 타입임 */
 enum tr_ap_outcome {
 	TR_AP_OUTCOME_REQUEST = 1,   /* initiatingMessage */
 	TR_AP_OUTCOME_SUCCESS,       /* successfulOutcome */
@@ -183,8 +183,8 @@ struct tr_reset_ue {
 
 /* obs_nas_values: NAS 메시지 하나에서 꺼낸 값.
  *
- *   한 구조체를 두 자리가 씀. 탐지 엔진이 두 자리를 가르지 않기 때문임 —
- *   참조 샘플의 `"via":"F1"` 줄도 id_type / s_tmsi / cause 를 싣음.
+ *   한 구조체를 두 자리가 씀. 두 자리에서 꺼내는 값이 같기 때문임 — F1 로 온 줄도 N2 로 온 줄도
+ *   id_type, s_tmsi, cause 를 그대로 싣음.
  *
  *     F1   RRCSetupComplete 안의 초기 NAS    AS 보안 전 평문이라 obs 가 바로 읽음
  *     N2   NGAP 이 나르는 NAS-PDU            SHT 1~4 면 학습한 알고리즘으로 가시성을 판정
@@ -267,7 +267,7 @@ struct obs_event {
 		/* setup_complete: RRC 식별자와, 그 안에 실린 초기 NAS(AS 보안 전 평문).
 		 *   has_stmsi48 이 두 겹인 것은 중복이 아님: 바깥쪽은 RRC 식별자 IE 에서, nas.has_stmsi48 은
 		 *   NAS 5GS mobile identity 에서 온 같은 개념의 값이고 둘 중 하나만 실리는 경우가 있음.
-		 *   탐지 엔진이 RRC 줄과 NAS 줄에 따로 요구함 */
+		 *   RRC 줄과 NAS 줄을 각각 그 계층이 본 값으로 채우려면 두 칸이 다 있어야 함 */
 		struct { bool has_stmsi_part2; uint16_t stmsi_part2; bool has_stmsi48; uint64_t stmsi48;
 		         struct obs_nas_values nas; } setup_complete;  /* 6 */
 
