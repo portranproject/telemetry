@@ -41,7 +41,7 @@
  *     수동 관측자라 다시 달라고 할 수 없으므로, 못 읽는 것은 못 읽었다고 세는 쪽이 맞음.
  *     그래서 두 걸음임 - (1) 값을 담지 않음, (2) 담지 않은 이유마다 계수기를 올림.
  *
- * [5] F1 과 N2 짝짓기. 같은 단말이 두 인터페이스에서 다른 번호를 쓰므로 내용으로 맞춤.
+ * [5] F1 과 N2 매칭. 같은 단말이 두 인터페이스에서 다른 번호를 쓰므로 내용으로 맞춤.
  *
  *     F1 쪽 RRCSetupComplete 가 먼저 와서 대기열에 들어가고, N2 쪽 INITIAL UE MESSAGE 가
  *     그 키를 찾아감. 대기열에 둘 이상이면 고르지 않고 모호로 셈 - 절반이 오귀속이 되기 때문임.
@@ -65,7 +65,7 @@ const char *tr_event_name(enum tr_event_kind kind)
 		[TR_EVENT_RRC_SETUP_COMPLETE]="E.RRC.SETUP_COMPLETE", [TR_EVENT_RRC_SMC]="E.RRC.SMC", [TR_EVENT_RRC_SMC_COMPLETE]="E.RRC.SMC_COMPLETE",
 		[TR_EVENT_RRC_SMC_FAILURE]="E.RRC.SMC_FAILURE", [TR_EVENT_RRC_REEST]="E.RRC.REEST", [TR_EVENT_RRC_REEST_COMPLETE]="E.RRC.REEST_COMPLETE",
 		[TR_EVENT_RRC_RESUME]="E.RRC.RESUME", [TR_EVENT_RRC_RESUME_COMPLETE]="E.RRC.RESUME_COMPLETE", [TR_EVENT_RRC_RELEASE]="E.RRC.RELEASE",
-		[TR_EVENT_RRC_DCCH_OPAQUE]="E.RRC.DCCH_OPAQUE", [TR_EVENT_RRC_OTHER]="E.RRC.OTHER", [TR_EVENT_NAS_F1]="E.NAS.F1",
+		[TR_EVENT_RRC_DCCH_OPAQUE]="E.RRC.DCCH_OPAQUE", [TR_EVENT_RRC_OTHER]="E.RRC.OTHER",
 		[TR_EVENT_F1_UE_CTX_SETUP]="E.F1.UE_CTX_SETUP", [TR_EVENT_F1_UE_CTX_RELEASE_REQ]="E.F1.UE_CTX_RELEASE_REQ",
 		[TR_EVENT_F1_UE_CTX_RELEASE_CMD]="E.F1.UE_CTX_RELEASE_CMD", [TR_EVENT_F1_UE_CTX_RELEASE_COMPLETE]="E.F1.UE_CTX_RELEASE_COMPLETE",
 		[TR_EVENT_F1_RESET]="E.F1.RESET", [TR_EVENT_SCTP_ASSOC_END]="E.SCTP.ASSOC_END", [TR_EVENT_NG_INITIAL_UE_MESSAGE]="E.NG.INITIAL_UE_MESSAGE",
@@ -194,7 +194,7 @@ struct obs_ue_state {
 	uint32_t crnti;         bool has_crnti;
 	struct tr_nr_cgi cell;
 	enum tr_prior_req prior_req;   // 재수립이나 재개 요청으로 들어왔으면 fallback 수립으로 봄
-	int est_cause;                 // RRCSetupRequest 의 establishmentCause. 짝짓기 키에 들어감. -1 모름
+	int est_cause;                 // RRCSetupRequest 의 establishmentCause. 매칭 키에 들어감. -1 모름
 	/* 전역에서 단조 증가하는 레코드 번호. 슬롯이 재사용돼도 번호는 재사용되지 않으므로,
 	   짝을 되찾을 때 다른 단말이 우연히 같은 슬롯에 들어온 것을 가려냄 */
 	uint64_t record_id;
@@ -282,14 +282,14 @@ struct obs_n2_state {
 	bool used; int hash_next; int lru_prev, lru_next;
 };
 
-// ---- F1 RRCSetupComplete 와 N2 INITIAL UE MESSAGE 짝짓기 --------------------------------
+// ---- F1 RRCSetupComplete 와 N2 INITIAL UE MESSAGE 매칭 ---------------------------------
 
 // 대기 중인 F1 항목 하나. (assoc_id, du_ue_id, f1_record_id)가 ue_find_record_id 로 되찾을 때의 키임
 struct corr_item { uint64_t wallclock_ns; uint64_t f1_record_id; uint32_t assoc_id; uint32_t du_ue_id; int next_index; bool used; };
 struct corr_key {
 	uint32_t plmn_packed; uint64_t cell_id; int est_cause; uint32_t nas_ie_len; uint64_t hash_lo, hash_hi;   // PLMN 과 셀 번호를 합쳐 NR CGI
 	uint64_t ambiguous_until_ns;        // 모호 표지 만료 시각. 그때까지 같은 키는 모두 모호로 셈
-	int item_head; int pending_count;      // 대기 F1 항목 단일 연결 리스트의 머리와 그 수
+	int item_head; int pending_count;      // 대기 F1 항목 단일 연결 리스트의 첫 항목과 그 수
 	bool used; int hash_next;
 };
 
@@ -307,7 +307,7 @@ struct obs {
 	// F1 단말 표. 배열 + 해시 체인 + 빈 칸 목록 + LRU
 	struct obs_ue_state *ue_states; uint32_t ue_capacity;
 	int *ue_hash_buckets; uint32_t ue_hash_bucket_count;
-	int ue_free;                 // 빈 칸 목록의 머리. -1 이면 없음
+	int ue_free;                 // 빈 칸 목록의 첫 항목. -1 이면 없음
 	int lru_head, lru_tail;      // head 가 가장 오래된 것, tail 이 가장 최근
 	uint32_t ue_count;
 
@@ -318,7 +318,7 @@ struct obs {
 	struct obs_n2_state *n2_states; uint32_t n2_capacity; int *n2_hash_buckets; uint32_t n2_hash_bucket_count;
 	int n2_free, n2_lru_head, n2_lru_tail; uint32_t n2_count;
 
-	// 짝짓기. 키 버킷 해시와 대기 F1 항목 풀
+	// 매칭. 키 버킷 해시와 대기 F1 항목 풀
 	struct corr_key *corr_keys; uint32_t corr_key_capacity; int *corr_key_hash_buckets; uint32_t corr_key_hash_bucket_count; int corr_key_free;
 	struct corr_item *corr_items; uint32_t corr_item_capacity; int corr_item_free;
 	uint64_t correlation_window_ns;
@@ -902,6 +902,7 @@ static void handle_rrc_container(struct obs *obs, const struct sctp_message *sct
 		ue_state->reest_reactivated = false;
 		break;
 	case TR_EVENT_RRC_REJECT:
+		event.payload.reject.has_wait_time = rrc_msg.has_wait_time;
 		event.payload.reject.wait_time_s = rrc_msg.wait_time_s;
 		event.payload.reject.prior_req = ue_state->prior_req;
 		ue_state->resumed = false;
@@ -947,7 +948,10 @@ static void handle_rrc_container(struct obs *obs, const struct sctp_message *sct
 		}
 		break;
 	case TR_EVENT_RRC_SMC:
-		event.payload.smc.ciph_alg = rrc_msg.ciphering_algorithm.value; event.payload.smc.integ_alg = rrc_msg.integrity_algorithm.value;
+		event.payload.smc.ciph_alg = rrc_msg.ciphering_algorithm.value;
+		event.payload.smc.integ_alg = rrc_msg.integrity_algorithm.value;
+		event.payload.smc.ciph_alg_name = rrc_msg.ciphering_algorithm.name;
+		event.payload.smc.integ_alg_name = rrc_msg.integrity_algorithm.name;
 		ue_state->rrc_sec_state = TR_SEC_CMD_SENT; ue_state->ciph_alg = rrc_msg.ciphering_algorithm.value;   // 고른 알고리즘을 기록. 관문이 이 값으로 가독을 판정함
 		break;
 	case TR_EVENT_RRC_SMC_COMPLETE:
@@ -978,7 +982,10 @@ static void handle_rrc_container(struct obs *obs, const struct sctp_message *sct
 		if (rrc_msg.ciphering_algorithm.value < 0 && rrc_msg.integrity_algorithm.value < 0) kind = TR_EVENT_RRC_OTHER;   // securityConfig 가 없으면 OTHER 로
 		event.kind = kind;
 		if (kind == TR_EVENT_RRC_RECONFIG_SEC) {
-			event.payload.smc.ciph_alg = rrc_msg.ciphering_algorithm.value; event.payload.smc.integ_alg = rrc_msg.integrity_algorithm.value;
+			event.payload.smc.ciph_alg = rrc_msg.ciphering_algorithm.value;
+			event.payload.smc.integ_alg = rrc_msg.integrity_algorithm.value;
+			event.payload.smc.ciph_alg_name = rrc_msg.ciphering_algorithm.name;
+			event.payload.smc.integ_alg_name = rrc_msg.integrity_algorithm.name;
 			/* 세션 중 재키잉(RRCReconfiguration 의 securityConfig)이 알고리즘을 바꾸면 관문이 쓰는 ciph_alg 도
 			 * 갱신해야 함. 안 하면 수립이 NEA0 였다가 실제 암호로 재키된 뒤에도 관문이 계속 평문으로 열려
 			 * 거짓 가독이 상한 없이 남음. NEA0 에서 NEAx 로 바뀌는 것은 드물지만 fail-closed 원칙상 추적함. */
@@ -1231,23 +1238,23 @@ static void handle_f1ap(struct obs *obs, const struct sctp_message *sctp_message
 	// 절차별 F1AP 수준 이벤트
 	switch (f1ap_msg->procedure_code) {
 	case P_UE_CTX_SETUP: {
-		struct obs_event ctx_setup_event; fill_event_header(&ctx_setup_event, obs, sctp_message, TR_EVENT_F1_UE_CTX_SETUP, direction); fill_f1ue(&ctx_setup_event, ue_state);
+		struct obs_event event; fill_event_header(&event, obs, sctp_message, TR_EVENT_F1_UE_CTX_SETUP, direction); fill_f1ue(&event, ue_state);
 		/* 결과 세 갈래를 그대로 옮김. bool 로 줄이면 unsuccessfulOutcome 이 successfulOutcome 과 같은 값이
 		 *   되어, 출력이 UEContextSetupFailure 를 "UEContextSetupResponse" 로 내보냄. */
 		switch (f1ap_msg->pdu_type) {
 		case F1AP_PDU_SUCCESSFUL:
-			ctx_setup_event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_SUCCESS;
+			event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_SUCCESS;
 			break;
 		case F1AP_PDU_UNSUCCESSFUL:
-			ctx_setup_event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_FAILURE;
+			event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_FAILURE;
 			obs->stats.ue_ctx_setup_failure_cause_dropped_count++;   // Cause IE 를 실을 칸이 없음. 버린 사실만 남김
 			break;
 		default:
-			ctx_setup_event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_REQUEST;
+			event.payload.ue_ctx_setup.outcome = TR_AP_OUTCOME_REQUEST;
 			break;
 		}
-		if (f1ap_msg->has_crnti) { ctx_setup_event.payload.ue_ctx_setup.has_crnti = true; ctx_setup_event.payload.ue_ctx_setup.crnti = f1ap_msg->crnti; }
-		emit(obs, &ctx_setup_event);
+		if (f1ap_msg->has_crnti) { event.payload.ue_ctx_setup.has_crnti = true; event.payload.ue_ctx_setup.crnti = f1ap_msg->crnti; }
+		emit(obs, &event);
 		/* 알고리즘 변경 기회(DU 간 핸드오버)는 여기서 내지 않음: 판단 근거인 CU to DU RRC Information 의
 		 *   확장 IE 119(HandoverPreparationInformation) 유무가 f1ap_msg 에 없음(ap.h) */
 		break; }

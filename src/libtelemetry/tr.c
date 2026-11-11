@@ -42,7 +42,6 @@
 // ---- 상수와 기본값 ----
 #define DEF_GP_MS                     TR_DEF_GP_MS   // 단일 출처는 tr.h. 출력 쪽이 광고하는 주기도 같은 값이어야 함
 #define DEF_CONN_SAMPLE_PERIOD_MS     100u
-#define DEF_INACTIVE_SAMPLE_PERIOD_MS 100u
 #define DEF_LATE_SLACK_MS             50u
 #define DEF_MAX_CELL_COUNT            4096u
 // 기본 무응답 대기는 tr.h 가 공개함. 출력 쪽이 같은 값을 광고해야 하므로 단일 출처여야 함
@@ -68,6 +67,14 @@ enum tr_setup_result { SR_OPEN = 0, SR_SUCCESS, SR_NETWORK_REJECT, SR_NOREPLY, S
 
 // 게이지를 값 등급별로 따로 둠. 등급이 다른 것을 한 수에 섞지 않으려고
 enum tr_gauge_level { LV_EXACT = 0, LV_INFERRED, LV_UNKNOWN };
+
+/* 표본 누적의 칸 번호. 게이지 칸 번호(enum tr_gauge_level)와 다름 - 이쪽은 값의 등급이 아니라
+ * 추정 범위임. 같은 길이 3 배열이라 번호를 섞으면 컴파일은 되고 값만 틀림 */
+enum tr_si_band { SI_LOWER = 0, SI_VALUE, SI_UPPER };
+
+/* 수립이 어느 경로로 결판났나. 수립 요청에서 시작한 것과 재수립/재개가 폴백한 것을 가름.
+ *   결과 카운팅이 경로마다 다른 지표로 가므로 레코드가 자기 경로를 들고 있어야 함 */
+enum tr_path { PATH_SETUP = 0, PATH_REEST_FALLBACK, PATH_RESUME_FALLBACK };
 
 /* AMF 과부하 상태. AMF_UNKNOWN 과 AMF_DETACHED 는 지금 어느 지점에서도 대입하지 않음 -
  * assoc 가 끊기면 레코드를 미상으로 두지 않고 지우기 때문임. 그래도 두는 이유는 과부하
@@ -99,20 +106,12 @@ static const char *const MNAME[TR_METRIC__COUNT] = {
 	TR_METRIC_LIST(X)
 #undef X
 };
-/* 원인 이름 배열 두 벌. metrics.h 의 목록 하나를 철자별로 두 번 전개함
- *   ARR      28.552 하위카운터 철자. 하이픈 없음(TS 28.552 §4.1a). 표 II 가 씀
- *   ASN1_ARR ASN.1 값 이름 철자. 탐지 엔진으로 나가는 줄이 씀 - 읽는 쪽이 대소문자까지 비교함 */
-#define Y(name_28552, name_asn1) name_28552,
+// 원인 이름 배열. metrics.h 의 목록 하나를 전개함. 철자는 ASN.1 값 이름이고 그대로 와이어로 나감
+#define Y(name) name,
 static const char *const TR_CAUSE_ARR_EST16[] = { TR_CAUSE_EST16(Y) };
 static const char *const TR_CAUSE_ARR_UEC11[] = { TR_CAUSE_UEC11(Y) };
 static const char *const TR_CAUSE_ARR_RES16[] = { TR_CAUSE_RES16(Y) };
 static const char *const TR_CAUSE_ARR_FAIL3[] = { TR_CAUSE_FAIL3(Y) };
-#undef Y
-#define Y(name_28552, name_asn1) name_asn1,
-static const char *const TR_CAUSE_ASN1_ARR_EST16[] = { TR_CAUSE_EST16(Y) };
-static const char *const TR_CAUSE_ASN1_ARR_UEC11[] = { TR_CAUSE_UEC11(Y) };
-static const char *const TR_CAUSE_ASN1_ARR_RES16[] = { TR_CAUSE_RES16(Y) };
-static const char *const TR_CAUSE_ASN1_ARR_FAIL3[] = { TR_CAUSE_FAIL3(Y) };
 #undef Y
 /* 두 가지를 컴파일 때 못박음. 어기면 컴파일 에러임
  *   (1) 배열 길이 == 유도 개수. 이름표 한쪽만 고쳐도 둘이 함께 바뀜을 보증
@@ -122,23 +121,13 @@ _Static_assert(TR_ARRAY_LENGTH(TR_CAUSE_ARR_EST16) == TR_CAUSE_TABLE_COUNT_EST16
 _Static_assert(TR_ARRAY_LENGTH(TR_CAUSE_ARR_UEC11) == TR_CAUSE_TABLE_COUNT_UEC11, "UEC11 이름표/개수 불일치");
 _Static_assert(TR_ARRAY_LENGTH(TR_CAUSE_ARR_RES16) == TR_CAUSE_TABLE_COUNT_RES16, "RES16 이름표/개수 불일치");
 _Static_assert(TR_ARRAY_LENGTH(TR_CAUSE_ARR_FAIL3) == TR_CAUSE_TABLE_COUNT_FAIL3, "FAIL3 이름표/개수 불일치");
-_Static_assert(TR_ARRAY_LENGTH(TR_CAUSE_ASN1_ARR_EST16) == TR_CAUSE_TABLE_COUNT_EST16 &&
-			   TR_ARRAY_LENGTH(TR_CAUSE_ASN1_ARR_UEC11) == TR_CAUSE_TABLE_COUNT_UEC11 &&
-			   TR_ARRAY_LENGTH(TR_CAUSE_ASN1_ARR_RES16) == TR_CAUSE_TABLE_COUNT_RES16 &&
-			   TR_ARRAY_LENGTH(TR_CAUSE_ASN1_ARR_FAIL3) == TR_CAUSE_TABLE_COUNT_FAIL3,
-			   "ASN.1 이름표/개수 불일치(두 철자 중 한쪽만 고쳤음)");
 _Static_assert(TR_CAUSE_TABLE_COUNT_EST16 <= MAX_CAUSE && TR_CAUSE_TABLE_COUNT_UEC11 <= MAX_CAUSE &&
 			   TR_CAUSE_TABLE_COUNT_RES16 <= MAX_CAUSE && TR_CAUSE_TABLE_COUNT_FAIL3 <= MAX_CAUSE &&
 			   TR_CAUSE_TABLE_COUNT_NONE1 <= MAX_CAUSE, "원인 개수가 MAX_CAUSE 초과(저장 배열/루프 OOB)");
 #undef TR_ARRAY_LENGTH
 // 지표에서 (원인표, 개수, CC/SI) 로 가는 매핑. 이것도 metrics.h 파생임
-static const char *const *const METRIC_CAUSE[TR_METRIC__COUNT] = {
+static const char *const *const METRIC_CAUSE_NAME[TR_METRIC__COUNT] = {
 #define X(id, name, kind, ct) [id] = TR_CAUSE_TABLE_ARR_##ct,
-	TR_METRIC_LIST(X)
-#undef X
-};
-static const char *const *const METRIC_CAUSE_ASN1[TR_METRIC__COUNT] = {
-#define X(id, name, kind, ct) [id] = TR_CAUSE_TABLE_ASN1_ARR_##ct,
 	TR_METRIC_LIST(X)
 #undef X
 };
@@ -169,34 +158,14 @@ const char *tr_metric_name(enum tr_metric metric)
 	return ((unsigned)metric < (unsigned)TR_METRIC__COUNT) ? MNAME[metric] : NULL;
 }
 
-const char *tr_cause_subname(enum tr_metric metric, int cause_index)
-{
-	if ((unsigned)metric >= (unsigned)TR_METRIC__COUNT) return NULL;
-	if (cause_index < 0 || cause_index >= METRIC_CAUSE_CNT[metric]) return NULL;   // 범위 밖이면 NULL
-	const char *const *subnames = METRIC_CAUSE[metric];
-	return subnames ? subnames[cause_index] : "";                              // 원인 분할이 없는 지표는 ""
-}
-
-/* tr_cause_asn1_name: 원인 칸의 ASN.1 값 이름. 범위 밖이면 NULL, 원인 분할이 없으면 "".
- *   이유: 탐지 엔진으로 나가는 줄의 est_cause 는 ASN.1 철자로 대소문자까지 비교되므로, 표 II 가
- *         쓰는 28.552 하위카운터 철자(tr_cause_subname, 하이픈 금지)와 같은 칸에 철자가 둘임.
- *   반환한 포인터는 정적 문자열이라 수명 제약 없음 */
-const char *tr_cause_asn1_name(enum tr_metric metric, int cause_index)
+/* tr_cause_name: 원인 칸의 이름. 철자는 ASN.1 값 이름이고 그대로 와이어로 나감.
+ *   반환: 범위 밖이면 NULL, 원인 분할이 없는 지표면 "". 포인터는 정적 문자열이라 수명 제약 없음 */
+const char *tr_cause_name(enum tr_metric metric, int cause_index)
 {
 	if ((unsigned)metric >= (unsigned)TR_METRIC__COUNT) return NULL;
 	if (cause_index < 0 || cause_index >= METRIC_CAUSE_CNT[metric]) return NULL;
-	const char *const *asn1_names = METRIC_CAUSE_ASN1[metric];
-	return asn1_names ? asn1_names[cause_index] : "";
-}
-
-// CC 는 SI 가 아닌 것. tr_metric_is_si 하나만 거쳐 판정해 분류가 두 곳에 생기지 않게 함
-static int metric_is_cc(enum tr_metric metric)
-{
-	return !tr_metric_is_si(metric);
-}
-static int metric_has_path(enum tr_metric metric)
-{
-	return (metric == TR_METRIC_RRC_CONN_ESTAB_SUCC) || (metric == TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE);
+	const char *const *cause_names = METRIC_CAUSE_NAME[metric];
+	return cause_names ? cause_names[cause_index] : "";
 }
 
 // ---- 해시맵 (open addressing, 키 비교는 콜백) ----
@@ -290,16 +259,17 @@ static uint64_t mix64(uint64_t value)
 struct tr_cell_record {
 	struct tr_nr_cgi cell;
 	int overflow;                 // 셀 수 상한을 넘겨 한 칸에 모은 셀임
-	int late_join;
 
-	// 주기 CC 누적. 주기를 닫을 때 0 으로 돌림
+	/* 주기 CC 누적. 주기를 닫을 때 0 으로 돌림.
+	 *   cc_value 와 cc_inferred 는 원인별로 둠. 둘 다 출력 줄에 원인 키로 나가기 때문임.
+	 *   cc_unknown 과 cc_excluded 는 원인별로 두지 않음. 출력 규약에 그 값을 받는 칸이 없어
+	 *     원인별로 나갈 곳이 없고, 읽는 쪽(셀마다 succ <= att 진단, 종료 보고)이 둘 다 원인을
+	 *     합쳐서만 보기 때문임. 원인 축을 남겨 두면 셀마다 5,656 B 를 아무도 읽지 않는 채로 듦 */
 	uint32_t cc_value[TR_METRIC__COUNT][MAX_CAUSE];
 	uint32_t cc_inferred[TR_METRIC__COUNT][MAX_CAUSE];
-	uint32_t cc_unknown[TR_METRIC__COUNT][MAX_CAUSE];
+	uint32_t cc_unknown[TR_METRIC__COUNT];
 	uint32_t cc_unknown_nocause[TR_METRIC__COUNT];
-	uint32_t cc_excluded[TR_METRIC__COUNT][TR_EXCLUDED__COUNT][MAX_CAUSE];
-	uint32_t cc_overlap[TR_METRIC__COUNT][MAX_CAUSE][TR_OVERLAP__COUNT];
-	uint32_t path_value[TR_METRIC__COUNT][PATH__COUNT];
+	uint32_t cc_excluded[TR_METRIC__COUNT][TR_EXCLUDED__COUNT];
 
 	// 게이지. 주기를 닫아도 값을 그대로 들고 감
 	int32_t conn_gauge[3];        // 칸 번호는 enum tr_gauge_level
@@ -308,8 +278,6 @@ struct tr_cell_record {
 
 	// SI 누적. 주기를 닫을 때 0 으로 돌림
 	uint64_t conn_sum[3]; uint32_t conn_sample_count; uint32_t conn_max[3];
-	uint64_t inactive_sum[3]; uint32_t inactive_sample_count; uint32_t inactive_max[3];
-	uint64_t half_open_sum; uint32_t half_open_max;
 
 	/* UE 컨텍스트 수를 28.552 게이지와 따로 두는 이유: 28.552 의 Max 는 표본을 뜬 시점의
 	 * 최댓값인데 이 지표는 칸 안 실제 수의 최댓값임. 표본 주기가 칸(100ms)보다 길면 봉우리를 놓침 */
@@ -365,7 +333,7 @@ struct tr_ue_record {
 	 *   RS_RELEASED / RS_INACTIVE  -> rel_inferred  = (평문으로 직접 봤으면 0, 추론이면 1)
 	 *   RS_IDLE_PENDING / RS_UNKNOWN -> 등급 판정이 두 플래그를 읽지 않음. 레코드 리셋에서 둘 다 0
 	 * 상태 전이를 새로 넣을 때도 같이 넣을 것 */
-	uint8_t  rel_inferred;        // 현 RELEASED/INACTIVE 를 추론으로 정했음. 등급을 교차 귀속으로 내림
+	// 현 RELEASED/INACTIVE 를 추론으로 정했음. 등급을 교차 귀속으로 내림
 	uint8_t  conn_inferred;       // 현 CONNECTED 를 추론으로 정했음(grant, 불투명, 암호 complete)
 	int      est_cell_index;      // 수립이 일어난 셀, -1=모름
 	/* Att 를 센 셀. 절차 도중에 바뀌지 않으므로 succ CC 는 여기에 귀속함.
@@ -375,7 +343,6 @@ struct tr_ue_record {
 	int      att_cell_index;
 
 	// 재수립 완료를 기다리는 중
-	uint8_t  wait_reest;
 	uint8_t  reest_succ_counted;   // 재수립 성공을 grant 와 Complete 중 먼저 본 것에서 한 번만 셈. 요청에서 리셋
 	uint8_t  resume_succ_counted;  // 재개 성공을 한 번만 셈. 중복 Complete 로 두 번 세지 않으려고. 요청에서 리셋
 
@@ -383,7 +350,6 @@ struct tr_ue_record {
 	int      resume_cause_pending;
 
 	// 표 I 칸. 관측 이벤트에서 유도할 수 있는 것만 둠
-	uint32_t crnti; int has_crnti;
 	/* free_list_next: 이 칸이 비었을 때(used=0)만 뜻이 있는 다음 빈 칸 색인+1(0=끝).
 	 *   이유: 종전엔 crnti 필드를 재활용해 이 링크를 담았음 - 한 이름이 C-RNTI 와 free-list
 	 *   링크 두 개념을 가리켜 읽는 위치에서 거짓이고, 둘 다 uint32_t 라 기계 검출도 불가능했음.
@@ -397,9 +363,8 @@ struct tr_ue_record {
 	int last_nas_epd, last_nas_sht, last_nas_msg_type; int has_last_nas; enum tr_quality nas_msg_quality;
 	int rrc_sec_state; enum tr_quality rrc_sec_quality;   // AS 보안 상태. F1 의 SMC/Complete/Failure 에서 유도. 기본 NONE
 	int nas_sec_state; enum tr_quality nas_sec_quality;   // NAS 보안 상태. SHT 에서 유도. 기본 UNKNOWN
-	int nas_ciph_alg;                                     // NAS SMC 가 고른 값(obs 가 하행 SHT 3 에서만 학습). 기본 -1=모름
+	// NAS SMC 가 고른 값(obs 가 하행 SHT 3 에서만 학습). 기본 -1=모름
 	int nas_reg_state; int nas_conn_mode; int nas_reg_state_origin; enum tr_quality nas_state_quality;
-	int late_join;
 	uint8_t closed;
 };
 
@@ -428,32 +393,24 @@ struct tr {
 	uint64_t now_ns;
 	int started;
 	int self_check;                // 자기-불변식 검사를 켜나. 0 이면 검사를 돌지 않아 오버헤드가 없음
-	uint64_t cur_start_ns, cur_end_ns;   // 현재 주기 [시작, 끝)
+	uint64_t cur_start_ns, cur_end_ns;
+	/* observe_start_ns: 첫 이벤트나 첫 진행 통지를 받은 시각. 첫 주기가 그보다 앞서 시작하면 그
+	 * 주기는 앞부분을 못 본 것이라 내보내지 않음 */
+	uint64_t observe_start_ns;   // 현재 주기 [시작, 끝)
 	uint64_t gp_ns;
-	uint64_t next_conn_sample_ns, next_inactive_sample_ns;
-	int first_period;              // 첫 주기는 부분 주기로 표시함
+	uint64_t next_conn_sample_ns;
 	/* 이 주기에 뜬 conn/inactive 표본 수. 주기 도중에 처음 나타난 셀의 앞쪽 0 표본을 채우는 데 씀 -
 	 * 한 주기의 모든 셀이 표본 수가 같아야 평균을 비교할 수 있음 */
-	uint32_t conn_sample_count, inactive_sample_count;
+	uint32_t conn_sample_count;
 
-	// 주기 헤더 누적
-	uint32_t late_event_count;
-	int n2_observed;
-	uint64_t lost_evicted_count;
-	/* INACTIVE 를 쓰지 않는 망이라고 설정했는데 평문 suspendConfig 를 본 횟수. 망이 INACTIVE 를
-	 * 설정한다는 뜻이므로 그 설정이 틀렸다는 경보임 */
-	uint32_t inactive_alarm_count;
-	// RelWithoutSuspendConfig 를 센 근거 수. 평문으로 본 것과 추론한 것을 따로 둠
-	uint32_t release_basis_observed_count, release_basis_assumed_count;
-
-	// 캡처 커버리지와 유실. 누적값(tr_set_coverage)과 주기 시작 스냅샷을 같이 둬 주기 델타를 냄
-	uint64_t coverage_tsn_gap_count, coverage_ringbuf_full_count, coverage_esp_seen_count;
-	uint64_t coverage_ip_frag_skipped_count, coverage_obs_lost_count;
+	/* 관측 품질 누적. 출력 규약에 받는 칸이 없어 tr_get_stats 로만 나감.
+	 * 주기마다 0 으로 돌리지 않음 - 주기별로 내보낼 칸이 없으므로 세션 누적 하나로 충분함 */
+	struct tr_stats stats;
+	/* N2 를 한 번이라도 봤나. UECNTX 두 지표를 셀 수 있는지가 이 값에 달려 있음.
+	 *   주기마다 돌리지 않는 이유: N2 연결은 오래 살아 있으므로, 한 번 본 뒤의 조용한 주기는
+	 *   "못 봤다" 가 아니라 "세어서 0" 임. 주기마다 돌리면 조용한 주기가 전부 null 로 나감 */
+	int n2_ever_observed;
 	uint64_t capture_alive_until_ns;   // 호출자가 알려 준 생존 워터마크. 0 = 한 번도 안 알려 줌 = 확인되지 않음
-	uint32_t reset_unresolved_count;   // 일부 RESET 이 가리켰지만 못 닫은 UE(그 주기 델타). 보고 뒤 0 으로 돌림
-	uint64_t coverage_snapshot_tsn_gap_count, coverage_snapshot_ringbuf_full_count;
-	uint64_t coverage_snapshot_esp_seen_count, coverage_snapshot_ip_frag_skipped_count;
-	uint64_t coverage_snapshot_obs_lost_count;
 
 	// 셀 표
 	struct tr_cell_record *cell_records; uint32_t cell_count, cell_capacity;
@@ -481,8 +438,9 @@ struct tr {
 	// 마감을 기다리는 수립들(ue 색인). tr_advance 가 시간순으로 처리함
 	uint32_t *open_list; uint32_t open_count, open_capacity;
 
-	// 출력 스크래치(콜백 동안만 유효)
-	struct tr_cc_cell scratch_cc[TR_METRIC__COUNT][MAX_CAUSE];
+	/* 출력 스크래치(콜백 동안만 유효). report_counter 가 원인 배열을 복사하지 않고 가리키므로
+	 * 호출이 돌아올 때까지 살아 있는 저장 위치가 필요함 */
+	struct report_cause_count scratch_causes[TR_METRIC__COUNT][MAX_CAUSE];
 };
 
 // ---- 키 비교 ----
@@ -585,11 +543,10 @@ static int overflow_cell(struct tr *tr)
 		cell_record->overflow = 1; cell_record->cell.valid = 0;
 		// 넘침 셀도 주기 도중에 생기므로 앞쪽 0 표본을 채워 다른 셀과 표본 수를 맞춤
 		cell_record->conn_sample_count = tr->conn_sample_count;
-		cell_record->inactive_sample_count = tr->inactive_sample_count;
 		tr->overflow_cell_index = (int)(cell_record - tr->cell_records);
 	}
 	if (!tr->warned_overflow) {
-		warn(tr, "overflow_cell", "max_cell_count exceeded; new cells merged");
+		warn(tr, "overflow_cell", "DEF_MAX_CELL_COUNT exceeded; new cells merged");
 		tr->warned_overflow = 1;
 	}
 	return tr->overflow_cell_index;
@@ -603,7 +560,7 @@ static int cell_lookup(struct tr *tr, const struct tr_nr_cgi *cell, int create_i
 	uint32_t idx = hash_map_get(&tr->cell_map, hash, cell_eq, tr, &cell_key_probe);
 	if (idx != UINT32_MAX) return (int)idx;
 	if (!create_if_missing) return -1;
-	uint32_t limit = tr->tr_cfg.max_cell_count ? tr->tr_cfg.max_cell_count : DEF_MAX_CELL_COUNT;
+	uint32_t limit = DEF_MAX_CELL_COUNT;
 	// 넘침 셀을 빼고 센 유효 셀 수
 	uint32_t valid_cells = tr->cell_count - (tr->overflow_cell_index >= 0 ? 1u : 0u);
 	if (valid_cells >= limit) return overflow_cell(tr);
@@ -611,11 +568,9 @@ static int cell_lookup(struct tr *tr, const struct tr_nr_cgi *cell, int create_i
 	if (!cell_record) return -1;
 	uint32_t new_index = (uint32_t)(cell_record - tr->cell_records);
 	cell_record->cell = *cell;
-	cell_record->late_join = 1;   // 새로 보인 셀. 그 주기 헤더에 표시하고 주기를 닫을 때 0 으로 돌림
 	/* 주기 도중에 나타난 셀이므로 앞쪽 0 표본을 채움(합과 최댓값은 0 유지 = 그 전에는 연결이 0).
 	 * 그래야 한 주기의 모든 셀이 표본 수가 같고 ConnMean 의 분모가 주기 전체가 됨(평균 과대 방지) */
 	cell_record->conn_sample_count = tr->conn_sample_count;
-	cell_record->inactive_sample_count = tr->inactive_sample_count;
 	if (hash_map_put(&tr->cell_map, hash, cell_eq, tr, &cell_key_probe, new_index) < 0) return -1;
 	return (int)new_index;
 }
@@ -663,7 +618,7 @@ static struct tr_ue_record *ue_lookup(struct tr *tr, const struct tr_f1ue *f1ue,
 	 * 증명되는 것은 수립 절차에서뿐이고, 늦게 합류하면 이미 보안이 걸렸는지 알 수 없음 */
 	ue_record->rrc_sec_state = TR_SEC_UNKNOWN; ue_record->rrc_sec_quality = TR_QUALITY_UNKNOWN;
 	ue_record->nas_sec_state = TR_SEC_UNKNOWN; ue_record->nas_sec_quality = TR_QUALITY_UNKNOWN;
-	ue_record->nas_ciph_alg = -1;
+
 	// 5GMM 상태도 미상에서 시작함. 늦게 합류했거나 암호가 걸린 뒤면 읽을 수 없기 때문임
 	ue_record->nas_reg_state = TR_5GMM_UNKNOWN; ue_record->nas_conn_mode = TR_CM_MODE_UNKNOWN;
 	ue_record->nas_reg_state_origin = TR_5GMM_UNKNOWN; ue_record->nas_state_quality = TR_QUALITY_UNKNOWN;
@@ -894,11 +849,11 @@ static void tr_self_check(struct tr *tr)
 		if (cell_record->ue_context_gauge < 0) inv_fail(tr, "ue_context_gauge<0", cell_index, 0);
 	}
 	// 멤버십 대조표
-	size_t tally_count = cell_count ? cell_count : 1;
-	int32_t (*conn_gauges)[3] = calloc(tally_count, sizeof *conn_gauges);
-	int32_t (*inactive_gauges)[3] = calloc(tally_count, sizeof *inactive_gauges);
-	int32_t  *half_open_gauges     = calloc(tally_count, sizeof *half_open_gauges);
-	int32_t  *ue_context_gauges    = calloc(tally_count, sizeof *ue_context_gauges);
+	size_t gauge_slot_count = cell_count ? cell_count : 1;
+	int32_t (*conn_gauges)[3] = calloc(gauge_slot_count, sizeof *conn_gauges);
+	int32_t (*inactive_gauges)[3] = calloc(gauge_slot_count, sizeof *inactive_gauges);
+	int32_t *half_open_gauges = calloc(gauge_slot_count, sizeof *half_open_gauges);
+	int32_t *ue_context_gauges = calloc(gauge_slot_count, sizeof *ue_context_gauges);
 	if (!conn_gauges || !inactive_gauges || !half_open_gauges || !ue_context_gauges) {
 		// 대조표를 못 잡으면 검사를 건너뜀. 검사 자체가 진단이므로 여기서 중단하지 않음
 		free(conn_gauges); free(inactive_gauges); free(half_open_gauges); free(ue_context_gauges);
@@ -981,15 +936,20 @@ static void inv_soft_succ_le_att(struct tr *tr, const struct tr_cell_record *cel
 	for (int path_index = 0; path_index < 4; path_index++) {
 		int att_metric = PAIR[path_index][0], succ_metric = PAIR[path_index][1];
 		int cause_count = tr_cause_count((enum tr_metric)att_metric);
-		uint64_t attempt_count = cell_record->cc_unknown_nocause[att_metric];
-		uint64_t success_count = cell_record->cc_unknown_nocause[succ_metric];
+		/* 관측 사건 수 = 본값 + 미상 + 제외. 본값만 원인별이라 그것만 원인 루프로 더함.
+		 * 미상과 제외는 원인 축이 없으므로 루프 밖에서 한 번 더해야 함 - 안에 두면 원인 칸 수만큼
+		 * 곱해져 시도가 과대해지고 succ <= att 가 영영 깨지지 않음(관문이 무력화됨) */
+		uint64_t attempt_count = cell_record->cc_unknown_nocause[att_metric]
+				       + cell_record->cc_unknown[att_metric];
+		uint64_t success_count = cell_record->cc_unknown_nocause[succ_metric]
+				       + cell_record->cc_unknown[succ_metric];
 		for (int cause_index = 0; cause_index < cause_count; cause_index++) {
-			attempt_count  += cell_record->cc_value[att_metric][cause_index] + cell_record->cc_unknown[att_metric][cause_index];
-			success_count += cell_record->cc_value[succ_metric][cause_index] + cell_record->cc_unknown[succ_metric][cause_index];
-			for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++) {
-				attempt_count += cell_record->cc_excluded[att_metric][excl_index][cause_index];
-				success_count += cell_record->cc_excluded[succ_metric][excl_index][cause_index];
-			}
+			attempt_count += cell_record->cc_value[att_metric][cause_index];
+			success_count += cell_record->cc_value[succ_metric][cause_index];
+		}
+		for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++) {
+			attempt_count += cell_record->cc_excluded[att_metric][excl_index];
+			success_count += cell_record->cc_excluded[succ_metric][excl_index];
 		}
 		if (success_count > attempt_count) warn(tr, "SUCC_GT_ATT", tr_metric_name((enum tr_metric)succ_metric));
 	}
@@ -1005,11 +965,6 @@ static uint32_t applied_noreply_timeout_ms(const struct tr *tr)
 {
 	return tr->tr_cfg.noreply_timeout_ms ? tr->tr_cfg.noreply_timeout_ms : TR_DEF_NOREPLY_TIMEOUT_MS;
 }
-static uint32_t applied_setup_outcome_timeout_ms(const struct tr *tr)
-{
-	return tr->tr_cfg.setup_outcome_timeout_ms ? tr->tr_cfg.setup_outcome_timeout_ms
-						    : TR_DEF_SETUP_OUTCOME_TIMEOUT_MS;
-}
 
 /* setup_recompute_deadline: 열린 수립 하나의 마감을 다시 잡음.
  *   구간이 둘이라 값도 둘임(tr.h 가 두 구간을 표로 적어 둠). Msg4 를 봤으면 그 시각부터 무응답
@@ -1018,7 +973,7 @@ static void setup_recompute_deadline(struct tr *tr, struct tr_ue_record *ue_reco
 {
 	uint64_t base_ns = ue_record->saw_setup_sent ? ue_record->setup_sent_time_ns : ue_record->request_time_ns;
 	uint32_t timeout_ms = ue_record->saw_setup_sent ? applied_noreply_timeout_ms(tr)
-							: applied_setup_outcome_timeout_ms(tr);
+							: TR_DEF_SETUP_OUTCOME_TIMEOUT_MS;
 	ue_record->deadline_ns = base_ns + (uint64_t)timeout_ms * 1000000ull;
 	if (ue_record->open_in_list) heap_fix(tr, ue_record->open_pos);   // 이미 heap 에 있으면 키가 바뀐 것이라 다시 정렬
 }
@@ -1026,25 +981,19 @@ static void setup_recompute_deadline(struct tr *tr, struct tr_ue_record *ue_reco
 // ---- 주기 머신 ----
 static uint64_t period_start_for(struct tr *tr, uint64_t now_ns)
 {
-	// 원점이 0 이면 벽시계의 주기 배수에 맞춤. 0 이 아니면 그 시각을 원점으로 삼아 다른 구현과 대조할 때 씀
-	uint64_t gp_origin_ns = tr->tr_cfg.gp_origin_ns;
-	// 원점이 미래면 빼기가 음수로 돌아가므로 첫 주기를 원점에서 시작함
-	if (now_ns <= gp_origin_ns) return gp_origin_ns;
-	return gp_origin_ns + ((now_ns - gp_origin_ns) / tr->gp_ns) * tr->gp_ns;
+	// 벽시계의 주기 배수에 맞춤. 받는 쪽이 칸 경계를 자기 시계로도 계산할 수 있어야 함
+	return (now_ns / tr->gp_ns) * tr->gp_ns;
 }
 static void engine_start(struct tr *tr, uint64_t now_ns)
 {
 	tr->gp_ns = (uint64_t)(tr->tr_cfg.gp_ms ? tr->tr_cfg.gp_ms : DEF_GP_MS) * 1000000ull;
+	tr->observe_start_ns = now_ns;
 	tr->cur_start_ns = period_start_for(tr, now_ns);
 	tr->cur_end_ns = tr->cur_start_ns + tr->gp_ns;
-	uint64_t conn_period_ns = (uint64_t)(tr->tr_cfg.conn_sample_period_ms ? tr->tr_cfg.conn_sample_period_ms
-									 : DEF_CONN_SAMPLE_PERIOD_MS) * 1000000ull;
-	uint64_t inactive_period_ns = (uint64_t)(tr->tr_cfg.inactive_sample_period_ms ? tr->tr_cfg.inactive_sample_period_ms
-										 : DEF_INACTIVE_SAMPLE_PERIOD_MS) * 1000000ull;
+	uint64_t conn_period_ns = DEF_CONN_SAMPLE_PERIOD_MS * 1000000ull;
 	// 첫 표본은 now_ns 를 넘는 첫 경계임. 주기는 시작 시각을 빼고 끝 시각을 넣는 구간이기 때문임
 	tr->next_conn_sample_ns = (now_ns / conn_period_ns + 1) * conn_period_ns;
-	tr->next_inactive_sample_ns = (now_ns / inactive_period_ns + 1) * inactive_period_ns;
-	tr->now_ns = now_ns; tr->started = 1; tr->first_period = 1;
+	tr->now_ns = now_ns; tr->started = 1;
 }
 
 static void sample_conn(struct tr *tr)
@@ -1059,260 +1008,224 @@ static void sample_conn(struct tr *tr)
 		uint64_t upper = value
 			+ (uint64_t)(cell_record->conn_gauge[LV_UNKNOWN] > 0 ? cell_record->conn_gauge[LV_UNKNOWN] : 0)
 			+ half_open;
-		cell_record->conn_sum[0] += lower; cell_record->conn_sum[1] += value; cell_record->conn_sum[2] += upper;
+		cell_record->conn_sum[SI_LOWER] += lower;
+		cell_record->conn_sum[SI_VALUE] += value;
+		cell_record->conn_sum[SI_UPPER] += upper;
 		cell_record->conn_sample_count++;
-		if ((uint32_t)lower  > cell_record->conn_max[0]) cell_record->conn_max[0] = (uint32_t)lower;
-		if ((uint32_t)value > cell_record->conn_max[1]) cell_record->conn_max[1] = (uint32_t)value;
-		if ((uint32_t)upper  > cell_record->conn_max[2]) cell_record->conn_max[2] = (uint32_t)upper;
-		cell_record->half_open_sum += half_open;
-		if ((uint32_t)half_open > cell_record->half_open_max) cell_record->half_open_max = (uint32_t)half_open;
-	}
-}
-static void sample_inactive(struct tr *tr)
-{
-	tr->inactive_sample_count++;
-	for (uint32_t i = 0; i < tr->cell_count; i++) {
-		struct tr_cell_record *cell_record = &tr->cell_records[i];
-		uint64_t lower = (uint64_t)(cell_record->inactive_gauge[LV_EXACT] > 0
-						? cell_record->inactive_gauge[LV_EXACT] : 0);
-		uint64_t value = lower + (uint64_t)(cell_record->inactive_gauge[LV_INFERRED] > 0
-							? cell_record->inactive_gauge[LV_INFERRED] : 0);
-		uint64_t upper = value + (uint64_t)(cell_record->inactive_gauge[LV_UNKNOWN] > 0
-							? cell_record->inactive_gauge[LV_UNKNOWN] : 0);
-		cell_record->inactive_sum[0] += lower; cell_record->inactive_sum[1] += value;
-		cell_record->inactive_sum[2] += upper; cell_record->inactive_sample_count++;
-		if ((uint32_t)lower  > cell_record->inactive_max[0]) cell_record->inactive_max[0] = (uint32_t)lower;
-		if ((uint32_t)value > cell_record->inactive_max[1]) cell_record->inactive_max[1] = (uint32_t)value;
-		if ((uint32_t)upper  > cell_record->inactive_max[2]) cell_record->inactive_max[2] = (uint32_t)upper;
+		if ((uint32_t)lower  > cell_record->conn_max[SI_LOWER]) cell_record->conn_max[SI_LOWER] = (uint32_t)lower;
+		if ((uint32_t)value > cell_record->conn_max[SI_VALUE]) cell_record->conn_max[SI_VALUE] = (uint32_t)value;
+		if ((uint32_t)upper  > cell_record->conn_max[SI_UPPER]) cell_record->conn_max[SI_UPPER] = (uint32_t)upper;
 	}
 }
 
-static void fill_si_mean(struct tr_si *si_stats, const uint64_t sums[3], uint32_t sample_count,
-			 int upper_invalid, int unbounded)
+/* fill_counter: 원인별 카운터 한 칸을 출력 층 구조체로 옮김.
+ *   total 은 원인 칸의 합이고 원인 이름은 ASN.1 값 이름임. 0 인 원인을 빼는 것은 출력 층이 함.
+ *   is_counted: 이 지표를 이 주기에 측정할 수 있었나. 거짓이면 출력이 null 로 내보내 읽는 쪽이
+ *     "세어서 0" 과 "못 세었음" 을 가를 수 있음. 0 으로 채우면 두 뜻이 같은 모양이 됨.
+ *   causes 는 tr 의 스크래치를 가리킴. 콜백이 돌아올 때까지만 유효함 */
+static void fill_counter(struct tr *tr, const struct tr_cell_record *cell_record,
+			 enum tr_metric metric, bool is_counted, struct report_counter *counter)
 {
-	memset(si_stats, 0, sizeof *si_stats);
-	si_stats->si_sum[0] = sums[0]; si_stats->si_sum[1] = sums[1]; si_stats->si_sum[2] = sums[2];
-	si_stats->sample_count = sample_count;
-	si_stats->upper_valid = !upper_invalid; si_stats->upper_unbounded = unbounded;
-	if (sample_count) {
-		si_stats->has_value = true;
-		si_stats->lower = (double)sums[0] / sample_count;
-		si_stats->value = (double)sums[1] / sample_count;
-		si_stats->upper = (double)sums[2] / sample_count;
-		si_stats->floor_value = (int64_t)(sums[1] / sample_count);
+	int cause_count = tr_cause_count(metric);
+	struct report_cause_count *causes = tr->scratch_causes[metric];
+	uint32_t total = 0, inferred = 0;
+	for (int cause_index = 0; cause_index < cause_count; cause_index++) {
+		causes[cause_index].name  = tr_cause_name(metric, cause_index);
+		causes[cause_index].count = cell_record->cc_value[metric][cause_index];
+		total    += cell_record->cc_value[metric][cause_index];
+		inferred += cell_record->cc_inferred[metric][cause_index];
 	}
-}
-static void fill_si_max(struct tr_si *si_stats, const uint32_t max_values[3], const uint64_t sums[3],
-			uint32_t sample_count, int upper_invalid, int unbounded)
-{
-	memset(si_stats, 0, sizeof *si_stats);
-	si_stats->si_sum[0] = sums[0]; si_stats->si_sum[1] = sums[1]; si_stats->si_sum[2] = sums[2];
-	si_stats->sample_count = sample_count;
-	si_stats->upper_valid = !upper_invalid; si_stats->upper_unbounded = unbounded;
-	if (sample_count) {
-		si_stats->has_value = true;
-		si_stats->lower = (double)max_values[0]; si_stats->value = (double)max_values[1];
-		si_stats->upper = (double)max_values[2];
-		si_stats->floor_value = (int64_t)max_values[1];
-	}
+	counter->is_counted  = is_counted;
+	counter->total       = total;
+	counter->inferred    = inferred;
+	counter->causes      = causes;
+	counter->cause_count = cause_count;
 }
 
-static void emit_cell_period(struct tr *tr, struct tr_cell_record *cell_record, int partial)
+// 원인 분할이 없는 지표의 합. 칸이 하나뿐이라도 루프로 두어 칸 수가 늘면 같이 따라감
+static uint32_t cc_total(const struct tr_cell_record *cell_record, enum tr_metric metric)
 {
-	inv_soft_succ_le_att(tr, cell_record);   // 경고만 하는 진단. 셀마다 succ <= att 를 봄
+	uint32_t total = 0;
+	for (int cause_index = 0; cause_index < tr_cause_count(metric); cause_index++)
+		total += cell_record->cc_value[metric][cause_index];
+	return total;
+}
+
+/* cell_number_for: 줄에 싣는 셀 번호. NR Cell Identity 36비트를 그대로 씀.
+ *   이유: 받는 쪽이 요구하는 것은 '셀을 가르는 0 이상 정수' 하나이고, NR Cell Identity 를 그대로
+ *     쓰면 그 번호가 실제 셀로 되짚어지며 주기 줄과 단말 줄과 DU 줄이 같은 번호를 씀. 세션마다
+ *     새로 매기는 순번은 같은 녹화를 다시 볼 때 같은 셀에 다른 번호를 줘 대조가 안 됨.
+ *   잃는 것: PLMN 이 다른 두 셀이 같은 NR Cell Identity 를 쓰면 한 번호로 보임. 그 수를 세어
+ *     조용히 합쳐지지 않게 함. 내부 셀 표는 (PLMN, NR Cell Identity) 전체를 키로 쓰므로 집계
+ *     자체는 갈려 있고, 합쳐져 보이는 것은 내보내는 번호뿐임.
+ *   부작용: 같은 번호를 쓰는 다른 PLMN 의 셀을 보면 그 수를 올림. */
+static uint64_t cell_number_for(struct tr *tr, const struct tr_nr_cgi *cell)
+{
+	for (uint32_t other = 0; other < tr->cell_count; other++) {
+		const struct tr_nr_cgi *other_cell = &tr->cell_records[other].cell;
+		if (!other_cell->valid) continue;
+		if (other_cell->cell_id != cell->cell_id) continue;
+		if (memcmp(other_cell->plmn_bytes, cell->plmn_bytes, 3) == 0) continue;   // 같은 셀임
+		tr->stats.cell_number_collision_count++;
+		break;
+	}
+	return cell->cell_id;
+}
+
+/* emit_cell_period: 셀 하나의 이 주기 값을 출력 층에 넘김.
+ *   capture_alive: 주기 끝까지 캡처가 살아 있었음이 확인됐을 때만 참임. 거짓이면 출력 층이 카운터를
+ *     전부 null 로 내보냄 - 0 으로 채우면 받는 쪽이 그 구간을 조용한 정상 셀로 보고 그동안의 공격을
+ *     놓침. 중간까지만 확인된 주기는 뒷부분을 못 본 것이라 0 으로 셀 수 없음.
+ *   UECNTX 두 지표의 is_counted 를 N2 관측 여부로 거는 이유: 그 값은 NGAP 을 봐야 셀 수 있음.
+ *     N2 탭이 없는 배치에서 0 을 보내면 "시도가 없었다" 로 읽히는데 실제 뜻은 "못 봤다" 임.
+ *     세션 전체에 한 번이라도 N2 를 봤으면 그 뒤로는 조용한 주기도 0 으로 세는 것이 맞음.
+ *   표본 지표에서 축출이 있던 주기를 무효로 두는 이유: 표가 넘쳐 레코드를 버리면 그 주기 게이지는
+ *     하한임. 받는 쪽이 최댓값을 유령 정리 문턱으로 쓰므로, 하한을 숫자로 주면 문턱이 낮아져
+ *     살아 있는 단말을 지움.
+ *   부작용: 셀마다 succ <= att 를 보는 경고성 진단을 돌리고, 출력 콜백을 한 번 부름 */
+static void emit_cell_period(struct tr *tr, struct tr_cell_record *cell_record)
+{
+	inv_soft_succ_le_att(tr, cell_record);
 	if (!tr->sink_ops.on_period) return;
-	struct tr_report_header report_header;
-	memset(&report_header, 0, sizeof report_header);
-	report_header.cell = cell_record->cell;
-	report_header.period_start_ns = tr->cur_start_ns; report_header.period_end_ns = tr->cur_end_ns;
-	report_header.gp_ms = tr->tr_cfg.gp_ms ? tr->tr_cfg.gp_ms : DEF_GP_MS;
-	report_header.partial = partial || tr->first_period;
-	// 주기 끝까지 확인됐을 때만 참임. 중간까지만 확인된 주기는 뒷부분을 못 본 것이라 0 으로 셀 수 없음
-	report_header.capture_alive = tr->capture_alive_until_ns >= report_header.period_end_ns;
-	report_header.late_join = cell_record->late_join;
-	report_header.n2_observed = tr->n2_observed;
-	report_header.assume_no_inactive = tr->tr_cfg.assume_no_inactive;
-	report_header.late_event_count = tr->late_event_count;
-	report_header.lost_evicted_count = tr->lost_evicted_count;
-	report_header.inactive_alarm_count = tr->inactive_alarm_count;
-	report_header.release_basis_observed_count = tr->release_basis_observed_count;
-	report_header.release_basis_assumed_count = tr->release_basis_assumed_count;
-	/* 관측 맹점 신호는 이 주기의 델타임(누적 - 주기 시작 스냅샷). 링 버퍼 넘침과 IP 조각은 어느 셀의
-	 * 것인지 가릴 수 없어 모든 셀에 같은 값을 복제함.
-	 * 정상 입력은 한 번의 실행 안에서 단조증가라 누적 >= 스냅샷이 보장되지만, 줄어든 누적이 들어오면
-	 * uint64 가 거꾸로 돌아가므로 0 으로 막음 */
-	#define COVERAGE_DELTA(cur, snap) ((cur) >= (snap) ? (cur) - (snap) : 0)
-	report_header.tsn_gap_count        = COVERAGE_DELTA(tr->coverage_tsn_gap_count,
-							   tr->coverage_snapshot_tsn_gap_count);
-	report_header.ringbuf_full_count    = COVERAGE_DELTA(tr->coverage_ringbuf_full_count,
-							 tr->coverage_snapshot_ringbuf_full_count);
-	report_header.esp_seen_count        = COVERAGE_DELTA(tr->coverage_esp_seen_count,
-							 tr->coverage_snapshot_esp_seen_count);
-	report_header.ip_frag_skipped_count = COVERAGE_DELTA(tr->coverage_ip_frag_skipped_count,
-							 tr->coverage_snapshot_ip_frag_skipped_count);
-	report_header.obs_lost_count        = COVERAGE_DELTA(tr->coverage_obs_lost_count,
-							 tr->coverage_snapshot_obs_lost_count);
-	#undef COVERAGE_DELTA
-	// 위 다섯 칸은 탭 전체의 값을 모든 셀에 복제한 것임. 읽는 쪽은 셀 사이에 더하지 말고 최댓값이나 첫 값을 쓸 것
-	report_header.coverage_tapwide     = true;
-	report_header.noreply_timeout_ms = applied_noreply_timeout_ms(tr);
-	/* 재개가 하나도 없었다고 증명하려면 네 조건이 모두 서야 함 - 재개 요청 0, 넘어온 미완 재개 0,
-	 * 유실 0, 늦게 붙은 레코드 0. 그중 넘어온 미완 재개와 늦게 붙은 UL SRB1 레코드는 관측 층이
-	 * 알려 주지 않아 추적할 수 없으므로 false 로 둠. 모르는 조건을 증명됐다고 주장하지 않음 */
-	report_header.resume_none_proven = false;
-	report_header.late_join_ul_srb1_count = 0;   // 관측 층이 이 수를 내보내지 않아 추적 불가
-	report_header.reset_unresolved_count = tr->reset_unresolved_count;
+	bool capture_alive = tr->capture_alive_until_ns >= tr->cur_end_ns;
+	bool has_n2 = tr->n2_ever_observed;
+	bool upper_valid = !cell_record->evicted_this_period;
 
-	struct tr_period_report report;
-	memset(&report, 0, sizeof report);
-	report.report_header = &report_header;
-	report.ue_context_max = cell_record->ue_context_max;
-	report.initial_ul_count = cell_record->initial_ul_count;
-	report.no_du_to_cu_count = cell_record->no_du_to_cu_count;
-	report.diag_half_open.si_sum[2] = cell_record->half_open_sum;
-	{
-		struct tr_si *si_stats = &report.diag_half_open;
-		si_stats->sample_count = cell_record->conn_sample_count;
-		if (cell_record->conn_sample_count) {
-			si_stats->has_value = true;
-			si_stats->value = si_stats->lower =
-				(double)cell_record->half_open_sum / cell_record->conn_sample_count;
-			si_stats->upper = (double)cell_record->half_open_max;
-			si_stats->floor_value = (int64_t)(cell_record->half_open_sum / cell_record->conn_sample_count);
-		}
+	struct report_period period;
+	memset(&period, 0, sizeof period);
+	period.cell_id          = cell_number_for(tr, &cell_record->cell);
+	period.t_start_ms       = tr->cur_start_ns / 1000000ull;
+	period.t_end_ms         = tr->cur_end_ns / 1000000ull;
+	period.is_capture_alive = capture_alive;
+
+	fill_counter(tr, cell_record, TR_METRIC_RRC_CONN_ESTAB_ATT,     true,   &period.conn_estab_att);
+	fill_counter(tr, cell_record, TR_METRIC_RRC_CONN_ESTAB_SUCC,    true,   &period.conn_estab_succ);
+	fill_counter(tr, cell_record, TR_METRIC_UECNTX_CONN_ESTAB_ATT,  has_n2, &period.uectx_estab_att);
+	fill_counter(tr, cell_record, TR_METRIC_UECNTX_CONN_ESTAB_SUCC, has_n2, &period.uectx_estab_succ);
+	/* 재개 두 지표를 '세지 못함' 으로 내는 이유: 재개 완료는 DCCH 라 AS 암호 구간에서 보이지 않음.
+	 * 시도만 세고 성공을 0 으로 내보내면 "재개가 전부 실패" 로 읽힘 - 우리가 못 본 것이지 실패한
+	 * 것이 아님. 받는 쪽도 이 지표를 판정이 아니라 기록으로만 쓰므로 값 없이 내는 것이 맞음.
+	 * 센 수는 버리지 않고 종료 보고로 감(tr_stats.value_count) */
+	fill_counter(tr, cell_record, TR_METRIC_RRC_RESUME_ATT,         false,  &period.resume_att);
+	fill_counter(tr, cell_record, TR_METRIC_RRC_RESUME_SUCC,        false,  &period.resume_succ);
+
+	/* 수립 실패 원인 세 칸. 칸 번호는 enum fail_cause 이고 그 순서가 metrics.h 의 FAIL3 이름표와
+	 * 같아야 함. 여기서만 이름을 지정해 꺼내므로 순서가 바뀌면 이 세 줄이 같이 틀림 */
+	period.has_fail_cause  = true;
+	period.network_reject  = cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_NETWORK_REJECT];
+	period.no_reply        = cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_NOREPLY];
+	period.other           = cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_OTHER];
+
+	period.has_rel_without_suspend = true;
+	period.rel_without_suspend     = cc_total(cell_record, TR_METRIC_RRC_REL_WITHOUT_SUSPEND);
+	/* 재수립 두 칸도 값 없이 냄. 유무 플래그가 한 개뿐이라 "시도는 셌고 성공은 못 셌다" 를 적을 수
+	 * 없는데, 시도는 평문 CCCH 라 확실하고 성공은 암호 구간의 시험 디코드에 달려 있음. 둘을 같이
+	 * 숫자로 내면 성공 0 이 "전부 실패" 로 읽히므로 둘 다 값 없이 냄. 센 수는 종료 보고로 감 */
+	period.has_reestab             = false;
+
+	// 표본 지표. 표본이 하나도 없으면 값이 없는 것이고, 축출이 있었으면 상한을 믿을 수 없음
+	period.has_conn_si         = cell_record->conn_sample_count > 0;
+	period.is_conn_upper_valid = upper_valid;
+	if (period.has_conn_si) {
+		period.conn_mean = (double)cell_record->conn_sum[SI_VALUE] / cell_record->conn_sample_count;
+		period.conn_max  = cell_record->conn_max[SI_VALUE];
 	}
+	/* INACTIVE 게이지는 내보내지 않음. 0 을 보내면 받는 쪽이 'INACTIVE 단말이 없었다' 로 읽는데
+	 *   그것을 우리는 알 수 없음. 게이지에 넣는 것은 평문 RRCRelease 의 suspendConfig 를 봤을 때뿐이고,
+	 *   빼는 것은 재개를 봤을 때인데 재개는 암호 구간에 있어 대개 안 보임. 그래서 이 값은 들어간 단말이
+	 *   쌓이기만 하는 하한이고, 0 이라는 것은 '한 번도 평문으로 못 봤다' 는 뜻일 뿐임.
+	 *   게이지 자체는 지우지 않음 - 한 단말이 연결 게이지와 INACTIVE 게이지에 동시에 들지 않게 하는
+	 *   내부 불변식이 이 칸을 씀. 내보내지 않는 것은 집계값뿐임 */
+	period.has_inactive_si = false;
 
+	/* TS 28.552 밖의 셀 상태 세 가지. 표본이 아니라 바로 센 값이라 못 세는 경우가 없음.
+	 * 단말 컨텍스트 최댓값은 받는 쪽이 유령 정리 문턱으로 쓰므로 축출이 있어도 보냄 - 연결 게이지의
+	 * 상위집합이라 같은 축출에서도 더 큰 하한이고, 큰 하한은 정리를 덜 하는 쪽임 */
+	period.has_ue_ctx_max      = true;
+	period.ue_ctx_max          = cell_record->ue_context_max;
+	period.has_du_cannot_serve = true;
+	period.du_cannot_serve     = cell_record->no_du_to_cu_count;
+	period.has_crnti_alloc     = true;
+	period.crnti_alloc         = cell_record->initial_ul_count;
+
+	tr->sink_ops.on_period(tr->user_ctx, &period);
+}
+
+/* accumulate_stats: 이 주기의 셀 값 중 출력 규약에 담을 칸이 없는 것을 세션 누적으로 옮김.
+ *   왜 필요한가: 미상과 제외는 카운터 본값에 넣지 않으므로 출력 줄에 나가지 않음. 그대로 버리면
+ *     "규칙이 뺀 것" 과 "우리가 못 읽은 것" 이 둘 다 사라져 과소보고를 되짚을 수 없음.
+ *   보고를 내지 못한 주기에도 돌려야 함. 그래서 출력 콜백과 무관하게 주기 리셋 직전에 부름 */
+static void accumulate_stats(struct tr *tr, const struct tr_cell_record *cell_record)
+{
 	for (int metric_index = 0; metric_index < TR_METRIC__COUNT; metric_index++) {
-		if (metric_is_cc((enum tr_metric)metric_index)) {
-			int cause_count = tr_cause_count((enum tr_metric)metric_index);
-			for (int cause_index = 0; cause_index < cause_count; cause_index++) {
-				struct tr_cc_cell *cc_cell = &tr->scratch_cc[metric_index][cause_index];
-				memset(cc_cell, 0, sizeof *cc_cell);
-				cc_cell->exact = cell_record->cc_value[metric_index][cause_index]
-					- cell_record->cc_inferred[metric_index][cause_index];
-				cc_cell->inferred = cell_record->cc_inferred[metric_index][cause_index];
-				cc_cell->value = cell_record->cc_value[metric_index][cause_index];   // value = exact + inferred
-				cc_cell->unknown = cell_record->cc_unknown[metric_index][cause_index];
-				for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++)
-					cc_cell->excluded[excl_index] =
-						cell_record->cc_excluded[metric_index][excl_index][cause_index];
-				for (int overlap_index = 0; overlap_index < TR_OVERLAP__COUNT; overlap_index++)
-					cc_cell->overlap[overlap_index] =
-						cell_record->cc_overlap[metric_index][cause_index][overlap_index];
-			}
-			report.cc_cells[metric_index] = tr->scratch_cc[metric_index];
-			report.cc_unknown_nocause[metric_index] = cell_record->cc_unknown_nocause[metric_index];
-			report.path_value[metric_index] = metric_has_path((enum tr_metric)metric_index)
-							 ? cell_record->path_value[metric_index] : NULL;
-		} else {
-			report.cc_cells[metric_index] = NULL; report.path_value[metric_index] = NULL;
+		tr->stats.unknown_count[metric_index]         += cell_record->cc_unknown[metric_index];
+		tr->stats.unknown_nocause_count[metric_index] += cell_record->cc_unknown_nocause[metric_index];
+		for (int cause_index = 0; cause_index < tr_cause_count(metric_index); cause_index++)
+			tr->stats.value_count[metric_index] += cell_record->cc_value[metric_index][cause_index];
+		for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++)
+			tr->stats.excluded_count[excl_index] += cell_record->cc_excluded[metric_index][excl_index];
+	}
+}
+
+/* period_has_content: 지금 열려 있는 주기에 표 II 로 방출할 내용이 있는가.
+ *   내용의 정의: close_period 가 주기마다 리셋하는 누적 중 실제 수치가 비어 있지 않은 것. 카운터와
+ *     그 제외, 중첩, 경로 분해, 표본 수, 반쯤 열림 합, 엔진 수준의 늦은 이벤트와 축출 수가 여기 듦.
+ *     순수 상태 플래그는 내용이 아니므로 뺌.
+ *   이 집합은 close_period 의 리셋 집합을 그대로 비춤 - 누적을 하나 추가하면 양쪽을 같이 고칠 것.
+ *     한쪽만 고치면 그 값이 유일한 내용인 주기가 조용히 사라짐.
+ *   반환: 내용이 있으면 1, 없으면 0 */
+static int period_has_content(const struct tr *tr)
+{
+	for (uint32_t i = 0; i < tr->cell_count; i++) {
+		const struct tr_cell_record *cell_record = &tr->cell_records[i];
+		if (cell_record->conn_sample_count) return 1;
+		for (int metric_index = 0; metric_index < TR_METRIC__COUNT; metric_index++) {
+			if (cell_record->cc_unknown_nocause[metric_index]
+			    || cell_record->cc_unknown[metric_index]) return 1;
+			for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++)
+				if (cell_record->cc_excluded[metric_index][excl_index]) return 1;
+			for (int cause_index = 0; cause_index < MAX_CAUSE; cause_index++)
+				if (cell_record->cc_value[metric_index][cause_index]) return 1;
 		}
 	}
-	// SI 네 지표
-	fill_si_mean(&report.si_stats[TR_METRIC_RRC_CONN_MEAN], cell_record->conn_sum,
-		     cell_record->conn_sample_count, cell_record->evicted_this_period, 0);
-	fill_si_max (&report.si_stats[TR_METRIC_RRC_CONN_MAX],  cell_record->conn_max, cell_record->conn_sum,
-		     cell_record->conn_sample_count, cell_record->evicted_this_period, 0);
-	// INACTIVE 를 쓰지 않는 망이라고 설정하지 않았으면 상한을 모름
-	int inactive_unbounded = !tr->tr_cfg.assume_no_inactive;
-	fill_si_mean(&report.si_stats[TR_METRIC_RRC_INACTIVE_CONN_MEAN], cell_record->inactive_sum,
-		     cell_record->inactive_sample_count, cell_record->evicted_this_period, inactive_unbounded);
-	fill_si_max (&report.si_stats[TR_METRIC_RRC_INACTIVE_CONN_MAX],  cell_record->inactive_max,
-		     cell_record->inactive_sum, cell_record->inactive_sample_count,
-		     cell_record->evicted_this_period, inactive_unbounded);
-	tr->sink_ops.on_period(tr->user_ctx, &report);
+	return 0;
 }
 
-/* 셀이 하나도 없는 주기에도 유실이 있으면 탭 전체 커버리지만 담은 보고를 냄. 제어평면이 전부
- * 암호화됐거나 첫 F1 셀이 만들어지기 전에 스톰이 오면 이 상태가 됨.
- *   종전에는 주기 보고를 셀 단위로만 냈으므로 셀이 0 개면 보고도 0 개였음. 유실이 있어도 읽는
- *   쪽에는 아무 일 없는 것과 같은 모양이 되어, 암호화된 구간에서만 돌던 시나리오의 유실 신호가
- *   통째로 사라졌음.
- * 유실이 0 이면 내지 않음. 할 일 없는 주기마다 빈 보고를 내지 않으려고임.
- * 셀 칸은 valid=false 인 빈 값이고 지표는 비움. 델타 계산식은 emit_cell_period 와 같은 식이므로
- * 커버리지 칸 집합이 바뀌면 두 곳을 같이 고칠 것 */
-static void emit_coverage_only_period(struct tr *tr, int partial)
+/* close_period: 지금 주기의 셀별 값을 내보내고 주기 누적을 0 으로 돌림. 게이지는 그대로 둠.
+ *   방출과 누적 이전을 한 함수에 둔 이유: 리셋을 빠뜨리면 다음 주기가 이번 값을 또 보고하고,
+ *     누적 이전을 빠뜨리면 미상과 제외가 종료 보고에서 사라짐. 셋이 한 자리에 있어야 비대칭이 안 생김 */
+static void close_period(struct tr *tr)
 {
-	if (!tr->sink_ops.on_period) return;
-	#define COVERAGE_DELTA(cur, snap) ((cur) >= (snap) ? (cur) - (snap) : 0)
-	uint64_t tsn_gap_count = COVERAGE_DELTA(tr->coverage_tsn_gap_count, tr->coverage_snapshot_tsn_gap_count);
-	uint64_t ringbuf_full_count  = COVERAGE_DELTA(tr->coverage_ringbuf_full_count,
-						      tr->coverage_snapshot_ringbuf_full_count);
-	uint64_t esp_seen_count = COVERAGE_DELTA(tr->coverage_esp_seen_count, tr->coverage_snapshot_esp_seen_count);
-	uint64_t ip_frag_skipped_count = COVERAGE_DELTA(tr->coverage_ip_frag_skipped_count,
-							tr->coverage_snapshot_ip_frag_skipped_count);
-	uint64_t obs_lost_count = COVERAGE_DELTA(tr->coverage_obs_lost_count, tr->coverage_snapshot_obs_lost_count);
-	#undef COVERAGE_DELTA
-	/* 유실도 경보도 근거 수도 없으면 내지 않음. 경보나 근거 수만 있는 주기는 내보내야 하므로
-	 * 그 둘도 조건에 넣음 */
-	if (!(tsn_gap_count || ringbuf_full_count || esp_seen_count || ip_frag_skipped_count || obs_lost_count
-		  || tr->late_event_count || tr->lost_evicted_count || tr->inactive_alarm_count
-		  || tr->release_basis_observed_count || tr->release_basis_assumed_count)) return;
-	struct tr_report_header report_header;
-	memset(&report_header, 0, sizeof report_header);   // 셀 칸은 valid=false 인 빈 값으로 남음
-	report_header.period_start_ns = tr->cur_start_ns; report_header.period_end_ns = tr->cur_end_ns;
-	report_header.gp_ms = tr->tr_cfg.gp_ms ? tr->tr_cfg.gp_ms : DEF_GP_MS;
-	report_header.partial = partial || tr->first_period;
-	// 주기 끝까지 확인됐을 때만 참임. 중간까지만 확인된 주기는 뒷부분을 못 본 것이라 0 으로 셀 수 없음
-	report_header.capture_alive = tr->capture_alive_until_ns >= report_header.period_end_ns;
-	report_header.n2_observed = tr->n2_observed; report_header.assume_no_inactive = tr->tr_cfg.assume_no_inactive;
-	report_header.late_event_count = tr->late_event_count; report_header.lost_evicted_count = tr->lost_evicted_count;
-	report_header.inactive_alarm_count = tr->inactive_alarm_count;
-	report_header.release_basis_observed_count = tr->release_basis_observed_count;
-	report_header.release_basis_assumed_count = tr->release_basis_assumed_count;
-	report_header.tsn_gap_count = tsn_gap_count; report_header.ringbuf_full_count = ringbuf_full_count;
-	report_header.esp_seen_count = esp_seen_count; report_header.ip_frag_skipped_count = ip_frag_skipped_count;
-	report_header.obs_lost_count = obs_lost_count;
-	report_header.coverage_tapwide = true;
-	struct tr_period_report report;
-	memset(&report, 0, sizeof report);
-	report.report_header = &report_header;   // memset 으로 cc_cells, si_stats, path_value 가 전부 비어 커버리지만 담김
-	tr->sink_ops.on_period(tr->user_ctx, &report);
-}
-
-static void close_period(struct tr *tr, int partial)
-{
-	for (uint32_t i = 0; i < tr->cell_count; i++)
-		emit_cell_period(tr, &tr->cell_records[i], partial);
-	if (tr->cell_count == 0) emit_coverage_only_period(tr, partial);
-	// 주기 리셋. CC 와 SI 누적, 주기 헤더 누적을 0 으로 돌리고 게이지는 그대로 둠
+	/* 길이가 온전한 주기만 내보냄. 기동 시각이 주기 경계가 아니면 첫 주기는 앞부분을 못 본 칸인데,
+	 * 주기 줄은 길이가 늘 period_ms 라고 약속돼 있어 그대로 내보내면 그 수가 그 칸의 전량으로
+	 * 읽힘. 집계 리셋은 내보내든 말든 똑같이 해야 다음 주기에 섞이지 않음 */
+	bool full_period = tr->cur_start_ns >= tr->observe_start_ns;
+	if (full_period) {
+		for (uint32_t i = 0; i < tr->cell_count; i++)
+			emit_cell_period(tr, &tr->cell_records[i]);
+	} else if (period_has_content(tr)) {
+		tr->stats.unreported_period_count++;
+	}
 	for (uint32_t i = 0; i < tr->cell_count; i++) {
 		struct tr_cell_record *cell_record = &tr->cell_records[i];
+		accumulate_stats(tr, cell_record);   // 리셋 전에. 미상과 제외는 줄로 안 나가므로 여기서만 남음
 		memset(cell_record->cc_value, 0, sizeof cell_record->cc_value);
 		memset(cell_record->cc_inferred, 0, sizeof cell_record->cc_inferred);
 		memset(cell_record->cc_unknown, 0, sizeof cell_record->cc_unknown);
 		memset(cell_record->cc_unknown_nocause, 0, sizeof cell_record->cc_unknown_nocause);
 		memset(cell_record->cc_excluded, 0, sizeof cell_record->cc_excluded);
-		memset(cell_record->cc_overlap, 0, sizeof cell_record->cc_overlap);
-		memset(cell_record->path_value, 0, sizeof cell_record->path_value);
 		memset(cell_record->conn_sum, 0, sizeof cell_record->conn_sum);
 		cell_record->conn_sample_count = 0;
 		memset(cell_record->conn_max, 0, sizeof cell_record->conn_max);
-		memset(cell_record->inactive_sum, 0, sizeof cell_record->inactive_sum);
-		cell_record->inactive_sample_count = 0;
-		memset(cell_record->inactive_max, 0, sizeof cell_record->inactive_max);
-		cell_record->half_open_sum = 0; cell_record->half_open_max = 0;
 		cell_record->evicted_this_period = 0;
 		/* 계수기는 0 으로 돌리고, UE 컨텍스트 최댓값은 주기가 시작될 때 이미 있던 수에서 시작함.
 		 * 그 주기에 아무 일도 없으면 그 수가 그대로 최댓값이어야 하기 때문임 */
 		cell_record->initial_ul_count = 0; cell_record->no_du_to_cu_count = 0;
 		cell_record->ue_context_max = (uint32_t)(cell_record->ue_context_gauge > 0
 							 ? cell_record->ue_context_gauge : 0);
-		cell_record->late_join = 0;
 	}
-	tr->late_event_count = 0; tr->n2_observed = 0; tr->lost_evicted_count = 0;
-	tr->inactive_alarm_count = 0;
-	tr->release_basis_observed_count = 0; tr->release_basis_assumed_count = 0;
-	tr->reset_unresolved_count = 0;
 	// 셀별 표본 수 리셋과 같이 돌려야 한 주기의 표본 수가 맞음
-	tr->conn_sample_count = 0; tr->inactive_sample_count = 0;
-	// 다음 주기 델타의 기준점은 지금 누적임. 이 주기분은 위에서 이미 헤더에 실렸음
-	tr->coverage_snapshot_tsn_gap_count = tr->coverage_tsn_gap_count;
-	tr->coverage_snapshot_ringbuf_full_count = tr->coverage_ringbuf_full_count;
-	tr->coverage_snapshot_esp_seen_count = tr->coverage_esp_seen_count;
-	tr->coverage_snapshot_ip_frag_skipped_count = tr->coverage_ip_frag_skipped_count;
-	tr->coverage_snapshot_obs_lost_count = tr->coverage_obs_lost_count;
-	tr->first_period = 0;
+	tr->conn_sample_count = 0;
 	tr_self_check(tr);   // 주기를 리셋한 뒤에도 게이지가 유지되고 멤버십과 맞는지 확인
 }
 
@@ -1326,7 +1239,6 @@ static void fire_deadline(struct tr *tr, struct tr_ue_record *ue_record)
 		if (ue_record->saw_setup_sent) {
 			// RRCSetup 을 봤으므로 무응답임
 			cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_NOREPLY]++;
-			cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][ue_record->path]++;
 			ue_record->setup_state = SR_NOREPLY;
 		} else {
 			// RRCSetup 을 못 봤으므로 원인 없는 unknown 임
@@ -1359,10 +1271,7 @@ static void advance_to(struct tr *tr, uint64_t target_ns)
 	 * 캡처 쪽에서 시각을 검사하더라도 거대한 target 이 어떤 경로로든 들어오면 아래 루프가 주기를
 	 * 끝없이 닫으며 멈추지 않으므로, 루프 밖에서 한 번 묶어 둠 */
 	if (target_ns - tr->now_ns > ADVANCE_MAX_NS) target_ns = tr->now_ns + ADVANCE_MAX_NS;
-	uint64_t conn_period_ns = (uint64_t)(tr->tr_cfg.conn_sample_period_ms ? tr->tr_cfg.conn_sample_period_ms
-									 : DEF_CONN_SAMPLE_PERIOD_MS) * 1000000ull;
-	uint64_t inactive_period_ns = (uint64_t)(tr->tr_cfg.inactive_sample_period_ms ? tr->tr_cfg.inactive_sample_period_ms
-										 : DEF_INACTIVE_SAMPLE_PERIOD_MS) * 1000000ull;
+	uint64_t conn_period_ns = DEF_CONN_SAMPLE_PERIOD_MS * 1000000ull;
 
 	for (;;) {
 		// 가장 이른 마감은 heap 루트라 O(1) 로 읽음. 빼는 것은 fire_deadline 안의 open_list_remove 가 O(log n) 으로 함
@@ -1371,16 +1280,14 @@ static void advance_to(struct tr *tr, uint64_t target_ns)
 			deadline_ue_index = tr->open_list[0];
 			earliest_deadline_ns = tr->ue_records[deadline_ue_index].deadline_ns;
 		}
-		// 후보 시각을 우선순위 순으로 늘어놓음. conn 표본, inactive 표본, 주기 끝, 마감
-		uint64_t candidate_ns[4] = { tr->next_conn_sample_ns, tr->next_inactive_sample_ns,
-					     tr->cur_end_ns, earliest_deadline_ns };
+		// 후보 시각을 우선순위 순으로 늘어놓음. conn 표본, 주기 끝, 마감
+		uint64_t candidate_ns[3] = { tr->next_conn_sample_ns, tr->cur_end_ns, earliest_deadline_ns };
 		uint64_t next_ns = candidate_ns[0];
-		for (int i = 1; i < 4; i++) if (candidate_ns[i] < next_ns) next_ns = candidate_ns[i];
+		for (int i = 1; i < 3; i++) if (candidate_ns[i] < next_ns) next_ns = candidate_ns[i];
 		if (next_ns > target_ns) { tr->now_ns = target_ns; break; }
 		// 같은 시각이면 앞쪽 후보가 이김
 		int fired_candidate = (candidate_ns[0] == next_ns) ? 0
-				    : (candidate_ns[1] == next_ns) ? 1
-				    : (candidate_ns[2] == next_ns) ? 2 : 3;
+				    : (candidate_ns[1] == next_ns) ? 1 : 2;
 		tr->now_ns = next_ns;
 		switch (fired_candidate) {
 		case 0:
@@ -1388,85 +1295,15 @@ static void advance_to(struct tr *tr, uint64_t target_ns)
 			tr->next_conn_sample_ns += conn_period_ns;
 			break;
 		case 1:
-			sample_inactive(tr);
-			tr->next_inactive_sample_ns += inactive_period_ns;
-			break;
-		case 2:
-			close_period(tr, 0);
+			close_period(tr);
 			tr->cur_start_ns = tr->cur_end_ns;
 			tr->cur_end_ns += tr->gp_ns;
 			break;
-		case 3:
+		case 2:
 			fire_deadline(tr, &tr->ue_records[deadline_ue_index]);
 			break;
 		}
 	}
-}
-
-// ---- 표 I 줄 ----
-static void emit_ue_line(struct tr *tr, struct tr_ue_record *ue_record, const struct obs_event *event,
-			 uint32_t changed, int closed)
-{
-	if (!tr->sink_ops.on_ue_line) return;
-	/* 이 이벤트가 디코드된 RRC 면 그 통로와 메시지 이름으로 마지막 RRC 를 갱신함. 일찍 돌아가는
-	 * 분기보다 위에 두는 이유: 바뀐 칸이 없는 RRC 이벤트도 마지막 RRC 를 남겨야 뒤따르는 줄이
-	 * 올바른 값을 읽음. 메시지 이름을 핸들러마다 상수로 박으면 그 핸들러가 다루는 두어 개만 기록됨 */
-	if (event->rrc_chan > 0) {
-		ue_record->last_rrc_chan = event->rrc_chan;
-		ue_record->last_rrc_msg_name = event->rrc_msg_name;
-		ue_record->has_last_rrc = 1;
-	}
-	if (!changed && !closed) return;
-	struct tr_ue_line ue_line; memset(&ue_line, 0, sizeof ue_line);
-	ue_line.wallclock_ns = event->wallclock_ns; ue_line.trigger_event = event->kind;
-	ue_line.f1ue = event->f1ue; ue_line.n2ue = event->n2ue;
-	if (ue_record->req_cell_index >= 0) ue_line.cell = tr->cell_records[ue_record->req_cell_index].cell;
-	else if (event->cell.valid) ue_line.cell = event->cell;
-	ue_line.changed_mask = changed; ue_line.closed = closed ? true : false;
-	/* 등급은 값을 실제로 관측하거나 판정했을 때만 EXACT 임. 관측하지 못했으면 UNKNOWN 으로 내림.
-	 * 안 그러면 모르는 값(알고리즘 -1, C-RNTI 0, 미상 상태)에 EXACT 가 붙어 읽는 쪽이 그것을
-	 * 측정값으로 받음 */
-	ue_line.crnti = ue_record->crnti;
-	ue_line.crnti_quality = ue_record->has_crnti ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
-	ue_line.has_stmsi48 = ue_record->has_stmsi48 ? true : false;
-	ue_line.stmsi48 = ue_record->stmsi48;
-	ue_line.stmsi48_quality = ue_record->has_stmsi48 ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
-	ue_line.ciph_alg = ue_record->ciph_alg; ue_line.integ_alg = ue_record->integ_alg;
-	ue_line.alg_quality = ue_record->has_alg ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
-	ue_line.ciph_alg_now = ue_record->ciph_alg_now; ue_line.integ_alg_now = ue_record->integ_alg_now;
-	ue_line.alg_changed_after_smc = ue_record->alg_changed_after_smc ? true : false;
-	ue_line.alg_change_opportunity_count = ue_record->alg_change_opportunity_count;
-	ue_line.rrc_state = ue_record->rrc_state;
-	/* 등급을 현 rrc_state 로 걸러 읽음. 각 플래그는 그 상태에서만 뜻이 있음
-	 *   CONNECTED             -> conn_inferred. 추론이면 STRUCT, 직접 본 complete 면 EXACT
-	 *   RELEASED / INACTIVE   -> rel_inferred.  추론이면 CROSS, 평문으로 봤으면 EXACT
-	 *   IDLE_PENDING(요청 관측) -> EXACT
-	 *   UNKNOWN               -> UNKNOWN
-	 * 상태로 걸러야 하는 이유: 종전에는 rel_inferred 를 상태와 무관하게 먼저 봤음. RELEASED 나
-	 * INACTIVE 에서 재개나 재수립이나 전사로 CONNECTED 로 돌아오면 이전 에피소드에 남은
-	 * rel_inferred 가 conn_inferred 를 가려 CONNECTED 가 CROSS 로 잘못 등급됐음(실측).
-	 * 그 플래그를 지우는 곳이 레코드 리셋 한 곳뿐이라 생긴 일임 */
-	ue_line.rrc_state_quality =
-		(ue_record->rrc_state == RS_UNKNOWN) ? TR_QUALITY_UNKNOWN :
-		(ue_record->rrc_state == RS_CONNECTED)
-			? (ue_record->conn_inferred ? TR_QUALITY_STRUCT : TR_QUALITY_EXACT) :
-		((ue_record->rrc_state == RS_RELEASED || ue_record->rrc_state == RS_INACTIVE)
-			? (ue_record->rel_inferred ? TR_QUALITY_CROSS : TR_QUALITY_EXACT) : TR_QUALITY_EXACT);
-	/* NAS 상태 세 줄은 이 계층이 유도한 값임 - 5GMM 주상태는 NAS 메시지에서, AS 보안 상태는 F1 의
-	 * SMC 와 Complete 와 Failure 에서, NAS 보안 상태는 SHT 에서 유도함. NAS 암호 알고리즘만은
-	 * 관측 층이 하행 SMC 에서 읽어 준 값을 그대로 실음 */
-	ue_line.nas_reg_state = ue_record->nas_reg_state; ue_line.nas_conn_mode = ue_record->nas_conn_mode;
-	ue_line.nas_state_quality = ue_record->nas_state_quality;
-	ue_line.rrc_sec_state = ue_record->rrc_sec_state; ue_line.rrc_sec_quality = ue_record->rrc_sec_quality;
-	ue_line.nas_sec_state = ue_record->nas_sec_state; ue_line.nas_sec_quality = ue_record->nas_sec_quality;
-	ue_line.nas_ciph_alg = ue_record->nas_ciph_alg;
-	ue_line.rrc_chan = ue_record->last_rrc_chan; ue_line.rrc_msg_name = ue_record->last_rrc_msg_name;
-	ue_line.rrc_msg_quality = ue_record->has_last_rrc ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
-	ue_line.nas_epd = ue_record->last_nas_epd; ue_line.nas_sht = ue_record->last_nas_sht;
-	ue_line.nas_msg_type = ue_record->last_nas_msg_type;
-	// 교차 귀속으로 얻은 값이면 그 등급을 그대로 유지함
-	ue_line.nas_msg_quality = ue_record->has_last_nas ? ue_record->nas_msg_quality : TR_QUALITY_UNKNOWN;
-	tr->sink_ops.on_ue_line(tr->user_ctx, &ue_line);
 }
 
 // ---- AMF 과부하 ----
@@ -1537,26 +1374,37 @@ static void amf_drop_assoc(struct tr *tr, uint32_t assoc_id)
 		else i++;
 }
 /* Overload Action 값에서 거부되는 수립 원인 집합을 냄(TS 38.413 §8.7.7.2).
- *   action_mask = 1u << overloadAction 이고, 값의 뜻은
- *     0 = 비응급 발신 데이터 거부, 1 = 신호용 연결 거부,
- *     2 = 응급과 착신만 허용,     3 = 고우선과 착신만 허용
+ *   action_mask = 1u << overloadAction 이고 비트 위치는 enum tr_overload_action 임.
  *   종전에는 이 값을 무시하고 모든 action 에 같은 원인 집합을 적용했음. 넷 중 하나만 우연히
- *   맞고 나머지 셋이 틀렸는데, 0 은 신호용 연결을 과잉 거부하고 '만 허용' 두 값은 대부분을
- *   과소 거부했음.
- *   원인 칸 번호: emergency 0, highPriorityAccess 1, mtAccess 2, moSignalling 3, moData 4,
- *   moVoiceCall 5, moVideoCall 6, moSMS 7, mpsPriorityAccess 8, mcsPriorityAccess 9, spare 10~15 */
+ *   맞고 나머지 셋이 틀렸는데, 비응급 발신 데이터 거부는 신호용 연결을 과잉 거부하고
+ *   '만 허용' 두 값은 대부분을 과소 거부했음.
+ *   원인 번호를 여기 적지 않는 이유: 그 번호는 enum tr_est_cause 하나에만 둠. 두 곳에 적으면
+ *     문법을 올렸을 때 한쪽만 바뀌어도 컴파일됨 */
 static int action_covers(uint32_t mask, int est_cause)
 {
-	// 비응급 발신 데이터
-	if (mask & (1u << 0)) return est_cause == 4 || est_cause == 5 || est_cause == 6 || est_cause == 7;
-	// 위에 신호용 연결을 더함
-	if (mask & (1u << 1))
-		return est_cause == 3 || est_cause == 4 || est_cause == 5 || est_cause == 6 || est_cause == 7;
-	// 응급과 착신만 허용이므로 그 둘 외 전부 거부
-	if (mask & (1u << 2)) return !(est_cause == 0 || est_cause == 2);
-	// 고우선과 우선순위 둘, 착신만 허용
-	if (mask & (1u << 3))
-		return !(est_cause == 1 || est_cause == 8 || est_cause == 9 || est_cause == 2);
+	bool is_mo_traffic = est_cause == TR_EST_CAUSE_MO_DATA
+			|| est_cause == TR_EST_CAUSE_MO_VOICE_CALL
+			|| est_cause == TR_EST_CAUSE_MO_VIDEO_CALL
+			|| est_cause == TR_EST_CAUSE_MO_SMS;
+	bool is_emergency_or_mt = est_cause == TR_EST_CAUSE_EMERGENCY
+			|| est_cause == TR_EST_CAUSE_MT_ACCESS;
+	bool is_priority_or_mt = est_cause == TR_EST_CAUSE_HIGH_PRIORITY_ACCESS
+			|| est_cause == TR_EST_CAUSE_MPS_PRIORITY_ACCESS
+			|| est_cause == TR_EST_CAUSE_MCS_PRIORITY_ACCESS
+			|| est_cause == TR_EST_CAUSE_MT_ACCESS;
+
+	// 비응급 발신 데이터를 거부함
+	if (mask & (1u << TR_OVERLOAD_REJECT_NON_EMERGENCY_MO_DT))
+		return is_mo_traffic;
+	// 위에 신호용 연결을 더해 거부함
+	if (mask & (1u << TR_OVERLOAD_REJECT_RRC_CR_SIGNALLING))
+		return is_mo_traffic || est_cause == TR_EST_CAUSE_MO_SIGNALLING;
+	// 응급과 착신만 허용이므로 그 둘 외 전부 거부함
+	if (mask & (1u << TR_OVERLOAD_PERMIT_EMERGENCY_AND_MT_ONLY))
+		return !is_emergency_or_mt;
+	// 고우선과 우선순위 둘과 착신만 허용함
+	if (mask & (1u << TR_OVERLOAD_PERMIT_HIGH_PRIORITY_AND_MT_ONLY))
+		return !is_priority_or_mt;
 	// 빈 마스크나 모르는 값이면 거부 목록을 알 수 없음. 부르는 쪽이 미상으로 처리함
 	return 0;
 }
@@ -1649,7 +1497,6 @@ static void n2_remove(struct tr *tr, uint32_t assoc_id, uint64_t ran_ue_ngap_id)
 	tr->n2_count = last;
 }
 
-uint32_t tr_n2_count(const struct tr *tr) { return tr ? tr->n2_count : 0; }
 
 // ---- 수립 종료 공통 ----
 // 열린 수립을 결과를 모르는 실패로 닫음
@@ -1662,7 +1509,6 @@ static void close_setup_other(struct tr *tr, struct tr_ue_record *ue_record)
 		if (cell_index >= 0) {
 			struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
 			cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_OTHER]++;
-			cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][ue_record->path]++;
 		}
 		settle_open_setup(tr, ue_record, SR_OTHER);
 	}
@@ -1695,7 +1541,7 @@ static void close_setup_complete_unobserved(struct tr *tr, struct tr_ue_record *
 		enum tr_metric metric = TR_METRIC_RRC_CONN_ESTAB_SUCC;
 		int cause_index = (ue_record->est_cause >= 0 && ue_record->est_cause < METRIC_CAUSE_CNT[metric])
 				? ue_record->est_cause : -1;
-		if (cause_index >= 0) cell_record->cc_unknown[metric][cause_index]++;
+		if (cause_index >= 0) cell_record->cc_unknown[metric]++;
 		else cell_record->cc_unknown_nocause[metric]++;
 	}
 	settle_open_setup(tr, ue_record, SR_SUCCESS);
@@ -1737,15 +1583,11 @@ static void on_setup_request(struct tr *tr, const struct obs_event *event)
 		// establishmentCause 는 필수라 보통 없음 - 방어적으로 원인 없는 미상에 넣음
 		cell_record->cc_unknown_nocause[metric]++;
 	} else if (ongoing) {
-		cell_record->cc_excluded[metric][TR_EXCLUDED_ONGOING_SETUP][cause_index]++;
-		if (overload_decision == OVERLOAD_EXCLUDE)
-			cell_record->cc_overlap[metric][cause_index][TR_OVERLAP_ONGOING_AND_OVL_EXCL]++;
-		else if (overload_decision == OVERLOAD_UNKNOWN)
-			cell_record->cc_overlap[metric][cause_index][TR_OVERLAP_ONGOING_AND_OVL_UNKNOWN]++;
+		cell_record->cc_excluded[metric][TR_EXCLUDED_ONGOING_SETUP]++;
 	} else if (overload_decision == OVERLOAD_EXCLUDE) {
-		cell_record->cc_excluded[metric][TR_EXCLUDED_AMF_OVERLOAD][cause_index]++;
+		cell_record->cc_excluded[metric][TR_EXCLUDED_AMF_OVERLOAD]++;
 	} else if (overload_decision == OVERLOAD_UNKNOWN) {
-		cell_record->cc_unknown[metric][cause_index]++;
+		cell_record->cc_unknown[metric]++;
 	} else {
 		cell_record->cc_value[metric][cause_index]++;   // 요청은 평문이라 inferred 는 늘 0 임
 	}
@@ -1771,7 +1613,7 @@ static void on_setup_request(struct tr *tr, const struct obs_event *event)
 	ue_record->n2_released = 0;
 	ue_record->suspend_resolved = 0;
 	ue_record->rel_had_container = 0;
-	ue_record->rel_inferred = 0;
+
 	ue_record->conn_inferred = 0;
 	ue_record->path = PATH_SETUP;
 	ue_record->setup_state = SR_OPEN;
@@ -1791,11 +1633,8 @@ static void on_setup_request(struct tr *tr, const struct obs_event *event)
 		     (uint32_t)(ue_record - tr->ue_records));
 
 	// 표 I: C-RNTI, S-TMSI 앞부분, RRC 상태, 마지막 RRC 메시지
-	uint32_t changed_mask = 0;
 	if (event->payload.setup_request.crnti) {
-		ue_record->crnti = event->payload.setup_request.crnti;
-		ue_record->has_crnti = 1;
-		changed_mask |= TR_UE_F_CRNTI;
+
 	}
 	/* 앞부분만 온 경우 48비트 S-TMSI 는 아직 조립 전이고 앞부분 자체는 출력 계약에 없음. 그래서
 	 * stmsi 변경 비트를 켜지 않음 - 값 없는 변경은 허위 신호임. 그 비트는 뒷부분이 와서 실제 48비트가
@@ -1805,9 +1644,6 @@ static void on_setup_request(struct tr *tr, const struct obs_event *event)
 		ue_record->has_stmsi_part1 = 1;
 	}
 	ue_record->rrc_state = RS_IDLE_PENDING;
-	changed_mask |= TR_UE_F_RRC_STATE;
-	changed_mask |= TR_UE_F_RRC_MSG;   // 마지막 RRC 메시지 값은 emit_ue_line 이 이벤트에서 직접 채움
-	emit_ue_line(tr, ue_record, event, changed_mask, 0);
 }
 
 /* on_rrc_setup: RRCSetup(Msg4) 송신을 레코드에 표시하고 반쯤 열린 연결 창을 시작함.
@@ -1882,7 +1718,7 @@ static void on_setup_complete(struct tr *tr, const struct obs_event *event)
 	 * 종결된 정확 등급과 같은 처분임. 형제 on_reest_complete, on_resume_complete 는 이미 이 가드를 가짐 */
 	if (event->quality == TR_QUALITY_UNKNOWN && ue_record->setup_state == SR_OPEN) {
 		// 망 공유로 Complete 자체를 보지 못하고 추정한 경우 -> 원인별 미상
-		if (cause_index >= 0) cell_record->cc_unknown[metric][cause_index]++;
+		if (cause_index >= 0) cell_record->cc_unknown[metric]++;
 		else cell_record->cc_unknown_nocause[metric]++;
 	} else if (ue_record->setup_state == SR_OPEN && ue_record->path == PATH_SETUP) {
 		/* 본값과 경로 칸을 같이 올림.
@@ -1894,7 +1730,6 @@ static void on_setup_complete(struct tr *tr, const struct obs_event *event)
 		 *   following a RRC connection setup request" 밖이고 수립 원인도 없음 */
 		if (cause_index >= 0) {
 			cell_record->cc_value[metric][cause_index]++;
-			cell_record->path_value[metric][PATH_SETUP]++;
 			/* 구조, 교차 추론으로 얻은 성공은 inferred 밴드로 보냄(exact = 본값 - inferred).
 			 * 지금 libobs 는 Complete 를 늘 정확으로 주어 이 분기는 실행되지 않지만, 집계 층은 어떤
 			 * 등급이 와도 정직하게 갈라야 함. 형제 on_reest_complete, on_resume_complete 와 같은 모양임 */
@@ -1902,10 +1737,6 @@ static void on_setup_complete(struct tr *tr, const struct obs_event *event)
 				cell_record->cc_inferred[metric][cause_index]++;
 		}
 		else cell_record->cc_unknown_nocause[metric]++;
-	} else if (ue_record->setup_state == SR_OPEN && ue_record->path == PATH_REEST_FALLBACK) {
-		cell_record->path_value[metric][PATH_REEST_FALLBACK]++;
-	} else if (ue_record->setup_state == SR_OPEN && ue_record->path == PATH_RESUME_FALLBACK) {
-		cell_record->path_value[metric][PATH_RESUME_FALLBACK]++;
 	} else if ((ue_record->setup_state == SR_NOREPLY || ue_record->setup_state == SR_UNKNOWN)
 		   && event->quality != TR_QUALITY_UNKNOWN) {
 		/* 마감이 지난 뒤 도착한 Msg5. 처분은 늦게 온 Msg5 도 성공으로 세고 이미 센 NoReply 는 그대로
@@ -1917,7 +1748,6 @@ static void on_setup_complete(struct tr *tr, const struct obs_event *event)
 		 *   Complete 11건이 성공 0 으로 나갔음(같은 고정물에서 PDU 간격 300 ms 는 11, 1100 ms 는 0).
 		 *   미상 등급을 이 갈래에서 뺀 이유: 그 등급은 Msg5 를 실제로 보지 못하고 망 공유 정보로
 		 *   추정한 것이라 "받았다" 가 성립하지 않음. 그 경우는 아래 else 로 떨어져 진단 칸만 올림 */
-		cell_record->path_value[metric][PATH_LATE_COMPLETE]++;
 		if (cause_index >= 0) {
 			cell_record->cc_value[metric][cause_index]++;
 			if (event->quality == TR_QUALITY_STRUCT || event->quality == TR_QUALITY_CROSS)
@@ -1926,7 +1756,15 @@ static void on_setup_complete(struct tr *tr, const struct obs_event *event)
 			cell_record->cc_unknown_nocause[metric]++;
 		}
 	} else {
-		cell_record->path_value[metric][PATH_OTHER]++;   // 이미 성공으로 닫힘(중복 Complete) 등
+		/* 위 어디에도 안 걸리는 Complete. 본값에 넣지 않는 근거는 TS 28.552 §5.1.1.15.2 c) 가
+		 *   "Receipt by the gNB of an RRCSetupComplete message following a RRC connection setup
+		 *   request" 로 수립 요청을 뒤따른 것만 세라고 한 것임. 폴백으로 열린 수립은 수립 요청을
+		 *   뒤따른 것이 아니고, 이미 결판난 시도의 Complete 도 그 요청의 결과가 아님.
+		 *   미상 칸이 아니라 제외 칸에 넣는 이유: 우리가 못 읽은 것이 아니라 규칙이 뺀 것임.
+		 *   그래도 세는 이유: 받은 Complete 가 어느 칸에도 없으면 안 받은 것과 같은 모양이 됨 */
+		enum tr_excl_reason reason = (ue_record->setup_state == SR_OPEN)
+					     ? TR_EXCLUDED_FALLBACK_COMPLETE : TR_EXCLUDED_SETTLED_COMPLETE;
+		cell_record->cc_excluded[metric][reason]++;
 	}
 	settle_open_setup(tr, ue_record, SR_SUCCESS);
 
@@ -1941,22 +1779,17 @@ static void on_setup_complete(struct tr *tr, const struct obs_event *event)
 	ue_record->est_cell_index = ue_record->req_cell_index;   // 수립이 끝난 셀. 해제 계수가 이 칸을 씀
 
 	// 표 I: S-TMSI 조립, RRC CONNECTED
-	uint32_t changed_mask = 0;
 	if (event->payload.setup_complete.has_stmsi48) {
 		ue_record->stmsi48 = event->payload.setup_complete.stmsi48;
 		ue_record->has_stmsi48 = 1;
-		changed_mask |= TR_UE_F_STMSI;
 	}
 	else if (event->payload.setup_complete.has_stmsi_part2 && ue_record->has_stmsi_part1) {
 		ue_record->stmsi48 = ((uint64_t)event->payload.setup_complete.stmsi_part2 << 39)
 				   | (ue_record->stmsi_part1 & 0x7FFFFFFFFFull);
 		ue_record->has_stmsi48 = 1;
-		changed_mask |= TR_UE_F_STMSI;
 	}
 	ue_record->rrc_state = RS_CONNECTED;   // RRCSetupComplete 는 평문 직접 관측이라 등급은 정확임
 	ue_record->conn_inferred = 0;
-	changed_mask |= TR_UE_F_RRC_STATE;
-	changed_mask |= TR_UE_F_RRC_MSG;   // 마지막 RRC 메시지 값은 emit_ue_line 이 이벤트에서 직접 채움
 	// 초기 5GMM 상태. RRCSetupComplete 가 실어 온 초기 NAS 는 AS 보안 전 평문임. 연결모드는 AMF 응답 전이라 IDLE
 	int nas_msg_type = event->payload.setup_complete.nas.msg_type,
 	    nas_reg_type = event->payload.setup_complete.nas.reg_type;
@@ -1975,16 +1808,13 @@ static void on_setup_complete(struct tr *tr, const struct obs_event *event)
 		/* 등급은 '무엇을 근거로 그 상태를 적었나' 임. 못 읽어서 미상이면 근거가 없으므로 판정 불가임.
 		 * 구조 등급을 달면 읽는 쪽이 '절차 흐름으로 판정했음' 으로 읽음 */
 		ue_record->nas_state_quality = reg_type_read ? TR_QUALITY_EXACT : TR_QUALITY_UNKNOWN;
-		changed_mask |= TR_UE_F_NAS_STATE;
 	} else if (nas_msg_type == NAS_MM_SERVICE_REQUEST || nas_msg_type == NAS_MM_CP_SERVICE_REQUEST) {
 		/* TS 24.501 §4.4.6 이 초기 NAS 로 꼽는 셋 중 둘임. CONTROL PLANE SERVICE REQUEST 도
 		 * 5GMM-REGISTERED 단말만 보냄(§5.6.1.1) */
 		ue_record->nas_reg_state = TR_5GMM_REGISTERED;
 		ue_record->nas_conn_mode = TR_CM_MODE_IDLE;
 		ue_record->nas_state_quality = TR_QUALITY_EXACT;
-		changed_mask |= TR_UE_F_NAS_STATE;
 	}
-	emit_ue_line(tr, ue_record, event, changed_mask, 0);
 }
 
 /* on_reject: RRCReject 를 ConnEstabFailCause[NetworkReject] 로 세고 수립을 닫음.
@@ -1997,29 +1827,10 @@ static void on_reject(struct tr *tr, const struct obs_event *event)
 								: ue_record->req_cell_index) : -1;
 	if (cell_index < 0) return;                             // 요청 셀 모름 -> 세지 않음
 	struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
-	int path = PATH_OTHER;
-	/* 선행 요청이 무엇이었는지로 경로 칸을 가름. 읽지 못한 경우도 한 칸을 받음.
-	 * default 를 두지 않음: enum 에 값이 하나 늘면 -Wswitch 가 빌드를 깨 이 곳을 같이 고치게 함.
-	 * default 가 있으면 새 값이 조용히 PATH_OTHER 로 섞여 들어감 */
-	switch (event->payload.reject.prior_req) {
-	case TR_PRIOR_SETUP:
-		path = PATH_SETUP;
-		break;
-	case TR_PRIOR_REEST_FALLBACK:
-		path = PATH_REEST_FALLBACK;
-		break;
-	case TR_PRIOR_RESUME_FALLBACK:
-		path = PATH_RESUME_FALLBACK;
-		break;
-	case TR_PRIOR_OTHER_OR_UNREADABLE:
-		path = PATH_OTHER;
-		break;
-	}
 	/* 계수를 '열린 수립' 가드 안에서 함. 종전엔 가드 밖이라 중복, 재전송 RRCReject 가 같은 원인을
 	 * 다시 세거나 이미 성공한 단말을 실패로도 셌음. 형제 실패 원인 생산자는 모두 이 가드를 먼저 함 */
 	if (ue_record->setup_state == SR_OPEN) {
 		cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][FC_NETWORK_REJECT]++;
-		cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][path]++;
 		gauge_leave_inactive(tr, ue_record);   // 폴백으로 다시 열린 INACTIVE 누수 방지(멱등)
 		settle_open_setup(tr, ue_record, SR_NETWORK_REJECT);
 	}
@@ -2045,7 +1856,6 @@ static void on_reest_request(struct tr *tr, const struct obs_event *event)
 		ue_record->reest_succ_counted = 0;   // 새 재수립 주기 시작이므로 성공 계수 플래그를 리셋함
 	}
 	// 재수립 요청도 RRC 메시지이므로 마지막 RRC 메시지 변경 비트를 켬(형제 on_setup_request 와 대칭)
-	if (ue_record) emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE | TR_UE_F_RRC_MSG, 0);
 }
 
 /* on_reest: RRCReestablishment(허가, DL)를 보고 ReEstabSuccWithUeContext 를 inferred 로 세고 연결
@@ -2065,7 +1875,7 @@ static void on_reest(struct tr *tr, const struct obs_event *event)
 {
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
 	if (!ue_record) return;
-	ue_record->wait_reest = 1;
+
 	if (ue_record->req_cell_index < 0 || ue_record->reest_succ_counted
 	    || ue_record->path != PATH_REEST_FALLBACK
 	    || (ue_record->setup_state != SR_OPEN && ue_record->setup_state != SR_SUCCESS)) return;
@@ -2108,7 +1918,7 @@ static void on_reest_complete(struct tr *tr, const struct obs_event *event)
 	enum tr_metric metric = TR_METRIC_RRC_REESTAB_SUCC_WITH_CTX;
 	if (!ue_record->reest_succ_counted && ue_record->path == PATH_REEST_FALLBACK
 	    && (ue_record->setup_state == SR_OPEN || ue_record->setup_state == SR_SUCCESS)) {
-		if (event->quality == TR_QUALITY_UNKNOWN) cell_record->cc_unknown[metric][0]++;
+		if (event->quality == TR_QUALITY_UNKNOWN) cell_record->cc_unknown[metric]++;
 		else {
 			cell_record->cc_value[metric][0]++;
 			if (event->quality == TR_QUALITY_STRUCT || event->quality == TR_QUALITY_CROSS)
@@ -2116,7 +1926,7 @@ static void on_reest_complete(struct tr *tr, const struct obs_event *event)
 		}
 		ue_record->reest_succ_counted = 1;
 	}
-	ue_record->wait_reest = 0;
+
 	// 실패로 종결된 뒤면 게이지와 상태를 건드리지 않음(종결된 레코드를 되살리지 않음)
 	if (ue_record->setup_state != SR_OPEN && ue_record->setup_state != SR_SUCCESS) return;
 	settle_open_setup(tr, ue_record, SR_SUCCESS);
@@ -2160,12 +1970,11 @@ static void on_resume_request(struct tr *tr, const struct obs_event *event)
 	if (cause_index >= 0)
 		tr->cell_records[cell_index].cc_value[TR_METRIC_RRC_RESUME_ATT][cause_index]++;
 	else tr->cell_records[cell_index].cc_unknown_nocause[TR_METRIC_RRC_RESUME_ATT]++;
-	/* 'INACTIVE 를 쓰지 않는 망' 이라는 전제가 깨졌음을 알리는 증거 하나.
-	 *   재개 요청은 저장된 INACTIVE 컨텍스트가 있다는 뜻이고 이 신호는 암호 구간에서도 평문임. 그래서
-	 *   그 전제를 켠 배치에서 재개 요청이 보이면 전제가 깨진 것임.
-	 *   종전엔 증거 셋 중 평문 suspendConfig 하나만 경보를 올려, 재개 요청만 보이는 배치에서는 전제
-	 *   위반을 알리지 않고 해제 쪽 구조 추론을 계속 적용했음 - 조용한 오값임 */
-	if (tr->tr_cfg.assume_no_inactive) tr->inactive_alarm_count++;
+	/* 이 망이 RRC_INACTIVE 를 쓴다는 증거 하나.
+	 *   재개 요청은 저장된 INACTIVE 컨텍스트가 있다는 뜻이고 이 신호는 암호 구간에서도 평문임.
+	 *   세는 이유: INACTIVE 로 간 단말은 연결 게이지에서 빠지지만 돌아오는 것을 암호 구간에서는 볼 수
+	 *   없으므로, 그 일이 있었다는 사실 자체가 Conn 지표를 읽을 때 알아야 하는 한계임 */
+	tr->stats.inactive_observed_count++;
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
 	if (ue_record) {
 		ue_record->path = PATH_RESUME_FALLBACK;
@@ -2201,7 +2010,7 @@ static void on_resume_complete(struct tr *tr, const struct obs_event *event)
 	    && (ue_record->setup_state == SR_OPEN || ue_record->setup_state == SR_SUCCESS)) {
 		if (cause_index < 0) cell_record->cc_unknown_nocause[metric]++;
 		else if (event->quality == TR_QUALITY_UNKNOWN)
-			cell_record->cc_unknown[metric][cause_index]++;
+			cell_record->cc_unknown[metric]++;
 		else {
 			cell_record->cc_value[metric][cause_index]++;
 			if (event->quality == TR_QUALITY_STRUCT || event->quality == TR_QUALITY_CROSS)
@@ -2241,13 +2050,9 @@ static void on_release(struct tr *tr, const struct obs_event *event)
 	int suspend = event->payload.release.suspend;
 	int count_it = 0, inferred = 0;
 	if (suspend == TR_SUSPEND_NO) { count_it = 1; inferred = (event->quality != TR_QUALITY_EXACT); }
-	else if (suspend == TR_SUSPEND_UNKNOWN && tr->tr_cfg.assume_no_inactive) {
-		count_it = 1;   // 못 읽었지만 전제가 켜져 있으므로 구조 추론으로 셈
-		inferred = 1;
-	}
 	else if (suspend == TR_SUSPEND_YES) {
-		// 평문 suspendConfig 를 봤으면 망이 INACTIVE 를 쓴다는 뜻이므로 전제 위반 경보를 올림
-		if (tr->tr_cfg.assume_no_inactive) tr->inactive_alarm_count++;
+		// 평문 suspendConfig 를 봤으므로 이 망이 RRC_INACTIVE 를 쓴다는 것이 확정됨
+		tr->stats.inactive_observed_count++;
 		/* suspendConfig 가 있으면 단말은 INACTIVE 로 감. 완전 해제가 아니므로 세지 않음.
 		 * 연결 게이지에서 먼저 뺀 뒤 INACTIVE 게이지로 옮김 - 순서가 어긋나면 ConnMean, ConnMax 가
 		 * 과대해짐. 그 게이지는 재개 완료나 레코드 해제에서 빠짐 */
@@ -2255,7 +2060,7 @@ static void on_release(struct tr *tr, const struct obs_event *event)
 			gauge_leave_conn(tr, ue_record);
 			half_open_leave(tr, ue_record);
 			ue_record->rrc_state = RS_INACTIVE;
-			ue_record->rel_inferred = 0;   // 평문 직접 관측이므로 남아 있던 추론 표시를 지움
+   // 평문 직접 관측이므로 남아 있던 추론 표시를 지움
 			int release_cell = ue_record->est_cell_index >= 0 ? ue_record->est_cell_index
 									 : ue_record->req_cell_index;
 			/* 들어갈 밴드를 가르는 것은 '그 단말의 소멸을 관측할 수 있는가' 하나임.
@@ -2268,23 +2073,21 @@ static void on_release(struct tr *tr, const struct obs_event *event)
 			int inactive_level = ue_record->has_n2_pair ? LV_EXACT : LV_UNKNOWN;
 			gauge_enter_inactive(tr, ue_record, release_cell, inactive_level);
 			// CONNECTED 에서 INACTIVE 로 가는 전이 줄. 평문 RRCRelease 는 관측된 RRC 메시지임
-			emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE | TR_UE_F_RRC_MSG, 0);
 		}
 		return;
 	} else {
-		// 전제가 꺼져 있고 암호라 못 읽음 -> 미상
+		// 암호 구간이라 suspendConfig 유무를 못 읽음 -> 미상. 완전 해제로 지어내지 않음
 		int cell_index = ue_record ? (ue_record->est_cell_index >= 0 ? ue_record->est_cell_index
 									: ue_record->req_cell_index)
 					   : cell_lookup(tr, &event->cell, 0);
-		if (cell_index >= 0) tr->cell_records[cell_index].cc_unknown[metric][0]++;
+		if (cell_index >= 0) tr->cell_records[cell_index].cc_unknown[metric]++;
 		// 상태는 불확정이지만 RRCRelease 는 관측된 RRC 메시지이므로 줄은 냄
-		if (ue_record) emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_MSG, 0);
 		return;
 	}
 	if (count_it) {
 		// 보고 헤더가 내는 근거 수. 평문 관측과 추론을 따로 셈
-		if (inferred) tr->release_basis_assumed_count++;
-		else tr->release_basis_observed_count++;
+		if (inferred) tr->stats.release_basis_assumed_count++;
+		else tr->stats.release_basis_observed_count++;
 		int target_cell = ue_record ? ue_record->est_cell_index : -1;   // 수립이 끝난 셀에 귀속함
 		if (target_cell >= 0) {
 			tr->cell_records[target_cell].cc_value[metric][0]++;
@@ -2295,23 +2098,24 @@ static void on_release(struct tr *tr, const struct obs_event *event)
 						   : cell_lookup(tr, &event->cell, 0);
 			if (cell_index >= 0)
 				tr->cell_records[cell_index]
-					.cc_excluded[metric][TR_EXCLUDED_EST_CELL_UNKNOWN][0]++;
+					.cc_excluded[metric][TR_EXCLUDED_EST_CELL_UNKNOWN]++;
 		}
 		/* 등급: 추론으로 센 해제는 교차 추론, 평문 관측은 정확임. 종전엔 추론일 때만 1 을 넣어
 		 * 평문 관측에서 옛 값이 남아 정확한 해제가 추론 등급으로 나갔음 - 늘 대입하게 고침 */
 		if (ue_record) {
 			ue_record->rrc_state = RS_RELEASED;
-			ue_record->rel_inferred = inferred;
+
 		}
 	}
 	// RELEASED 또는 미계수 미상으로 가는 전이 줄(평문 RRCRelease)
-	if (ue_record) emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE | TR_UE_F_RRC_MSG, 0);
 }
 
-/* on_ctx_release_cmd: UE CONTEXT RELEASE COMMAND 를 보고 열린 수립을 실패로 닫고 RRC 상태를 정함.
- *   게이지는 여기서 빼지 않음 - 이탈의 원천만 기록하고 감소는 COMPLETE 에서 함. libobs 가 유예 시간
+/* on_ctx_release_cmd: UE CONTEXT RELEASE COMMAND 를 보고 RRC 상태를 정함.
+ *   수립은 여기서 닫지 않음 - 응답 대기가 해제로 끝났는지는 COMPLETE 가 와야 정해지므로 실패 원인도
+ *     그때 셈. 명령과 완료 사이에 마감이 떨어지면 대기 안에 해제가 끝나지 않은 것이라 무응답이 맞음.
+ *   게이지도 여기서 빼지 않음 - 이탈의 원천만 기록하고 감소는 COMPLETE 에서 함. libobs 가 유예 시간
  *     만료 때 COMPLETE 를 합성해 주므로 늘 COMPLETE 가 옴.
- *   부작용: 실패 원인 카운터 증가, 수립 종결, RRC 상태 갱신, 표 I 줄 방출 */
+ *   부작용: RRC 상태 갱신, 표 I 줄 방출 */
 static void on_ctx_release_cmd(struct tr *tr, const struct obs_event *event)
 {
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
@@ -2319,20 +2123,6 @@ static void on_ctx_release_cmd(struct tr *tr, const struct obs_event *event)
 	// 해제 명령에 RRC 컨테이너가 있었는지만 봄. SRB 번호는 보지 않음
 	if (event->payload.f1_release.rrc_container_kind != TR_RRC_CONTAINER_NONE)
 		ue_record->rel_had_container = 1;
-	// 열린 수립이면 CU 가 먼저 끊은 것임. RRCSetup 을 봤으면 NoReply, 그 전이면 Other
-	if (ue_record->setup_state == SR_OPEN) {
-		int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
-								 : ue_record->req_cell_index;
-		int terminal = SR_OPEN;   // 셀을 모르면 계수할 수 없으므로 상태는 그대로 두고 마감만 해제함
-		if (cell_index >= 0) {
-			struct tr_cell_record *cell_record = &tr->cell_records[cell_index];
-			int fail_cause = ue_record->saw_setup_sent ? FC_NOREPLY : FC_OTHER;
-			cell_record->cc_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][fail_cause]++;
-			cell_record->path_value[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE][ue_record->path]++;
-			terminal = ue_record->saw_setup_sent ? SR_NOREPLY : SR_OTHER;
-		}
-		settle_open_setup(tr, ue_record, terminal);
-	}
 	/* 여기 CONNECTED 로 남은 것은 두 경우뿐임. 평문 RRCRelease 는 on_release 가 이미 상태를 잡아
 	 *   걸러짐.
 	 *   RRC 컨테이너가 없는 해제 명령이면 완전 해제가 확실하므로 RELEASED 에 정확 등급임.
@@ -2342,16 +2132,11 @@ static void on_ctx_release_cmd(struct tr *tr, const struct obs_event *event)
 	if (ue_record->rrc_state != RS_CONNECTED)
 		return;
 	if (ue_record->rel_had_container) {
-		if (tr->tr_cfg.assume_no_inactive) {
-			ue_record->rrc_state = RS_RELEASED;
-			ue_record->rel_inferred = 1;
-		}
-		else ue_record->rrc_state = RS_UNKNOWN;   // 정직하게 판정 불가로 둠
+		ue_record->rrc_state = RS_UNKNOWN;   // 정직하게 판정 불가로 둠
 	} else {
 		ue_record->rrc_state = RS_RELEASED;
-		ue_record->rel_inferred = 0;   // 컨테이너 없음 -> 정확. 남아 있던 추론 표시를 지움
+   // 컨테이너 없음 -> 정확. 남아 있던 추론 표시를 지움
 	}
-	emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE, 0);
 }
 
 /* on_ctx_release_complete: UE CONTEXT RELEASE COMPLETE 로 게이지에서 빼고 레코드를 회수함.
@@ -2359,29 +2144,25 @@ static void on_ctx_release_cmd(struct tr *tr, const struct obs_event *event)
  *     N2 와 매칭돼 있으면, 명령과 완료 사이에 그 N2 의 NG 해제가 왔으면 완전 해제로 보고 세고, 안
  *     왔으면 NG 연결이 유지된 것이므로 suspend 로 보고 INACTIVE 로 둠(세지 않음).
  *     표준 순서상 완전 해제에서는 NG 해제가 F1 해제보다 먼저 와 그 표시가 제때 섬.
- *   부작용: 해제 카운터 증가 가능, 게이지 감소, 연결모드 갱신, 닫힘 줄 방출, 레코드 회수 */
+ *   부작용: 수립 실패 원인 카운팅, 해제 카운터 증가 가능, 게이지 감소, 연결모드 갱신, 닫힘 줄 방출,
+ *     레코드 회수 */
 static void on_ctx_release_complete(struct tr *tr, const struct obs_event *event)
 {
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
 	if (!ue_record) return;
-	// 닫힘 줄의 변경 비트는 이 핸들러가 실제로 바꾼 칸만 실음
-	int rrc_state_before = ue_record->rrc_state, nas_conn_mode_before = ue_record->nas_conn_mode;
-	if (ue_record->setup_state == SR_OPEN) {
-		// 명령을 못 본 채 완료가 옴 -> 원인 없는 미상
-		int cell_index = (ue_record->att_cell_index >= 0) ? ue_record->att_cell_index
-								 : ue_record->req_cell_index;
-		if (cell_index >= 0)
-			tr->cell_records[cell_index]
-				.cc_unknown_nocause[TR_METRIC_RRC_CONN_ESTAB_FAIL_CAUSE]++;
-		settle_open_setup(tr, ue_record, SR_UNKNOWN);
-	}
+	/* 수립이 아직 열린 채로 완료가 왔으면 응답 대기가 해제로 끝난 것이므로 Other 로 셈.
+	 *   TS 28.552 §5.1.1.15.3 c) "Each expected RRCSetupComplete message unreceived by the gNB
+	 *   after the RRCSetup message is added to the subcounter for cause 'NoReply'; and each failed
+	 *   RRC connection establishment caused by the other reasons is added to measurement cause
+	 *   'Other'." 마감이 먼저 떨어졌으면 상태가 열려 있지 않아 센 무응답이 그대로 남음 */
+	close_setup_other(tr, ue_record);
 	gauge_leave_conn(tr, ue_record);     // 게이지 감소는 명령이 아니라 완료에서 함
 	half_open_leave(tr, ue_record);
 	/* N2 와 매칭된 경우에만 추론함. 매칭이 없으면 추론을 금지하고 명령 핸들러가 남긴 미상을 유지함 -
 	 * F1 만 보이는 캡처에서 허위 INACTIVE 를 만들지 않으려는 것임. 암호 INACTIVE 의 게이지 기여는
 	 * 판정이 늦어 관측할 수 없고 그것이 암호 구간의 한계임 */
 	if (!ue_record->suspend_resolved && ue_record->rel_had_container && ue_record->has_n2_pair) {
-		ue_record->rel_inferred = 1;   // 아래 상태는 평문 관측이 아니라 추론이므로 교차 등급임
+   // 아래 상태는 평문 관측이 아니라 추론이므로 교차 등급임
 		enum tr_metric metric = TR_METRIC_RRC_REL_WITHOUT_SUSPEND;
 		if (ue_record->n2_released) {        // 창 안에 NG 해제가 옴 -> 완전 해제 -> 추론 계수
 			if (ue_record->est_cell_index >= 0) {
@@ -2390,7 +2171,7 @@ static void on_ctx_release_complete(struct tr *tr, const struct obs_event *event
 			}
 			else if (ue_record->req_cell_index >= 0)
 				tr->cell_records[ue_record->req_cell_index]
-					.cc_excluded[metric][TR_EXCLUDED_EST_CELL_UNKNOWN][0]++;
+					.cc_excluded[metric][TR_EXCLUDED_EST_CELL_UNKNOWN]++;
 			ue_record->rrc_state = RS_RELEASED;
 		} else {                     // NG 연결 유지 -> suspend 추론 -> INACTIVE(세지 않음)
 			ue_record->rrc_state = RS_INACTIVE;
@@ -2401,10 +2182,6 @@ static void on_ctx_release_complete(struct tr *tr, const struct obs_event *event
 	 * IDLE 로 내리지 않음 */
 	if (ue_record->nas_conn_mode == TR_CM_MODE_CONNECTED && ue_record->rrc_state != RS_INACTIVE)
 		ue_record->nas_conn_mode = TR_CM_MODE_IDLE;
-	uint32_t changed_mask = 0;
-	if (ue_record->rrc_state != rrc_state_before) changed_mask |= TR_UE_F_RRC_STATE;
-	if (ue_record->nas_conn_mode != nas_conn_mode_before)   changed_mask |= TR_UE_F_NAS_STATE;
-	emit_ue_line(tr, ue_record, event, changed_mask, 1);
 	ue_record_free(tr, ue_record);
 }
 
@@ -2448,9 +2225,9 @@ static void on_reset(struct tr *tr, const struct obs_event *event)
 	int listed_count = event->payload.reset.ue_count > 0 ? event->payload.reset.ue_count : 0;
 	int overflow_count = event->payload.reset.ue_overflow_count > 0
 			   ? event->payload.reset.ue_overflow_count : 0;
-	tr->reset_unresolved_count += (uint32_t)overflow_count;
+	tr->stats.reset_unresolved_count += (uint32_t)overflow_count;
 	if (!event->payload.reset.ues) {
-		tr->reset_unresolved_count += (uint32_t)listed_count;
+		tr->stats.reset_unresolved_count += (uint32_t)listed_count;
 		return;
 	}
 	for (int ue_index = 0; ue_index < listed_count; ue_index++) {
@@ -2458,7 +2235,7 @@ static void on_reset(struct tr *tr, const struct obs_event *event)
 		struct tr_ue_record *ue_record = ue_lookup(tr, &reset_ue->f1ue, 0, event->assoc_id);
 		if (!ue_record) {
 			// libobs 가 못 찾았거나(CU 번호만 온 항목) 우리에게 레코드가 없음. 둘 다 '가리키지 못함' 임
-			tr->reset_unresolved_count++;
+			tr->stats.reset_unresolved_count++;
 			continue;
 		}
 		close_setup_other(tr, ue_record);
@@ -2499,13 +2276,10 @@ static void on_ue_replaced(struct tr *tr, const struct obs_event *event)
 	/* 번호 재사용은 해제 명령 없이 끝나는 것이므로 미상으로 닫음. RELEASED 와 INACTIVE 는 유지함 -
 	 * 끝 신호가 RRC 결과를 알려 주지 않기 때문임. 종전엔 CONNECTED, 수립 대기 상태를 그대로 둬
 	 * 닫힘 줄이 과신이었음. 바뀌면 변경 비트에 RRC 상태를 실음 */
-	uint32_t changed_mask = 0;
 	if (ue_record->rrc_state != RS_RELEASED && ue_record->rrc_state != RS_INACTIVE
 	    && ue_record->rrc_state != RS_UNKNOWN) {
 		ue_record->rrc_state = RS_UNKNOWN;
-		changed_mask |= TR_UE_F_RRC_STATE;
 	}
-	emit_ue_line(tr, ue_record, event, changed_mask, 1);
 	ue_record_free(tr, ue_record);
 }
 
@@ -2526,7 +2300,7 @@ static void on_ue_evicted(struct tr *tr, const struct obs_event *event)
 	half_open_leave(tr, ue_record);
 	open_list_remove(tr, ue_record);
 	if (was_in_gauge && cell_index >= 0) tr->cell_records[cell_index].evicted_this_period = 1;
-	tr->lost_evicted_count++;
+	tr->stats.lost_evicted_count++;
 	ue_record_free(tr, ue_record);
 }
 
@@ -2635,17 +2409,14 @@ static void on_smc(struct tr *tr, const struct obs_event *event)
 {
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
 	if (!ue_record) return;
-	uint32_t changed_mask = 0;
 	if (event->kind == TR_EVENT_RRC_SMC) {
 		ue_record->ciph_alg = event->payload.smc.ciph_alg;
 		ue_record->integ_alg = event->payload.smc.integ_alg;
 		ue_record->ciph_alg_now = ue_record->ciph_alg;
 		ue_record->integ_alg_now = ue_record->integ_alg;
 		ue_record->has_alg = 1;
-		changed_mask |= TR_UE_F_ALG;
 		ue_record->rrc_sec_state = TR_SEC_CMD_SENT;   // 하행 보안 모드 명령 -> 명령 보냄
 		ue_record->rrc_sec_quality = TR_QUALITY_EXACT;
-		changed_mask |= TR_UE_F_SEC;
 	} else { /* 알고리즘을 바꾸는 재설정: 지금 값의 변경만 관측함 */
 		int new_ciph_alg = event->payload.smc.ciph_alg, new_integ_alg = event->payload.smc.integ_alg;
 		/* '명령 뒤' 라는 말이 성립하려면 명령을 봤어야 함. 안 보고 비교하면 초기값과 달랐다는 사실이
@@ -2654,19 +2425,10 @@ static void on_smc(struct tr *tr, const struct obs_event *event)
 		    && ((new_ciph_alg >= 0 && new_ciph_alg != ue_record->ciph_alg_now)
 			|| (new_integ_alg >= 0 && new_integ_alg != ue_record->integ_alg_now))) {
 			ue_record->alg_changed_after_smc = 1;
-			changed_mask |= TR_UE_F_ALG;
 		}
 		if (new_ciph_alg >= 0) ue_record->ciph_alg_now = new_ciph_alg;
 		if (new_integ_alg >= 0) ue_record->integ_alg_now = new_integ_alg;
 	}
-	emit_ue_line(tr, ue_record, event, changed_mask, 0);
-}
-
-// on_alg_opportunity: 알고리즘을 바꿀 수 있었던 재설정 수. 바뀌었는지와 무관하게 기회만 셈
-static void on_alg_opportunity(struct tr *tr, const struct obs_event *event)
-{
-	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 1, event->assoc_id);
-	if (ue_record) ue_record->alg_change_opportunity_count++;
 }
 
 /* on_smc_result: AS 보안 모드 완료 또는 실패로 보안 상태를 확정함.
@@ -2678,7 +2440,6 @@ static void on_smc_result(struct tr *tr, const struct obs_event *event)
 	ue_record->rrc_sec_state = (event->kind == TR_EVENT_RRC_SMC_COMPLETE) ? TR_SEC_ACTIVE
 									      : TR_SEC_FAILED;
 	ue_record->rrc_sec_quality = TR_QUALITY_EXACT;
-	emit_ue_line(tr, ue_record, event, TR_UE_F_SEC, 0);
 }
 
 /* on_rrc_dcch_opaque: 탭을 붙이기 전부터 연결돼 있던 단말을 미상 연결 모집단에 넣음.
@@ -2725,9 +2486,7 @@ static void on_ue_ctx_setup(struct tr *tr, const struct obs_event *event)
 		}
 	}
 	if (event->payload.ue_ctx_setup.has_crnti) {
-		ue_record->crnti = event->payload.ue_ctx_setup.crnti;
-		ue_record->has_crnti = 1;
-		emit_ue_line(tr, ue_record, event, TR_UE_F_CRNTI, 0);
+
 	}
 }
 
@@ -2737,7 +2496,7 @@ static void on_ue_ctx_setup(struct tr *tr, const struct obs_event *event)
  *   is incremented by 1" - 메시지 송신 자체가 발화 조건임 */
 static void on_initial_ue_msg(struct tr *tr, const struct obs_event *event)
 {
-	tr->n2_observed = 1;
+	tr->n2_ever_observed = 1;
 	int cell_index = cell_lookup(tr, &event->cell, 1);
 	int est_cause = event->payload.initial_ue.est_cause;
 	enum tr_metric metric = TR_METRIC_UECNTX_CONN_ESTAB_ATT;
@@ -2763,7 +2522,7 @@ static void on_initial_ue_msg(struct tr *tr, const struct obs_event *event)
  *     세어야 함. 종전에는 기록만 하고 읽지 않아 쓰이지 않는 칸이었음 */
 static void on_amf_dl(struct tr *tr, const struct obs_event *event)
 {
-	tr->n2_observed = 1;
+	tr->n2_ever_observed = 1;
 	if (!event->payload.amf_dl.first_for_ran_ue_ngap_id || !event->n2ue.valid) return;
 	struct tr_n2_record *n2_record = n2_lookup(tr, event->assoc_id, event->n2ue.ran_ue_ngap_id, 0);
 	if (!n2_record || n2_record->uli_cell_index < 0 || n2_record->amf_id_seen) return;
@@ -2783,7 +2542,7 @@ static void on_amf_dl(struct tr *tr, const struct obs_event *event)
  *     표 I 에 변화가 없고 줄도 내지 않음 */
 static void on_ng_release_cmd(struct tr *tr, const struct obs_event *event)
 {
-	tr->n2_observed = 1;
+	tr->n2_ever_observed = 1;
 	if (!event->f1ue.valid) return;   // 매칭된 F1 이 없으면 표 I 에 반영할 대상이 없음
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
 	if (!ue_record) return;
@@ -2797,13 +2556,12 @@ static void on_ng_release_cmd(struct tr *tr, const struct obs_event *event)
 	if (ue_record->in_inactive) {
 		gauge_leave_inactive(tr, ue_record);
 		ue_record->rrc_state = RS_RELEASED;
-		ue_record->rel_inferred = 1;
+
 	}
 	if (event->payload.ng_cause.cause_group == TR_NGAP_CAUSE_GRP_NAS &&
 	    event->payload.ng_cause.cause_value == TR_NGAP_CAUSE_NAS_DEREGISTER) {
 		ue_record->nas_reg_state = TR_5GMM_DEREGISTERED;
 		ue_record->nas_state_quality = TR_QUALITY_CROSS;
-		emit_ue_line(tr, ue_record, event, TR_UE_F_NAS_STATE, 0);
 	}
 }
 
@@ -2822,7 +2580,7 @@ static void on_ng_release_cmd(struct tr *tr, const struct obs_event *event)
  *     연결에서 INACTIVE 로 옮김, 표 I 줄 방출. 평문으로 이미 판정된 단말은 덮지 않고 경고만 올림 */
 static void on_rrc_state_report(struct tr *tr, const struct obs_event *event)
 {
-	tr->n2_observed = 1;
+	tr->n2_ever_observed = 1;
 	int rrc_state = event->payload.rrc_state_report.rrc_state;
 	if (rrc_state != TR_NGAP_RRC_STATE_INACTIVE) return;   // connected 와 확장값은 전이를 만들지 않음
 
@@ -2836,7 +2594,7 @@ static void on_rrc_state_report(struct tr *tr, const struct obs_event *event)
 	bool already_inactive = ue_record && ue_record->rrc_state == RS_INACTIVE;
 	/* 전제 위반 경보는 매칭된 F1 이 없어도 올림 - 이 보고 자체가 "망이 RRC_INACTIVE 를 쓴다" 는
 	 * 증거이고, 전제는 단말이 아니라 배치에 대한 것임 */
-	if (tr->tr_cfg.assume_no_inactive && !already_inactive) tr->inactive_alarm_count++;
+	if (!already_inactive) tr->stats.inactive_observed_count++;
 
 	if (!ue_record || already_inactive) return;   // 매칭된 F1 이 없으면 표 I 에 반영할 대상이 없음
 
@@ -2864,15 +2622,14 @@ static void on_rrc_state_report(struct tr *tr, const struct obs_event *event)
 	gauge_leave_conn(tr, ue_record);
 	half_open_leave(tr, ue_record);
 	ue_record->rrc_state = RS_INACTIVE;
-	ue_record->rel_inferred = 1;   // N2 교차 귀속이라 상태 등급은 교차임
+   // N2 교차 귀속이라 상태 등급은 교차임
 	gauge_enter_inactive(tr, ue_record, release_cell, LV_EXACT);
-	emit_ue_line(tr, ue_record, event, TR_UE_F_RRC_STATE, 0);
 }
 
 // on_overload_start: AMF 과부하 시작. 과부하 판정이 읽을 입력을 AMF 레코드에 담음
 static void on_overload_start(struct tr *tr, const struct obs_event *event)
 {
-	tr->n2_observed = 1;
+	tr->n2_ever_observed = 1;
 	uint64_t amf_key = event->amf_id ? ((uint64_t)event->amf_id | (1ull << 40))
 					 : ((uint64_t)event->assoc_id);
 	struct tr_amf_record *amf_record = amf_lookup(tr, amf_key, 1);
@@ -2889,7 +2646,7 @@ static void on_overload_start(struct tr *tr, const struct obs_event *event)
 // on_overload_stop: AMF 과부하 종료. 과부하 내용을 비움
 static void on_overload_stop(struct tr *tr, const struct obs_event *event)
 {
-	tr->n2_observed = 1;
+	tr->n2_ever_observed = 1;
 	uint64_t amf_key = event->amf_id ? ((uint64_t)event->amf_id | (1ull << 40))
 					 : ((uint64_t)event->assoc_id);
 	struct tr_amf_record *amf_record = amf_lookup(tr, amf_key, 0);
@@ -2905,7 +2662,7 @@ static void on_overload_stop(struct tr *tr, const struct obs_event *event)
 // on_ng_setup: NG SETUP 성공으로 그 AMF 의 과부하 상태를 초기화함
 static void on_ng_setup(struct tr *tr, const struct obs_event *event)
 {
-	tr->n2_observed = 1;
+	tr->n2_ever_observed = 1;
 	if (event->payload.ng_setup.outcome_failure) return;
 	uint64_t amf_key = event->amf_id ? ((uint64_t)event->amf_id | (1ull << 40))
 					 : ((uint64_t)event->assoc_id);
@@ -2926,7 +2683,7 @@ static void on_ng_setup(struct tr *tr, const struct obs_event *event)
  *   부작용: 표 I 의 마지막 NAS, NAS 보안 상태, 5GMM 주상태와 연결모드 갱신, 표 I 줄 방출 */
 static void on_nas(struct tr *tr, const struct obs_event *event)
 {
-	if (event->iface == TR_IFACE_N2) tr->n2_observed = 1;
+	if (event->iface == TR_IFACE_N2) tr->n2_ever_observed = 1;
 	struct tr_ue_record *ue_record = ue_lookup(tr, &event->f1ue, 0, event->assoc_id);
 	if (!ue_record) return;
 	/* NAS Non Delivery Indication 에 실린 NAS 는 기지국이 단말에 전달하지 못한 하행임 -> 단말은 받지
@@ -2947,7 +2704,7 @@ static void on_nas(struct tr *tr, const struct obs_event *event)
 	 * 있었음 - 첫 명령에서는 학습 전이라 음수이고, 그 뒤 보호된 NAS 줄에서 뒤늦게 들어와 엉뚱한
 	 * 메시지에 귀속됐음 */
 	if (event->payload.nas.smc_ciph_alg >= 0)
-		ue_record->nas_ciph_alg = event->payload.nas.smc_ciph_alg;
+
 	// libnas 가 확장 프로토콜 판별자를 보안 헤더보다 먼저 세우므로 '헤더는 읽고 판별자는 못 읽음' 은 도달 불가임
 	ue_record->last_nas_epd = event->payload.nas.epd;
 	if (event->payload.nas.parse_ok) ue_record->has_last_nas = 1;
@@ -2957,7 +2714,6 @@ static void on_nas(struct tr *tr, const struct obs_event *event)
 									   : TR_QUALITY_STRUCT)
 				   : event->quality;
 	// NAS 보안 상태는 보안 헤더 종류로만 유도함(암호 구간에서도 가능). 0 평문, 1/2 보호, 3 명령, 4 완료
-	int nas_sec_state_before = ue_record->nas_sec_state;
 	/* 전진 조건 둘을 여기서 한 칸으로 묶음.
 	 *   형식 오류 PDU 의 보안 헤더 니블은 공격자가 고른 바이트임. AMF 도 버릴 메시지이므로 보안 상태를
 	 *     전진시키지 않음. 종전엔 두 바이트가 보안 헤더 4 로 읽혀 NAS 보안 ACTIVE 를 평문 관측 등급
@@ -2996,15 +2752,12 @@ static void on_nas(struct tr *tr, const struct obs_event *event)
 		break;
 	}
 	// 5GMM 주상태와 연결모드. N2 NAS 는 교차 귀속으로 F1 단말에 붙음
-	uint32_t changed_mask = TR_UE_F_NAS_MSG;
 	/* NAS 보안 상태 전이도 변경 비트에 실음. 종전엔 그 비트가 AS 보안에서만 세워져 NAS 쪽 전이가
 	 * 변경 목록에서 사라졌음. 비트 하나를 AS 와 NAS 가 함께 쓰는데, 나누는 것은 출력 형식 변경이라
 	 * 지금 하지 않음 */
-	if (ue_record->nas_sec_state != nas_sec_state_before) changed_mask |= TR_UE_F_SEC;
 	if (event->iface == TR_IFACE_N2 && event->direction == TR_DIRECTION_DOWN
 	    && ue_record->nas_conn_mode != TR_CM_MODE_CONNECTED) {
 		ue_record->nas_conn_mode = TR_CM_MODE_CONNECTED;   // 첫 AMF 하행 NAS -> 연결모드 CONNECTED
-		changed_mask |= TR_UE_F_NAS_STATE;
 	}
 	int nas_msg_type = event->payload.nas.msg_type, mm_cause = event->payload.nas.mm_cause,
 	    nas_reg_state = -1;
@@ -3078,9 +2831,7 @@ static void on_nas(struct tr *tr, const struct obs_event *event)
 			: (event->payload.nas.msg_type_inferred
 			   ? ((event->quality > TR_QUALITY_STRUCT) ? event->quality : TR_QUALITY_STRUCT)
 			   : event->quality);
-		changed_mask |= TR_UE_F_NAS_STATE;
 	}
-	emit_ue_line(tr, ue_record, event, changed_mask, 0);
 }
 // ---- 공개 API ----
 /* tr_new: 집계 엔진 하나를 만듬.
@@ -3118,11 +2869,419 @@ void tr_advance(struct tr *tr, uint64_t now_ns)
  *   이미 닫힌 주기의 이벤트는 반영할 칸이 없으므로 버리고 그 수를 셈 - 버린 사실을 남기지 않으면
  *     "그런 이벤트가 없었다" 와 같은 모양이 됨.
  *   부작용: 주기 경계를 넘으면 그 주기를 방출함. 처리 뒤 자기 검사를 돌림 */
+/* ---- 탐지 줄 변환: 관측 이벤트 하나를 단말 줄 또는 DU 줄로 ----
+ *
+ * [1] 두 단계로 나눔. 1단계가 이벤트 종류를 프로토콜과 메시지 이름으로 바꾸고, 2단계가 그 종류만
+ *     싣는 값을 꺼냄. 한 switch 에 합치면 종류마다 두 관심사가 섞여 어느 분기가 어느 값을
+ *     빠뜨렸는지 보이지 않음.
+ *
+ *       obs_event --+-- [1] 종류 -> proto, msg_name, 방향 --+-- 관문 --+-- [2] 값 -> fields --> on_ue_event
+ *                   |                                                  |
+ *                   +-- F1 SETUP / RESET ------------------------------+------------------------> on_f1_event
+ *
+ * [2] 이름표를 여기 두지 않음. NAS 메시지 이름, 등록 유형, 신원 종류, NAS 알고리즘 철자는 출력 층이
+ *     번호에서 만듦. 여기 한 벌 더 두면 두 표가 어긋남 - 번호만 넘김.
+ *
+ * [3] 내보내지 않은 것은 이유마다 따로 셈. 수동 관측자는 다시 달라고 할 수 없으므로 '내보내지
+ *     않았다' 를 남기지 않으면 '그런 메시지가 없었다' 와 같은 모양이 됨.
+ */
+
+/* libobs 가 자르는 상한과 같은 값임(그쪽 ASSOC_CELL_MAX, RESET_UE_MAX). 여기서 한 번 더 막는 이유:
+ *   저 상한이 올라도 이 스택 배열은 안 커지므로, 넘치면 잘라 내고 센다 */
+#define F1_EVENT_CELL_MAX 8
+#define F1_EVENT_UE_MAX   256
+
+/* cell_number_for: 줄에 싣는 셀 번호. NR Cell Identity 36비트를 그대로 씀.
+ *   이유: 받는 쪽이 요구하는 것은 '셀을 가르는 0 이상 정수' 하나이고, NR Cell Identity 를 그대로
+ *     쓰면 그 번호가 실제 셀로 되짚어지며 주기 줄과 단말 줄과 DU 줄이 같은 번호를 씀. 세션마다
+ *     새로 매기는 순번은 같은 녹화를 다시 볼 때 같은 셀에 다른 번호를 줘 대조가 안 됨.
+ *   잃는 것: PLMN 이 다른 두 셀이 같은 NR Cell Identity 를 쓰면 한 번호로 보임. 그 수를 세어
+ *     조용히 합쳐지지 않게 함. 내부 셀 표는 (PLMN, NR Cell Identity) 전체를 키로 쓰므로 집계
+ *     자체는 갈려 있고, 합쳐져 보이는 것은 내보내는 번호뿐임. */
+
+/* emit_f1_event: F1 SETUP 과 RESET 을 DU 줄로 내보냄.
+ *   단말 줄이 아님 - DU 단말 번호와 C-RNTI 가 없고 셀이 여럿이라 아래 단말 관문을 지나지 않음.
+ *   쓰임: 받는 쪽이 그 셀들에 쌓아 둔 단말 표를 비움.
+ *   셀 번호 배열과 단말 번호 배열은 빌려 주는 것이라 콜백이 돌아가는 동안만 유효함. */
+static void emit_f1_event(struct tr *tr, const struct obs_event *event)
+{
+	if (!tr->sink_ops.on_f1_event) return;
+	uint64_t cell_numbers[F1_EVENT_CELL_MAX];
+	int cell_number_count = 0;
+	bool cells_known = event->payload.reset.cells_known;
+	for (int i = 0; i < event->payload.reset.cell_count; i++) {
+		const struct tr_nr_cgi *cell = &event->payload.reset.cells[i];
+		int cell_index = cell->valid ? cell_lookup(tr, cell, 1) : -1;
+		if (cell_index < 0 || cell_number_count == F1_EVENT_CELL_MAX) {
+			/* 한 셀이라도 번호를 못 주면 목록이 불완전함. 불완전한 목록을 보내면 빠진 셀의 단말이
+			 * 닫히지 않으므로 '모든 셀' 로 내림 - 과도하게 닫는 쪽이 유령을 남기는 쪽보다 나음 */
+			tr->stats.f1_event_cells_unknown_count++;
+			cells_known = false;
+			continue;
+		}
+		cell_numbers[cell_number_count++] = cell_number_for(tr, cell);
+	}
+
+	/* 일부 단말만 대상인 RESET 은 DU 번호가 있는 항목만 보냄. CU 번호만 실린 항목은 가리킬 수 없음
+	 *   (TS 38.473 §8.2.1.2.1 이 "gNB-CU UE F1AP ID IE and/or gNB-DU UE F1AP ID IE" 라 둘 중 하나만
+	 *   실어도 됨). 그 수를 세어 둠 - 목록에서 빠지면 그 단말이 닫히지 않고, 목록 없이 보내면 그 DU 의
+	 *   전 단말을 닫아 양방향으로 틀림 */
+	uint32_t du_ue_ids[F1_EVENT_UE_MAX];
+	int du_ue_id_count = 0;
+	bool part_of_interface = event->payload.reset.scope != TR_SCOPE_ALL;
+	if (part_of_interface) {
+		for (int i = 0; i < event->payload.reset.ue_count; i++) {
+			if (!event->payload.reset.ues[i].has_du_ue_id || du_ue_id_count == F1_EVENT_UE_MAX) {
+				tr->stats.f1_event_du_ue_id_missing_count++;
+				continue;
+			}
+			du_ue_ids[du_ue_id_count++] = event->payload.reset.ues[i].du_ue_id;
+		}
+		tr->stats.f1_event_du_ue_id_missing_count += (uint64_t)event->payload.reset.ue_overflow_count;
+	}
+
+	struct report_f1_event f1_event = {
+		.t_ms           = event->wallclock_ns / 1000000ull,
+		.kind           = (event->kind == TR_EVENT_F1_SETUP) ? REPORT_F1_KIND_SETUP : REPORT_F1_KIND_RESET,
+		.cells_known    = cells_known,
+		.cell_ids       = cells_known ? cell_numbers : NULL,
+		.cell_count     = cells_known ? cell_number_count : 0,
+		.du_ue_ids      = part_of_interface ? du_ue_ids : NULL,
+		.du_ue_id_count = part_of_interface ? du_ue_id_count : 0,
+	};
+	tr->sink_ops.on_f1_event(tr->user_ctx, &f1_event);
+}
+
+/* ue_event_init: 단말 줄의 센티널 칸을 손으로 채움.
+ *   이유: 0 이 정상값인 칸이 셋 있어서 0 으로만 채우면 거짓이 나감. 특히 보안 헤더 종류 0 은
+ *     '평문' 이라는 뜻이라, 안 채운 NAS 줄이 전부 평문으로 보고됨. 모든 줄이 이 함수를 지나게 함 */
+static void ue_event_init(struct report_ue_event *ue_event)
+{
+	memset(ue_event, 0, sizeof *ue_event);
+	ue_event->nas_msg_type = -1;         // -1 = 종류를 못 읽음
+	ue_event->sht          = -1;         // -1 = 보안 헤더가 없음(0 은 평문이라는 뜻)
+	ue_event->fields.id_type = -1;       // -1 = 못 읽음(0 은 신원 없음이라는 뜻)
+}
+
+/* fill_nas_line: NAS 값을 단말 줄에 채움. 내보낼 수 없으면 거짓을 돌려주고 이유를 셈.
+ *   관문 네 개와 그 이유.
+ *     전달되지 않은 NAS   관측 층이 방향을 NGAP 절차 방향으로 둬서 하행 메시지가 상행으로 나감.
+ *                         또한 전달 실패한 수락 메시지가 '망이 수락했다' 로 읽힘
+ *     해석 실패           읽지 못한 것을 읽은 것처럼 내보내지 않음
+ *     보안 헤더 방향 위반  규격이 한 방향에만 쓰도록 둔 보안 헤더가 반대로 왔음 = 조작으로만 생김
+ *     5GMM 이 아님        5GSM 자리의 값을 5GMM 표로 조회하면 전혀 다른 메시지 이름이 붙음
+ *   메시지 이름은 넣지 않음 - 출력 층이 판별자와 번호로 만듦. 여기 이름표를 두면 두 표가 어긋남. */
+static bool fill_nas_line(struct tr *tr, const struct obs_nas_values *nas,
+			  enum report_nas_via via, struct report_ue_event *ue_event)
+{
+	if (nas->non_delivered) {
+		tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_NAS_NON_DELIVERED]++;
+		return false;
+	}
+	if (!nas->parse_ok || !nas->sec_header_direction_ok) {
+		tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_NAS_REJECTED]++;
+		return false;
+	}
+	if (nas->epd != NAS_EPD_5GMM) {
+		tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_NAS_NOT_5GMM]++;
+		return false;
+	}
+	if (nas->msg_type >= 0) {
+		ue_event->nas_msg_type = nas->msg_type;
+		/* 추론으로 얻은 종류도 그대로 실음. 전제 둘(보안 헤더 종류와 방향)이 다 확인된 뒤에만
+		 * 관측 층이 추론하므로 근거가 있고, -1 로 내리면 보안 수립을 본 사실이 사라져 받는 쪽의
+		 * 인증 단계 판정이 서지 않음. 줄에는 추론임을 적을 칸이 없으므로 그 수를 세어 둠 */
+		if (nas->msg_type_inferred) tr->stats.nas_msg_type_inferred_count++;
+	} else if (nas->inner_readable) {
+		/* 안쪽을 읽었는데 종류가 없음. 관측 층이 담지 않은 값이라 우리도 짓지 않음 */
+		tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_NAS_UNMAPPED]++;
+		return false;
+	}
+	// 그 밖은 nas_msg_type 이 -1 로 남음. 암호화돼 종류를 모른다는 사실 자체가 판정에 쓰임
+
+	ue_event->nas_epd = nas->epd;
+	ue_event->via     = via;
+	ue_event->sht     = nas->sht;
+
+	struct report_ue_fields *fields = &ue_event->fields;
+	if (nas->reg_type >= 0)  { fields->has_reg_type = true;   fields->reg_type = nas->reg_type; }
+	fields->id_type = nas->id_type;
+	if (nas->switch_off >= 0) { fields->has_switch_off = true; fields->switch_off = nas->switch_off != 0; }
+	if (nas->mm_cause >= 0)  { fields->has_nas_cause = true;  fields->nas_cause = nas->mm_cause; }
+	if (nas->has_stmsi48)    { fields->has_s_tmsi = true;     fields->s_tmsi = nas->stmsi48; }
+	if (nas->smc_ciph_alg >= 0) {
+		fields->has_nas_algorithm         = true;
+		fields->nas_ciphering_algorithm   = nas->smc_ciph_alg;
+		fields->nas_integrity_algorithm   = nas->smc_integ_alg;
+	}
+	return true;
+}
+
+/* fill_rrc_fields: RRC 와 F1AP 줄이 싣는 값을 채움.
+ *   종류마다 싣는 값이 다르므로 그 종류만 꺼냄. 값이 없는 칸은 출력 층이 키를 뺌. */
+static void fill_rrc_fields(const struct obs_event *event, struct report_ue_event *ue_event)
+{
+	struct report_ue_fields *fields = &ue_event->fields;
+	switch (event->kind) {
+	case TR_EVENT_RRC_SETUP_REQUEST: {
+		const char *est_cause_name = tr_cause_name(TR_METRIC_RRC_CONN_ESTAB_ATT,
+							   event->payload.setup_request.est_cause);
+		if (est_cause_name && est_cause_name[0]) {
+			fields->has_est_cause = true;
+			fields->est_cause     = est_cause_name;
+		}
+		if (event->payload.setup_request.ue_identity_type != TR_UE_IDENTITY_NONE) {
+			fields->has_ue_identity      = true;
+			fields->is_ue_identity_part1 = event->payload.setup_request.ue_identity_type
+						       == TR_UE_IDENTITY_STMSI_PART1;
+			fields->ue_identity_part1    = event->payload.setup_request.ue_identity39;
+		}
+		break;
+	}
+	case TR_EVENT_RRC_SETUP_COMPLETE:
+		if (event->payload.setup_complete.has_stmsi48) {
+			fields->has_s_tmsi = true;
+			fields->s_tmsi     = event->payload.setup_complete.stmsi48;
+		}
+		if (event->payload.setup_complete.has_stmsi_part2) {
+			fields->has_s_tmsi_part2 = true;
+			fields->s_tmsi_part2     = event->payload.setup_complete.stmsi_part2;
+		}
+		break;
+	case TR_EVENT_RRC_REJECT:
+		if (event->payload.reject.has_wait_time) {
+			fields->has_wait_time = true;
+			fields->wait_time_s   = (uint32_t)event->payload.reject.wait_time_s;
+		}
+		break;
+	case TR_EVENT_RRC_SMC:
+	case TR_EVENT_RRC_RECONFIG_SEC:
+		/* 이름이 있을 때만 실음. 번호가 있는데 이름이 없으면 문법이 모르는 확장값이라 그 번호로
+		 * 이름을 지어낼 수 없음 - 암호 알고리즘은 받는 쪽이 평문 여부 판정에 쓰므로 특히 그럼 */
+		if (event->payload.smc.ciph_alg_name) {
+			fields->has_rrc_algorithm = true;
+			fields->cipher            = event->payload.smc.ciph_alg_name;
+			fields->integrity         = event->payload.smc.integ_alg_name;
+		}
+		break;
+	case TR_EVENT_RRC_RELEASE:
+		fields->has_suspend = true;
+		fields->suspend     = event->payload.release.suspend == TR_SUSPEND_YES;
+		break;
+	case TR_EVENT_F1_UE_CTX_RELEASE_REQ:
+	case TR_EVENT_F1_UE_CTX_RELEASE_CMD:
+		/* 두 메시지 다 Cause 를 실음. 한쪽만 내면 형제 비대칭임.
+		 * 관문은 그 Cause 의 유무 플래그여야 함 - 모양이 비슷한 다른 IE 의 플래그를 쓰면 Cause 가
+		 * 있는데 안 나가거나, 없는데 센티널 -1 이 이름으로 지어져 나감 */
+		if (event->payload.f1_release.cause_present
+		    && event->payload.f1_release.cause_group_name
+		    && event->payload.f1_release.cause_value_name) {
+			fields->has_f1ap_cause   = true;
+			fields->f1ap_cause_group = event->payload.f1_release.cause_group_name;
+			fields->f1ap_cause_value = event->payload.f1_release.cause_value_name;
+		}
+		break;
+	default:
+		break;   // 그 밖의 종류는 값 없이 메시지 이름만 냄
+	}
+}
+
+/* emit_ue_event: 관측 이벤트 하나를 단말 줄로 내보냄.
+ *   내보내지 않는 경우: 줄의 필수 칸(셀, 방향, 단말 키)을 채울 수 없음, 와이어에서 보지 않은 합성
+ *     이벤트, 전달되지 않은 NAS, 해석 실패 NAS. 전부 이유별로 셈.
+ *   부작용: 셀 표에 그 셀을 등록하고 통계를 갱신함. */
+static void emit_ue_event(struct tr *tr, const struct obs_event *event)
+{
+	if (!tr->sink_ops.on_ue_event) return;
+
+	const char *msg_name = NULL;
+	enum report_proto proto = REPORT_PROTO_NONE;
+	bool is_setup_complete = false;
+	/* 방향은 관측 층이 정함. F1AP 네 줄만 여기서 다시 고정하는 이유: 그 절차들은 규격이 방향을
+	 * 한쪽으로 못박아 둬서(TS 38.473 §8.3.1, §8.3.3) 이 위치에서 확실히 알 수 있음. 두 값이
+	 * 어긋나면 관측 층 결함이고 그 수를 셈. 종전에 해제 완료가 하행으로 나가 받는 쪽의 연결 종료
+	 * 판정이 영구 미발화된 일이 있어 이중으로 봄 */
+	enum tr_direction direction = event->direction;
+	enum tr_direction spec_direction = TR_DIRECTION_UNKNOWN;
+
+	switch (event->kind) {
+	case TR_EVENT_RRC_SETUP_REQUEST:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCSetupRequest";
+		break;
+	case TR_EVENT_RRC_REEST_REQUEST:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCReestablishmentRequest";
+		break;
+	case TR_EVENT_RRC_RESUME_REQUEST:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCResumeRequest";
+		break;
+	case TR_EVENT_RRC_SETUP:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCSetup";
+		break;
+	case TR_EVENT_RRC_REJECT:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCReject";
+		break;
+	case TR_EVENT_RRC_SETUP_COMPLETE:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCSetupComplete";
+		is_setup_complete = true;
+		break;
+	case TR_EVENT_RRC_SMC:
+		proto = REPORT_PROTO_RRC; msg_name = "SecurityModeCommand";
+		break;
+	case TR_EVENT_RRC_SMC_COMPLETE:
+		proto = REPORT_PROTO_RRC; msg_name = "SecurityModeComplete";
+		break;
+	case TR_EVENT_RRC_SMC_FAILURE:
+		proto = REPORT_PROTO_RRC; msg_name = "SecurityModeFailure";
+		break;
+	case TR_EVENT_RRC_REEST:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCReestablishment";
+		break;
+	case TR_EVENT_RRC_REEST_COMPLETE:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCReestablishmentComplete";
+		break;
+	case TR_EVENT_RRC_RESUME:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCResume";
+		break;
+	case TR_EVENT_RRC_RESUME_COMPLETE:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCResumeComplete";
+		break;
+	case TR_EVENT_RRC_RELEASE:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCRelease";
+		break;
+	case TR_EVENT_RRC_RECONFIG_SEC:
+		proto = REPORT_PROTO_RRC; msg_name = "RRCReconfiguration";
+		break;
+	case TR_EVENT_RRC_OTHER:
+		/* 이름표에서 못 찾은 RRC 전부가 이 종류로 오므로 단말 능력 두 줄만 통과시킴. 받는 쪽이
+		 * 능력 요청 수와 응답 수를 맞춰 보는 데 그 둘이 필요하고, 그 밖의 RRC 는 쓰는 곳이 없음.
+		 * 통과 못 하면 줄도 순번도 쓰지 않으므로 받는 쪽의 순번 연속성이 깨지지 않음 */
+		if (!event->payload.rrc_other.rrc_msg_name) return;
+		if (strcmp(event->payload.rrc_other.rrc_msg_name, "UECapabilityEnquiry") != 0
+		    && strcmp(event->payload.rrc_other.rrc_msg_name, "UECapabilityInformation") != 0)
+			return;
+		proto = REPORT_PROTO_RRC; msg_name = event->payload.rrc_other.rrc_msg_name;
+		break;
+	case TR_EVENT_F1_UE_CTX_SETUP:
+		proto = REPORT_PROTO_F1AP;
+		switch (event->payload.ue_ctx_setup.outcome) {
+		case TR_AP_OUTCOME_SUCCESS:
+			msg_name = "UEContextSetupResponse"; spec_direction = TR_DIRECTION_UP;
+			break;
+		case TR_AP_OUTCOME_FAILURE:
+			msg_name = "UEContextSetupFailure";  spec_direction = TR_DIRECTION_UP;
+			break;
+		default:
+			msg_name = "UEContextSetupRequest";  spec_direction = TR_DIRECTION_DOWN;
+			break;
+		}
+		break;
+	case TR_EVENT_F1_UE_CTX_RELEASE_REQ:
+		proto = REPORT_PROTO_F1AP; msg_name = "UEContextReleaseRequest";
+		spec_direction = TR_DIRECTION_UP;
+		break;
+	case TR_EVENT_F1_UE_CTX_RELEASE_CMD:
+		proto = REPORT_PROTO_F1AP; msg_name = "UEContextReleaseCommand";
+		spec_direction = TR_DIRECTION_DOWN;
+		break;
+	case TR_EVENT_F1_UE_CTX_RELEASE_COMPLETE:
+		/* 와이어에서 본 완료만 냄. 관측 층은 해제 명령 뒤 유예 안에 완료를 못 보면 게이지가 새지
+		 * 않게 이 이벤트를 합성하는데, 합성분을 내보내면 줄의 칸 집합이 관측한 줄과 똑같아 받는
+		 * 쪽이 가를 수 없음 = 확신 있는 오값. 우리는 참여자가 아니라 수동 관측자임.
+		 * 안 보내도 그 단말이 영구히 남지 않음: 연결 수 지표가 그 단말을 닫은 수로 내려가므로
+		 * 받는 쪽 표가 그 수보다 하나 많아지고, 그 차이로 남은 항목을 정리함 */
+		if (event->quality != TR_QUALITY_EXACT) {
+			tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_SYNTHETIC_RELEASE]++;
+			return;
+		}
+		proto = REPORT_PROTO_F1AP; msg_name = "UEContextReleaseComplete";
+		spec_direction = TR_DIRECTION_UP;
+		break;
+	case TR_EVENT_NG_NAS:
+		proto = REPORT_PROTO_NAS;
+		break;
+	case TR_EVENT_RRC_MALFORMED:
+		tr->stats.rrc_malformed_count++;
+		return;
+	case TR_EVENT_AP_DECODE_FAIL:
+		tr->stats.ap_decode_fail_count++;
+		return;
+	default:
+		return;   // 단말 줄이 아님
+	}
+	if (spec_direction != TR_DIRECTION_UNKNOWN) {
+		if (direction != spec_direction) tr->stats.ue_event_direction_disagree_count++;
+		direction = spec_direction;
+	}
+
+	/* 방향 미상이면 줄을 내지 않음. 방향 없는 줄은 받는 쪽이 형식 오류로 거부하는데, 거부된 줄의
+	 * 순번은 없던 유실로 보고됨. 그래서 순번을 쓰기 전에 빠져나가 세기만 함. 방향을 추측해 적지
+	 * 않는 이유는 한쪽으로 찍으면 그 값이 사실처럼 나가기 때문임 */
+	if (direction == TR_DIRECTION_UNKNOWN) {
+		tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_UNKNOWN_DIRECTION]++;
+		return;
+	}
+	/* 셀과 단말 키는 줄의 필수 칸임. 미상이면 유효한 줄을 못 내므로 건너뛰되 셈. 조용히 빠져나가면
+	 * 중간에 합류한 단말(NR-CGI 를 실은 F1AP 를 못 본 단말)의 줄이 전부 사라지는데 양쪽 어디에도
+	 * 신호가 없음 - 받는 쪽은 단말 항목 자체를 못 만들어 진단조차 낼 수 없음 */
+	if (!event->cell.valid) {
+		tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_NO_CELL]++;
+		return;
+	}
+	if (!event->f1ue.valid) {
+		tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_NO_UE_KEY]++;
+		return;
+	}
+	int cell_index = cell_lookup(tr, &event->cell, 1);
+	if (cell_index < 0) {
+		tr->stats.ue_event_skipped_count[TR_UE_EVENT_SKIP_NO_CELL]++;
+		return;
+	}
+
+	struct report_ue_event ue_event;
+	ue_event_init(&ue_event);
+	ue_event.t_ms      = event->wallclock_ns / 1000000ull;
+	ue_event.cell_id   = cell_number_for(tr, &event->cell);
+	ue_event.direction = (direction == TR_DIRECTION_UP) ? REPORT_DIRECTION_UL : REPORT_DIRECTION_DL;
+	ue_event.proto     = proto;
+	ue_event.msg_name  = msg_name;
+	/* 단말 번호 셋은 레코드가 들고 온 값 하나만 씀. 받는 쪽은 INITIAL UL RRC MESSAGE TRANSFER 에서
+	 * 얻은 C-RNTI 가 그 단말의 모든 줄에 붙어 있기를 요구함 - 페이로드에서 꺼내면 그 세 줄에만 실림 */
+	ue_event.has_du_ue_id = true;   // 위 관문이 f1ue.valid 를 요구하므로 여기서는 늘 있음
+	ue_event.du_ue_id     = event->f1ue.du_ue_id;
+	ue_event.has_cu_ue_id = event->f1ue.has_cu_ue_id;
+	ue_event.cu_ue_id     = event->f1ue.cu_ue_id;
+	ue_event.has_crnti    = event->f1ue.has_crnti;
+	ue_event.crnti        = event->f1ue.crnti;
+
+	if (proto == REPORT_PROTO_NAS && !fill_nas_line(tr, &event->payload.nas, REPORT_NAS_VIA_NGAP, &ue_event))
+		return;
+	if (proto != REPORT_PROTO_NAS)
+		fill_rrc_fields(event, &ue_event);
+	tr->sink_ops.on_ue_event(tr->user_ctx, &ue_event);
+
+	/* RRCSetupComplete 안에는 초기 NAS 가 평문으로 실려 옴. 그 NAS 는 RRC 줄과 다른 메시지이므로
+	 * 같은 단말 키와 같은 시각으로 줄을 하나 더 냄. 이 경로의 NAS 만 F1 에서 본 것이고 나머지는
+	 * N2 에서 봄 - 그 구분이 줄의 via 칸임 */
+	if (is_setup_complete) {
+		struct report_ue_event nas_event = ue_event;
+		nas_event.proto    = REPORT_PROTO_NAS;
+		nas_event.msg_name = NULL;
+		nas_event.fields   = (struct report_ue_fields){ .id_type = -1 };
+		if (fill_nas_line(tr, &event->payload.setup_complete.nas, REPORT_NAS_VIA_F1, &nas_event))
+			tr->sink_ops.on_ue_event(tr->user_ctx, &nas_event);
+	}
+}
+
 void tr_on_event(struct tr *tr, const struct obs_event *event)
 {
 	if (!tr || !event) return;
 	advance_to(tr, event->wallclock_ns);
-	if (event->wallclock_ns < tr->cur_start_ns) { tr->late_event_count++; return; }
+	/* 탐지 줄을 여기서 냄. advance_to 뒤인 이유: 그 호출이 끝난 주기의 줄을 이미 내보냈으므로
+	 * 주기 줄과 단말 줄의 순서가 시각 순으로 맞음. 늦은 이벤트 검사보다 앞인 이유: 집계에는 못
+	 * 넣어도 그 메시지를 본 사실은 줄로 남겨야 함 */
+	if (event->kind == TR_EVENT_F1_SETUP || event->kind == TR_EVENT_F1_RESET) emit_f1_event(tr, event);
+	else emit_ue_event(tr, event);
+	if (event->wallclock_ns < tr->cur_start_ns) { tr->stats.late_event_count++; return; }
 
 	switch (event->kind) {
 	case TR_EVENT_RRC_SETUP_REQUEST:
@@ -3209,7 +3368,8 @@ void tr_on_event(struct tr *tr, const struct obs_event *event)
 		on_smc_result(tr, event);
 		break;   // AS 보안 상태 확정
 	case TR_EVENT_F1_ALG_CHANGE_OPPORTUNITY:
-		on_alg_opportunity(tr, event);
+		/* libobs 가 이 종류를 발화하지 않음(obs.c 에 이름표 1건뿐이고 대입 0건). 핸들러를 두지
+		 * 않고 여기서 끝냄 - default 로 흘리면 enum 에 값이 늘 때 -Wswitch 가 못 잡음 */
 		break;
 	case TR_EVENT_F1_UE_CTX_SETUP:
 		on_ue_ctx_setup(tr, event);
@@ -3238,7 +3398,6 @@ void tr_on_event(struct tr *tr, const struct obs_event *event)
 	case TR_EVENT_NG_SETUP:
 		on_ng_setup(tr, event);
 		break;
-	case TR_EVENT_NAS_F1:
 	case TR_EVENT_NG_NAS:
 		on_nas(tr, event);
 		break;
@@ -3248,66 +3407,24 @@ void tr_on_event(struct tr *tr, const struct obs_event *event)
 	tr_self_check(tr);   // 게이지, 소속, 열린 수립 목록이 정합한지 검사(시험과 새니타이저 빌드에서만)
 }
 
-/* period_has_content: 지금 열려 있는 주기에 표 II 로 방출할 내용이 있는가.
- *   내용의 정의: close_period 가 주기마다 리셋하는 누적 중 실제 수치가 비어 있지 않은 것. 카운터와
- *     그 제외, 중첩, 경로 분해, 표본 수, 반쯤 열림 합, 엔진 수준의 늦은 이벤트와 축출 수가 여기 듦.
- *     순수 상태 플래그는 내용이 아니므로 뺌.
- *   이 집합은 close_period 의 리셋 집합을 그대로 비춤 - 누적을 하나 추가하면 양쪽을 같이 고칠 것.
- *     한쪽만 고치면 그 값이 유일한 내용인 주기가 조용히 사라짐.
- *   반환: 내용이 있으면 1, 없으면 0 */
-static int period_has_content(const struct tr *tr)
-{
-	if (tr->late_event_count || tr->lost_evicted_count) return 1;
-	/* 전제 위반 경보와 해제 근거 수도 보고 헤더에 실리는 내용임. 이들이 유일한 내용인 주기 -
-	 * suspendConfig 를 본 해제만 있었던 주기처럼 카운터가 하나도 오르지 않은 경우 - 가 종전엔
-	 * 조용히 드롭돼 '깨끗한 주기' 로 보였음 */
-	if (tr->inactive_alarm_count || tr->release_basis_observed_count
-	    || tr->release_basis_assumed_count) return 1;
-	/* 탭 전체의 커버리지 증가분도 내용임. 종전엔 늦은 이벤트, 축출, 셀 카운터와 표본만 봐서
-	 * tr_finish 의 길이 0 최종 주기가 TSN 공백, 링 버퍼 포화, ESP, IP 조각, 관측자 내부 유실을
-	 * 조용히 드롭했음. emit_coverage_only_period 의 손실 관문과 같은 집합으로 맞춤 */
-	#define COVERAGE_DELTA(cur, snap) ((cur) >= (snap) ? (cur) - (snap) : 0)
-	int has_coverage =
-		COVERAGE_DELTA(tr->coverage_tsn_gap_count, tr->coverage_snapshot_tsn_gap_count) ||
-		COVERAGE_DELTA(tr->coverage_ringbuf_full_count, tr->coverage_snapshot_ringbuf_full_count) ||
-		COVERAGE_DELTA(tr->coverage_esp_seen_count, tr->coverage_snapshot_esp_seen_count) ||
-		COVERAGE_DELTA(tr->coverage_ip_frag_skipped_count, tr->coverage_snapshot_ip_frag_skipped_count) ||
-		COVERAGE_DELTA(tr->coverage_obs_lost_count, tr->coverage_snapshot_obs_lost_count);
-	#undef COVERAGE_DELTA
-	if (has_coverage) return 1;
-	for (uint32_t i = 0; i < tr->cell_count; i++) {
-		const struct tr_cell_record *cell_record = &tr->cell_records[i];
-		if (cell_record->conn_sample_count || cell_record->inactive_sample_count
-		    || cell_record->half_open_sum) return 1;
-		for (int metric_index = 0; metric_index < TR_METRIC__COUNT; metric_index++) {
-			if (cell_record->cc_unknown_nocause[metric_index]) return 1;
-			for (int path_index = 0; path_index < PATH__COUNT; path_index++)
-				if (cell_record->path_value[metric_index][path_index]) return 1;
-			for (int cause_index = 0; cause_index < MAX_CAUSE; cause_index++) {
-				if (cell_record->cc_value[metric_index][cause_index]
-				    || cell_record->cc_unknown[metric_index][cause_index]) return 1;
-				for (int excl_index = 0; excl_index < TR_EXCLUDED__COUNT; excl_index++)
-					if (cell_record->cc_excluded[metric_index][excl_index][cause_index]) return 1;
-				for (int overlap_index = 0; overlap_index < TR_OVERLAP__COUNT; overlap_index++)
-					if (cell_record->cc_overlap[metric_index][cause_index][overlap_index]) return 1;
-			}
-		}
-	}
-	return 0;
-}
 
 /* tr_finish: 마지막 주기를 닫고 방출함.
+ *   길이가 있는 빈 주기는 늘 방출함 - 시도 0 도 뜻이 있는 값이고, 받는 쪽은 줄이 없는 칸을
+ *     '못 봤음' 으로 보류하기 때문임.
  *   끝 시각이 주기 경계에 정확히 떨어지면 advance_to 가 그 주기를 닫고 길이 0 인 주기로 넘어감.
- *     그 주기가 비었으면 방출이 잡음이라 생략하되, 끝 시각에 기록된 이벤트가 있으면 유실 없이
- *     방출해야 함. 길이가 있는 빈 주기는 늘 유지함 - 시도 0 과 커버리지도 뜻이 있는 값임.
- *   부작용: 마지막 주기를 부분 주기로 표시해 방출함. 종료 상태 자기 검사를 돌림 */
+ *     그 주기는 방출하지 않음 - 출력 규약이 끝 시각이 시작 시각보다 커야 한다고 해서 보내도
+ *     버려지기 때문임. 끝 시각에 들어온 이벤트가 있으면 그 주기 카운터 기여분이 빠지므로 세어 둠.
+ *     그 이벤트 자체는 단말 줄로 이미 나갔고, 빠지는 것은 셀 카운터 기여분뿐임.
+ *   부작용: 마지막 주기를 방출함. 종료 상태 자기 검사를 돌림 */
 void tr_finish(struct tr *tr, uint64_t end_ns)
 {
 	if (!tr) return;
 	advance_to(tr, end_ns);
-	if (tr->started && (tr->cur_start_ns < end_ns ||
-					   (tr->cur_start_ns == end_ns && period_has_content(tr))))
-		close_period(tr, 1);
+	/* advance_to 가 길이를 채운 주기를 모두 닫았으므로 지금 열려 있는 주기는 반드시 짧음.
+	 * 그 칸을 period_ms 길이로 내보내면 뒷부분을 못 본 수가 그 칸의 전량으로 읽히므로 내지 않고
+	 * 셈. 그 주기의 단말 줄은 이미 나갔음 */
+	if (tr->started && period_has_content(tr))
+		tr->stats.unreported_period_count++;
 	tr_self_check(tr);
 }
 
@@ -3320,39 +3437,44 @@ void tr_set_capture_alive(struct tr *tr, uint64_t capture_alive_until_ns)
 	if (capture_alive_until_ns > tr->capture_alive_until_ns) tr->capture_alive_until_ns = capture_alive_until_ns;
 }
 
-/* tr_set_coverage: 캡처 쪽 누적 카운터 넷을 받아 저장함. 주기를 닫을 때 증가분으로 헤더에 실림.
+/* tr_set_coverage: 캡처 쪽 누적 카운터 넷을 받아 관측 품질 누적에 담음.
  *   역행을 경고하는 이유: 누적 카운터는 한 번 돌리는 동안 단조 증가여야 함. 역행은 탭 재부착이나
- *     커널 카운터 리셋을 뜻하고, 그때 증가분 계산이 그 주기를 0 으로 묶음. 0 으로 묶는 것은 '그
- *     구간의 유실이 없었다' 로 읽히므로 맹점을 숨기지 않도록 한 번 경고를 올림 */
+ *     커널 카운터 리셋을 뜻하고, 그러면 우리가 들고 있는 수가 실제 손실보다 작아짐. 작아진 수를
+ *     그대로 보고하면 '유실이 줄었다' 로 읽히므로 맹점을 숨기지 않도록 한 번 경고를 올림 */
 void tr_set_coverage(struct tr *tr, uint64_t coverage_tsn_gap_count, uint64_t coverage_ringbuf_full_count,
 					 uint64_t coverage_esp_seen_count, uint64_t coverage_ip_frag_skipped_count)
 {
 	if (!tr) return;
 	if (!tr->warned_coverage_reset &&
-	    (coverage_tsn_gap_count < tr->coverage_tsn_gap_count ||
-	     coverage_ringbuf_full_count < tr->coverage_ringbuf_full_count ||
-	     coverage_esp_seen_count < tr->coverage_esp_seen_count ||
-	     coverage_ip_frag_skipped_count < tr->coverage_ip_frag_skipped_count)) {
-		warn(tr, "coverage_reset", "coverage counter decreased (tap reattach/counter reset); period delta clamped to 0");
+	    (coverage_tsn_gap_count < tr->stats.tsn_gap_count ||
+	     coverage_ringbuf_full_count < tr->stats.ringbuf_full_count ||
+	     coverage_esp_seen_count < tr->stats.esp_seen_count ||
+	     coverage_ip_frag_skipped_count < tr->stats.ip_frag_skipped_count)) {
+		warn(tr, "coverage_reset", "coverage counter decreased (tap reattach/counter reset)");
 		tr->warned_coverage_reset = 1;
 	}
-	tr->coverage_tsn_gap_count = coverage_tsn_gap_count;
-	tr->coverage_ringbuf_full_count = coverage_ringbuf_full_count;
-	tr->coverage_esp_seen_count = coverage_esp_seen_count;
-	tr->coverage_ip_frag_skipped_count = coverage_ip_frag_skipped_count;
+	tr->stats.tsn_gap_count = coverage_tsn_gap_count;
+	tr->stats.ringbuf_full_count = coverage_ringbuf_full_count;
+	tr->stats.esp_seen_count = coverage_esp_seen_count;
+	tr->stats.ip_frag_skipped_count = coverage_ip_frag_skipped_count;
 }
 
-// tr_set_obs_coverage: 관측자 내부 유실 누적을 저장함. 주기를 닫을 때 증가분으로 헤더에 실림
+// tr_set_obs_coverage: 관측자 내부 유실 누적을 관측 품질 누적에 담음
 void tr_set_obs_coverage(struct tr *tr, uint64_t coverage_obs_lost_count)
 {
 	if (!tr) return;
-	tr->coverage_obs_lost_count = coverage_obs_lost_count;
+	tr->stats.obs_lost_count = coverage_obs_lost_count;
+}
+
+/* tr_get_stats: 관측 품질 누적을 빌려 줌. 이 값들은 출력 규약에 받는 칸이 없어 이 경로로만 나감 */
+const struct tr_stats *tr_get_stats(const struct tr *tr)
+{
+	return tr ? &tr->stats : NULL;
 }
 
 /* tr_period_pending_close: 지금 tr_advance 를 부르면 주기가 닫히는가.
  *   이유: 부르는 쪽이 주기가 닫히기 직전에만 커버리지를 갱신하게 해, 라이브 경로에서 레코드마다
- *     커널 카운터를 조회하는 비용을 없앰. 증가분은 누적과 스냅샷의 차이로 계산하므로 그 주기 전체의
- *     손실은 그대로 잡힘.
+ *     커널 카운터를 조회하는 비용을 없앰. 담는 값이 누적이라 갱신 시점이 늦어도 총량은 그대로임.
  *   반환: 아직 시작하지 않았으면 거짓(첫 레코드는 엔진을 시작하기만 함) */
 bool tr_period_pending_close(const struct tr *tr, uint64_t now_ns)
 {

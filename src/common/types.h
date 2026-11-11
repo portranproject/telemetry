@@ -2,16 +2,14 @@
  * common/types.h
  * : 모듈들이 공유하는 기본 타입 - 관측 이벤트 하나
  *
- * [1] 쓰는 쪽은 하나, 읽는 쪽은 둘임.
+ * [1] 쓰는 쪽도 하나, 읽는 쪽도 하나임.
  *
- *     libobs --struct obs_event--+--> libtelemetry   표 I/II 집계
- *                                |
- *                                +--> sink_kpm2      탐지 엔진용 ue_evt 줄
- *                                                      (와이어로 나가는 유일한 경로)
+ *     libobs --struct obs_event--> libtelemetry --common/report.h 구조체--> libsink
  *
- *     sink_jsonl 은 표 보고만 받고 이 구조체를 보지 않음.
- *     잎 100개 중 18개는 둘 다 읽지 않아 지금은 아무에게도 닿지 않음. 칸을 넣거나 지우기 전에
- *     그 칸을 읽는 쪽이 있는지 먼저 확인할 것.
+ *     libtelemetry 가 셀 카운터로 집계하는 동시에 탐지 줄 세 가지(주기 줄, 단말 줄, DU 줄)로
+ *     바꿔 내보냄. 와이어로 나가는 경로가 그 하나임.
+ *     읽는 쪽이 하나라서, 여기 칸을 늘리면 libtelemetry 가 읽지 않는 한 아무에게도 닿지 않음.
+ *     칸을 넣거나 지우기 전에 그 칸을 읽는 쪽이 있는지 먼저 확인할 것.
  *
  * [2] 경계. 이 헤더는 ASN.1(asn1c) 타입을 포함하지 않음. 공유 계층이 디코더 헤더
  *     (ap.h, rrc.h, nas.h)에 매달리지 않게 하려는 것이고, 번역은 obs.c 한 곳에서만 함.
@@ -97,6 +95,15 @@ enum tr_ap_outcome {
 	TR_AP_OUTCOME_FAILURE        /* unsuccessfulOutcome */
 };
 
+/* Overload Action 값. payload.overload.action_mask 의 비트 위치이고, 값 순서는 고정 문법
+ *   asn1/ngap-15.8.0.asn1:4399 OverloadAction 과 같음. 이름은 그 문법의 값 이름을 옮긴 것임 */
+enum tr_overload_action {
+	TR_OVERLOAD_REJECT_NON_EMERGENCY_MO_DT       = 0,
+	TR_OVERLOAD_REJECT_RRC_CR_SIGNALLING         = 1,
+	TR_OVERLOAD_PERMIT_EMERGENCY_AND_MT_ONLY     = 2,
+	TR_OVERLOAD_PERMIT_HIGH_PRIORITY_AND_MT_ONLY = 3
+};
+
 /* ---- 이벤트 종류 (번호 고정) ------------------------------------------------------ */
 enum tr_event_kind {
 	TR_EVENT_RRC_SETUP_REQUEST          = 1,
@@ -115,7 +122,9 @@ enum tr_event_kind {
 	TR_EVENT_RRC_RELEASE                = 14,
 	TR_EVENT_RRC_DCCH_OPAQUE            = 15,
 	TR_EVENT_RRC_OTHER                  = 16,
-	TR_EVENT_NAS_F1                     = 17,
+	/* 17 은 비어 있음: F1 의 NAS 를 따로 내는 이벤트였는데 내보내는 곳을 끝내 두지 않았음.
+	 *   보안 전 초기 NAS 는 RRCSetupComplete 이벤트가 payload.setup_complete.nas 로 같이 올리고,
+	 *   보안 뒤의 F1 NAS 는 암호문이라 읽지 않음. 번호를 당기지 않는 이유는 42 와 같음. */
 	TR_EVENT_F1_UE_CTX_SETUP            = 18,
 	TR_EVENT_F1_UE_CTX_RELEASE_REQ      = 19,
 	TR_EVENT_F1_UE_CTX_RELEASE_CMD      = 20,
@@ -246,8 +255,12 @@ struct obs_event {
 	 *           가 stmsi48 의 48비트 근거이고, :1347-1349 의 ng-5G-S-TMSI-Part2 BIT STRING (SIZE (9))
 	 *           가 stmsi_part2 의 9비트 근거임(TS 38.331). */
 	union {
-		struct { enum tr_ue_identity_type ue_identity_type; uint64_t ue_identity39;
-		         int est_cause; uint32_t crnti; } setup_request;  /* 1 */
+		struct {
+			enum tr_ue_identity_type ue_identity_type;
+			uint64_t ue_identity39;
+			int est_cause;
+			uint32_t crnti;
+		} setup_request;  /* 1 */
 
 		/* initial_ul: DU to CU RRC Container IE(선택)의 유무.
 		 *   이름을 'DU 가 못 받는다' 로 짓지 않은 이유 — TS 38.473 §8.4.1.2 는 두 IE 의 논리곱으로 말함:
@@ -256,27 +269,90 @@ struct obs_event {
 		 *      should reject the UE under the assumption that the gNB-DU is not able to serve such UE."
 		 *   f1ap 는 Sidelink 쪽 IE 를 뽑지 않으므로 우리가 보는 것은 앞쪽 하나뿐임. 그 하나만 담고,
 		 *   '거절 예상' 이라는 판정은 이 플래그로 하지 않음 */
-		struct { bool has_du_to_cu_rrc_container; } initial_ul;  /* 45 */
+		struct {
+			bool has_du_to_cu_rrc_container;
+		} initial_ul;  /* 45 */
 
-		struct { int reason; } malformed;  /* 43, 44 — 디코드 실패 코드(-ENOMSG = 이름 없음 또는 릴리스 드리프트, -EBADMSG = 구조적) */
-		struct { uint32_t old_crnti; uint16_t old_pci; int reest_cause; uint32_t crnti; } reest_request;  /* 2 */
-		struct { uint64_t i_rnti; bool i_rnti_is_full40; int resume_cause; bool ccch1; } resume_request;  /* 3 */
-		struct { enum tr_prior_req prior_req; } setup;  /* 4 */
-		struct { int wait_time_s; enum tr_prior_req prior_req; } reject;  /* 5 */
+		/* malformed: 43, 44. reason 은 디코드 실패 코드임.
+		 *   -ENOMSG = 이름 없음 또는 릴리스 드리프트, -EBADMSG = 구조적 */
+		struct {
+			int reason;
+		} malformed;
+
+		struct {
+			uint32_t old_crnti;
+			uint16_t old_pci;
+			int reest_cause;
+			uint32_t crnti;
+		} reest_request;  /* 2 */
+
+		struct {
+			uint64_t i_rnti;
+			bool i_rnti_is_full40;
+			int resume_cause;
+			bool ccch1;
+		} resume_request;  /* 3 */
+
+		struct {
+			enum tr_prior_req prior_req;
+		} setup;  /* 4 */
+
+		/* reject: 5. has_wait_time 이 거짓이면 wait_time_s 는 뜻이 없음 - 플래그 없이 값만 들고
+		 *   오면 waitTime 이 없는 RRCReject 에서 0 이 '0초 대기' 라는 뜻으로 나감.
+		 *   근거 범위는 librrc 가 적은 1~16초임 */
+		struct {
+			bool has_wait_time;
+			int wait_time_s;
+			enum tr_prior_req prior_req;
+		} reject;
 
 		/* setup_complete: RRC 식별자와, 그 안에 실린 초기 NAS(AS 보안 전 평문).
 		 *   has_stmsi48 이 두 겹인 것은 중복이 아님: 바깥쪽은 RRC 식별자 IE 에서, nas.has_stmsi48 은
 		 *   NAS 5GS mobile identity 에서 온 같은 개념의 값이고 둘 중 하나만 실리는 경우가 있음.
 		 *   RRC 줄과 NAS 줄을 각각 그 계층이 본 값으로 채우려면 두 칸이 다 있어야 함 */
-		struct { bool has_stmsi_part2; uint16_t stmsi_part2; bool has_stmsi48; uint64_t stmsi48;
-		         struct obs_nas_values nas; } setup_complete;  /* 6 */
+		struct {
+			bool has_stmsi_part2;
+			uint16_t stmsi_part2;
+			bool has_stmsi48;
+			uint64_t stmsi48;
+			struct obs_nas_values nas;
+		} setup_complete;  /* 6 */
 
-		struct { int ciph_alg; int integ_alg; } smc;  /* 7, 35 */
-		struct { enum tr_suspend suspend; bool after_sec; } release;  /* 14 */
-		struct { int srb_id; } dcch_opaque;  /* 15 */
-		struct { int rrc_chan; const char *rrc_msg_name; } rrc_other;  /* 16 */
-		struct obs_nas_values nas;  /* 17, 26 — N2 가 나르는 NAS-PDU 하나 */
-		struct { uint32_t crnti; bool has_crnti; enum tr_ap_outcome outcome; } ue_ctx_setup;  /* 18 */
+		/* smc: 7, 35. RRC SecurityModeCommand 와 RRCReconfiguration 이 고른 알고리즘.
+		 *   이름을 값과 같이 들고 오는 이유: 출력 층은 번호가 아니라 이름을 내보냄("nea0", "nia2").
+		 *   번호만 내려보내면 출력 층이 이름표를 따로 들어야 하고, 문법 판이 바뀌면 그 손표가 조용히
+		 *   틀림. 같은 결함을 F1AP Cause 에서 겪어 이름 포인터를 들고 내려오는 것으로 고쳤음.
+		 *   librrc 의 고정 문자열이라 rrc_release 뒤에도 유효하므로 포인터만 들고 옴.
+		 *   모르는 값이면 NULL - 그때는 알고리즘을 생략하고 셈. 이름을 만들지 않음 */
+		struct {
+			int ciph_alg;
+			int integ_alg;
+			const char *ciph_alg_name;
+			const char *integ_alg_name;
+		} smc;
+
+		struct {
+			enum tr_suspend suspend;
+			bool after_sec;
+		} release;  /* 14 */
+
+		struct {
+			int srb_id;
+		} dcch_opaque;  /* 15 */
+
+		struct {
+			int rrc_chan;
+			const char *rrc_msg_name;
+		} rrc_other;  /* 16 */
+
+		/* nas: 17, 26. N2 가 나르는 NAS-PDU 하나 */
+		struct obs_nas_values nas;
+
+		struct {
+			uint32_t crnti;
+			bool has_crnti;
+			enum tr_ap_outcome outcome;
+		} ue_ctx_setup;  /* 18 */
 
 		/* f1_release 의 세 칸에 대한 계약.
 		 *   cause_present: Cause IE 가 실제로 실려 있었나. 없으면 cause_group 과 cause_value 는
@@ -288,30 +364,68 @@ struct obs_event {
 		 *     번호만 내려보내면 출력 층이 이름을 지어낼 수밖에 없고, 실제로 "group2:value6" 이 나갔음.
 		 *     ap.h 의 그 이름은 고정 문자열이라 f1ap_release 뒤에도 유효하므로 포인터만 들고 옴.
 		 *     모르는 값이면 NULL - 그때는 Cause 를 생략하고 셈. 이름을 만들지 않음 */
-		struct { int cause_group; int cause_value; bool cause_present;
-		         const char *cause_group_name; const char *cause_value_name;
-		         bool has_old_du_ue_id; enum tr_rrc_container rrc_container_kind; } f1_release;  /* 19, 20 */
+		struct {
+			int cause_group;
+			int cause_value;
+			bool cause_present;
+			const char *cause_group_name;
+			const char *cause_value_name;
+			bool has_old_du_ue_id;
+			enum tr_rrc_container rrc_container_kind;
+		} f1_release;  /* 19, 20 */
 
 		/* reset: 22, 46.
 		 *   F1 SETUP 이 RESET 과 같은 칸을 쓰는 이유: F1 SETUP 은 F1 인터페이스 (재)초기화이고
 		 *   (TS 38.473 §8.2.3), 받는 쪽의 UE 컨텍스트를 전부 지움 — RESET(전체)과 같은 효과임.
 		 *   cells 와 ues 는 빌려 쓰는 포인터임. 콜백이 돌아가는 동안만 유효함. */
-		struct { enum tr_scope scope;                 /* SETUP 은 늘 TR_SCOPE_ALL */
-		         const struct tr_nr_cgi *cells; int cell_count;
-		         bool cells_known;                    /* 거짓 = 그 DU 의 셀을 모름. 읽는 쪽은 '모든 셀' 로 봄 */
-		         const struct tr_reset_ue *ues; int ue_count;  /* 일부 RESET 이 가리킨 UE. 읽는 쪽마다 쓸 수 있는 번호가 다름 */
-		         int ue_overflow_count;               /* 상한을 넘겨 목록에 못 실은 UE */
-		       } reset;
+		struct {
+			enum tr_scope scope;                 /* SETUP 은 늘 TR_SCOPE_ALL */
+			const struct tr_nr_cgi *cells;
+			int cell_count;
+			bool cells_known;                    /* 거짓 = 그 DU 의 셀을 모름. 읽는 쪽은 '모든 셀' 로 봄 */
+			const struct tr_reset_ue *ues;       /* 일부 RESET 이 가리킨 UE. 읽는 쪽마다 쓸 수 있는 번호가 다름 */
+			int ue_count;
+			int ue_overflow_count;               /* 상한을 넘겨 목록에 못 실은 UE */
+		} reset;
 
-		struct { uint32_t old_du_ue_id; int srb_id; } ue_transfer;  /* 33 */
-		struct { int est_cause; } initial_ue;  /* 24 — NAS 는 RRCSetupComplete 과 같은 바이트라 libobs 가 계수기만 올림 */
-		struct { int proc_code; bool has_amf_ue_ngap_id; bool first_for_ran_ue_ngap_id; } amf_dl;  /* 25 */
-		struct { int cause_group; int cause_value; } ng_cause;  /* 27, 28, 34, 39 */
-		struct { uint32_t action_mask; int traffic_load_reduction_pct;
-		         bool nssai_list_present; bool has_action; } overload;  /* 30 */
-		struct { int rrc_state; } rrc_state_report;  /* 32 */
-		struct { struct tr_bytes amf_name; uint64_t guami_digest;
-		         bool ue_contexts_retained; bool outcome_failure; } ng_setup;  /* 38, 42 */
+		struct {
+			uint32_t old_du_ue_id;
+			int srb_id;
+		} ue_transfer;  /* 33 */
+
+		/* initial_ue: 24. NAS 는 RRCSetupComplete 과 같은 바이트라 libobs 가 계수기만 올림 */
+		struct {
+			int est_cause;
+		} initial_ue;
+
+		struct {
+			int proc_code;
+			bool has_amf_ue_ngap_id;
+			bool first_for_ran_ue_ngap_id;
+		} amf_dl;  /* 25 */
+
+		struct {
+			int cause_group;
+			int cause_value;
+		} ng_cause;  /* 27, 28, 34, 39 */
+
+		struct {
+			uint32_t action_mask;
+			int traffic_load_reduction_pct;
+			bool nssai_list_present;
+			bool has_action;
+		} overload;  /* 30 */
+
+		struct {
+			int rrc_state;
+		} rrc_state_report;  /* 32 */
+
+		struct {
+			struct tr_bytes amf_name;
+			uint64_t guami_digest;
+			bool ue_contexts_retained;
+			bool outcome_failure;
+		} ng_setup;  /* 38, 42 */
 	} payload;
 };
 #endif /* TELEMETRY_TYPES_H */
