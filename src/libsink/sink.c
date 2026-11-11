@@ -652,16 +652,6 @@ static void counter_write(struct line_buf *line, const char *key, const struct r
     line_close(line, '}');
 }
 
-/* inferred_write: "키":n 또는 null — 그 카운터의 추정분. 세지 못한 카운터는 추정분도 없음 */
-static void inferred_write(struct line_buf *line, const char *key, const struct report_counter *counter) {
-    line_key(line, key);
-    if (counter->is_counted) {
-        line_u64(line, counter->inferred);
-    } else {
-        line_null(line);
-    }
-}
-
 /* optional_u64_write: "키":n 또는 null. 세지 못한 지표는 null(0 은 '셌고 0건' 이라 따로 — 탐지 명세 §5.3) */
 static void optional_u64_write(struct line_buf *line, const char *key, bool has_value, uint64_t value) {
     line_key(line, key);
@@ -734,21 +724,6 @@ static void kpm2_ext_write(struct line_buf *line, const struct report_period *pe
     line_close(line, '}');
 }
 
-/* kpm2_inferred_write: cc 의 형제 칸 "inferred" — 카운터마다 추정으로 메운 수.
- *   cc 안(원인별 객체)에 넣으면 엔진이 원인으로 더해 total ≠ 합 경고가 남. 맨 위 모르는 키는 엔진이 무시(탐지 명세 §5.3·§6.3 계약) — 기록용
- */
-static void kpm2_inferred_write(struct line_buf *line, const struct report_period *period) {
-    line_key(line, "inferred");
-    line_open(line, '{');
-    inferred_write(line, "RRC.ConnEstabAtt", &period->conn_estab_att);
-    inferred_write(line, "RRC.ConnEstabSucc", &period->conn_estab_succ);
-    inferred_write(line, "UECNTX.ConnEstabAtt", &period->uectx_estab_att);
-    inferred_write(line, "UECNTX.ConnEstabSucc", &period->uectx_estab_succ);
-    inferred_write(line, "RRC.ResumeAtt", &period->resume_att);
-    inferred_write(line, "RRC.ResumeSucc", &period->resume_succ);
-    line_close(line, '}');
-}
-
 enum sink_result sink_on_period(struct sink *sink, const struct report_period *period) {
     if (!sink) {
         return SINK_DROPPED_INVALID;
@@ -804,7 +779,6 @@ enum sink_result sink_on_period(struct sink *sink, const struct report_period *p
         kpm2_cc_write(&line, period);
         kpm2_si_write(&line, period);
         kpm2_ext_write(&line, period);
-        kpm2_inferred_write(&line, period);
     } else {
         // 캡처가 멈췄거나 살아 있는지 확인되지 않은 칸: 0 으로 채우면 엔진이 조용한 정상 셀로 봄(탐지 명세 §5.3)
         line_key(&line, "cc");
@@ -812,8 +786,6 @@ enum sink_result sink_on_period(struct sink *sink, const struct report_period *p
         line_key(&line, "si");
         line_null(&line);
         line_key(&line, "ext");
-        line_null(&line);
-        line_key(&line, "inferred");
         line_null(&line);
     }
     line_key(&line, "ue_evt_lost"); // 늘 빈 배열 — 없으면 엔진이 그 칸을 양방향 로스로 봐 2·3단계 판정을 보류(탐지 명세 §5.5)

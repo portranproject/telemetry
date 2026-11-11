@@ -92,7 +92,7 @@ struct report_ue_fields {
 //   obs 가 UE 잇기를 끝낸 뒤 넘김: du_ue_id·crnti·cell_id 는 그 UE 의 모든 메시지에 붙음(탐지 명세 §6.2)
 struct report_ue_event {
     uint64_t t_ms;    // 관측 시각(Unix epoch ms, 캡처 시각 ns 를 내림). 칸 경계와 같은 시계
-    uint64_t cell_id; // tr 이 (PLMN + NR Cell Identity) 마다 처음 본 순서로 1부터 매긴 번호, 세션 동안 고정. 탐지 엔진이 int64 로 읽어 64비트
+    uint64_t cell_id; // NR CGI 에서 PLMN 을 뺀 NR Cell Identity(36비트) 값 그대로(obs·tr 의 tr_nr_cgi.cell_id). 탐지 엔진이 int64 로 읽어 64비트
 
     bool has_du_ue_id; // false 는 NGAP 에서만 본 NAS 줄(via NGAP)만 됨 — 그 밖은 sink 가 내지 않음
     uint32_t du_ue_id; // gNB-DU UE F1AP ID. UE 를 잇는 기본 키
