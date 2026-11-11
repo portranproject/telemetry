@@ -49,7 +49,7 @@ struct sink_stats {
     uint64_t too_long_drop_count;     // SINK_DROPPED_TOO_LONG
     uint64_t write_error_count;       // SINK_DROPPED_WRITE_FAILED
     uint64_t spec_warning_count;      // 보내긴 했지만 탐지 엔진이 경고를 낼 모양이었던 줄 수(원인 합 ≠ total, 칸 길이 ≠ period_ms). 집계 층 계산이 어긋난 흔적 — 줄을 버리면 칸이 비어 판정이 멈추므로 보내고 셈
-    uint64_t inferred_count;          // 낸 kpm2 카운터의 inferred 합. 줄의 "inferred" 객체에도 나가지만 실행 끝에 사람이 보는 자리는 여기(main 이 출력)
+    uint64_t inferred_count;          // 낸 kpm2 카운터의 inferred 합. 탐지 명세에 이 값을 받는 키가 없어 줄에는 안 나가고, 실행 끝에 사람이 보는 자리는 여기뿐(main 이 출력)
     uint64_t record_bytes;            // 녹화 파일에 쓴 바이트
     bool is_record_stopped;           // record_max_bytes 를 넘었거나 파일 쓰기가 실패해 녹화를 멈춤. 소켓 전송은 계속
 };
