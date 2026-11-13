@@ -804,6 +804,130 @@ enum sink_result sink_on_period(struct sink *sink, const struct report_period *p
     return result;
 }
 
+// MARK: - overhead
+
+/* overhead_role_name: 선언 플래그를 역할 문자열로. 둘 다 참이면 "f1+n2" 로 적어 그 칸의 수가
+ *   어느 한 역할의 것이 아님을 읽는 쪽에 그대로 보임.
+ *   반환: 역할이 하나도 없으면 NULL(부르는 쪽이 줄을 버림) — 역할 없는 NIC 는 탭을 붙인 적이 없음 */
+static const char *overhead_role_name(const struct sink_overhead_link *link) {
+    if (link->is_f1_declared && link->is_n2_declared) {
+        return "f1+n2";
+    }
+    if (link->is_f1_declared) {
+        return "f1";
+    }
+    if (link->is_n2_declared) {
+        return "n2";
+    }
+    return NULL;
+}
+
+/* overhead_direction_write: 방향 하나의 객체. 초당 값이 아니라 창 증가분을 그대로 적음 —
+ *   증가분은 창을 합쳐도 더하면 되지만 초당 값은 더할 수 없고, 창 길이는 같은 줄의 t_start·t_end 에 있음.
+ *   "bps" 를 쓰지 않는 이유: bit 인지 byte 인지 이름이 말하지 않음. 센 것을 그대로 부름 */
+static void overhead_direction_write(struct line_buf *line, const char *key, const struct sink_overhead_direction *direction) {
+    line_key(line, key);
+    line_open(line, '{');
+    line_key(line, "sctp_packet_count");
+    line_u64(line, direction->sctp_packet_count);
+    line_key(line, "wire_byte_count");
+    line_u64(line, direction->wire_byte_count);
+    line_close(line, '}');
+}
+
+/* overhead_link_write: link 배열. 못 읽은 창은 빈 배열이 아니라 null — 빈 배열은 '인터페이스가 없음' 으로
+ *   읽히고, 그것은 '못 읽음' 과 정반대의 뜻임 */
+static void overhead_link_write(struct line_buf *line, const struct sink_overhead *overhead) {
+    line_key(line, "link");
+    if (!overhead->has_link) {
+        line_null(line);
+        return;
+    }
+    line_open(line, '[');
+    for (int i = 0; i < overhead->link_count; i++) {
+        const struct sink_overhead_link *link = &overhead->links[i];
+        line_open(line, '{');
+        line_key(line, "interface_name");
+        line_string(line, link->interface_name);
+        line_key(line, "role");
+        line_string(line, overhead_role_name(link));
+        overhead_direction_write(line, "ingress", &link->ingress);
+        overhead_direction_write(line, "egress", &link->egress);
+        line_close(line, '}');
+    }
+    line_close(line, ']');
+}
+
+enum sink_result sink_on_overhead(struct sink *sink, const struct sink_overhead *overhead) {
+    if (!sink) {
+        return SINK_DROPPED_INVALID;
+    }
+    if (!overhead) {
+        sink->stats.invalid_drop_count++;
+        return SINK_DROPPED_INVALID;
+    }
+    // 엔진이 줄을 버리는 모양: t_end ≤ t_start, int64 밖 시각. 음수 코어 수도 여기서 막음(JSON 에 담겨도 뜻이 없음)
+    bool is_time_valid = overhead->t_end_ms > overhead->t_start_ms && overhead->t_end_ms <= JSON_INT_MAX;
+    bool is_cores_valid = !(overhead->has_node_cpu && overhead->node_cpu_busy_cores < 0)
+                       && !(overhead->has_process_cpu && overhead->process_cpu_cores < 0);
+    bool is_link_valid = overhead->link_count >= 0 && (!overhead->has_link || overhead->link_count == 0 || overhead->links);
+    for (int i = 0; is_link_valid && overhead->has_link && i < overhead->link_count; i++) {
+        const struct sink_overhead_link *link = &overhead->links[i];
+        if (!link->interface_name || !is_valid_utf8(link->interface_name) || !overhead_role_name(link)) {
+            is_link_valid = false;
+        }
+    }
+    if (!is_time_valid || !is_cores_valid || !is_link_valid) {
+        sink->stats.invalid_drop_count++;
+        return SINK_DROPPED_INVALID;
+    }
+
+    bool is_connected = connection_ensure(sink);
+    struct line_buf line = {.data = sink->line, .cap = sizeof sink->line};
+    line_reset(&line);
+    sink->seq++;
+    line_open(&line, '{');
+    line_common_head(&line, sink, "overhead", sink->seq);
+    // node_id: 어느 박스의 부하인지. hello 와 같은 값이라 키를 뺄 수 있지만, 이 줄만 받는 쪽이
+    //   hello 를 거슬러 찾지 않아도 되게 같이 실음. 없으면 키를 뺌(hello 와 같은 규칙)
+    if (sink->has_node_id) {
+        line_key(&line, "node_id");
+        line_string(&line, sink->node_id);
+    }
+    /* process_scope: process_cores 와 process_rss_bytes 가 덮는 범위.
+     *   이 칸이 없으면 받는 쪽이 프로세스 하나의 수를 센서 전체의 부하로 읽어 실제보다 낮게 봄.
+     *   탐지 판정과 전송은 다른 프로세스가 맡으므로 그 둘의 몫은 이 수에 들어가지 않고,
+     *   node 쪽 수에만 섞여 들어감.
+     *   인자가 아니라 상수인 이유: 재는 층이 /proc/self 만 읽으므로 범위가 달라질 수 없음.
+     *   인자로 두면 부르는 쪽이 실제로 잰 것보다 넓은 범위를 적을 수 있게 됨 */
+    line_key(&line, "process_scope");
+    line_string(&line, "self");
+    line_key(&line, "t_start_ms");
+    line_u64(&line, overhead->t_start_ms);
+    line_key(&line, "t_end_ms");
+    line_u64(&line, overhead->t_end_ms);
+
+    // 점유율을 여기서 나누지 않는 이유: 분자와 분모를 같이 보내면 읽는 쪽이 점유율도 내고 코어 수도 봄.
+    //   나눠 보내면 분모를 잃어 '0.5' 가 2코어 장비의 절반인지 64코어 장비의 절반인지 알 수 없음
+    line_key(&line, "cpu");
+    line_open(&line, '{');
+    optional_u64_write(&line, "count", overhead->cpu_count != 0, overhead->cpu_count);
+    optional_real_write(&line, "node_busy_cores", overhead->has_node_cpu, overhead->node_cpu_busy_cores);
+    optional_real_write(&line, "process_cores", overhead->has_process_cpu, overhead->process_cpu_cores);
+    line_close(&line, '}');
+
+    line_key(&line, "memory");
+    line_open(&line, '{');
+    optional_u64_write(&line, "total_bytes", overhead->has_node_memory, overhead->memory_total_bytes);
+    optional_u64_write(&line, "used_bytes", overhead->has_node_memory, overhead->memory_used_bytes);
+    optional_u64_write(&line, "process_rss_bytes", overhead->has_process_memory, overhead->process_memory_rss_bytes);
+    line_close(&line, '}');
+
+    overhead_link_write(&line, overhead);
+    line_finish(&line);
+    return line_emit(sink, &line, is_connected);
+}
+
 // MARK: - ue_evt
 
 /* line_hex: "0x" + 소문자 16진수 문자열. bits 비트를 담는 자릿수로 앞을 0 으로 채움(48 → 12자리, 39 → 10자리, 9 → 3자리 — 탐지 명세 §6.4).
