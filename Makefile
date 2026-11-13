@@ -75,7 +75,7 @@ asn1: $(BLD)/.asn1libs.stamp
 # ---- 파이프라인 모듈 묶기 ----
 #   libcap 은 위 특수 규칙(BPF skeleton 의존). 나머지 모듈은 아래 템플릿으로 src/lib<m>/*.c 에서
 #   build/lib<m>.a 를 만듬. 폴더가 비어 있으면 .a 를 안 만들고 그만큼만 .so 에서 빠짐. .c 가 생기면 자동 편입
-PLAIN_MODULES := sctp ap rrc nas obs telemetry sink
+PLAIN_MODULES := sctp ap rrc nas obs telemetry sink host
 define MODULE_rule
 $(BLD)/lib$(1).a: $(patsubst src/lib$(1)/%.c,$(BLD)/lib$(1)/%.o,$(wildcard src/lib$(1)/*.c))
 	@mkdir -p $$(@D)

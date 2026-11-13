@@ -30,6 +30,52 @@ struct sink_cfg {
     const char *node_id;         // hello 기록용. 실행 옵션 또는 gethostname 으로 main 이 정함. NULL 이면 키 뺌
 };
 
+// MARK: - overhead
+//   overhead 줄의 입력. 보내는 값은 집계 층에서 오지 않고 호스트 측정 층과 캡처 층에서 와서,
+//   report_* 와 달리 main 이 직접 채움. 여기 두는 이유: 출력 층이 libcap 과 libhost 타입을
+//   알게 되면 출력만 책임지는 층이 아니게 됨 — 그래서 두 곳의 값을 평범한 수로 옮겨 받음
+
+// 방향 하나의 와이어 측정값. 창 하나 동안의 증가분임(누적이 아님)
+struct sink_overhead_direction {
+    uint64_t sctp_packet_count;
+    uint64_t wire_byte_count;
+};
+
+// 인터페이스 한 칸. role 은 선언 플래그 그대로 나감 — 한 NIC 에 F1 과 N2 가 같이 흐르면 양쪽 다 참이고,
+//   그 칸의 수를 한 역할에 몰아주지 않음(몰아주면 읽는 쪽이 그 역할의 부하를 부풀려 봄)
+struct sink_overhead_link {
+    const char *interface_name;  // 빌려 읽기만 함
+    bool is_f1_declared;
+    bool is_n2_declared;
+    struct sink_overhead_direction ingress;
+    struct sink_overhead_direction egress;
+};
+
+/* sink_overhead: overhead 한 줄의 값. has_* 가 false 면 그 창에서 못 읽은 것이라 null 로 나감 —
+ *   0 을 넣으면 '한가했음' 과 같은 모양이 되어 읽는 쪽이 측정 구멍을 볼 수 없음 */
+struct sink_overhead {
+    uint64_t t_start_ms;
+    uint64_t t_end_ms;
+
+    uint32_t cpu_count;              // 0 이면 못 읽은 것이라 null
+    bool has_node_cpu;
+    double node_cpu_busy_cores;      // 창 동안 노드가 바쁘게 돈 코어 수의 평균
+    bool has_process_cpu;
+    double process_cpu_cores;        // 같은 창에서 이 프로세스가 쓴 코어 수의 평균
+
+    bool has_node_memory;
+    uint64_t memory_total_bytes;
+    uint64_t memory_used_bytes;
+    bool has_process_memory;
+    uint64_t process_memory_rss_bytes;
+
+    /* has_link 가 false 인 경우 둘: 커널 맵을 못 읽었거나, 차이를 낼 앞선 읽기가 아직 없음(첫 창).
+     *   links 는 빌려 읽기만 하고 link_count 칸을 가리켜야 함 */
+    bool has_link;
+    const struct sink_overhead_link *links;
+    int link_count;
+};
+
 // sink_result: 호출 하나의 결과. 버린 줄은 sink_stats 에도 셈
 enum sink_result {
     SINK_OK = 0,
@@ -73,6 +119,11 @@ enum sink_result sink_on_f1_event(struct sink *sink, const struct report_f1_even
 
 /* sink_on_period: kpm2 한 줄. 부작용·반환은 sink_on_ue_event 와 같다. 같은 칸의 ue_evt 를 먼저 넘기고 부를 것(탐지 명세 §6.5). */
 enum sink_result sink_on_period(struct sink *sink, const struct report_period *period);
+
+/* sink_on_overhead: overhead 한 줄. 부작용·반환은 sink_on_ue_event 와 같다.
+ *   kpm2 와 같은 소켓·같은 seq 를 쓰고 줄 종류만 다르다 — 탐지 엔진은 모르는 종류를 조용히 흘려보내고
+ *   seq 만 소비하므로, 따로 소켓을 열지 않아야 한다(엔진은 클라이언트를 하나만 붙여 둔다). */
+enum sink_result sink_on_overhead(struct sink *sink, const struct sink_overhead *overhead);
 
 const struct sink_stats *sink_get_stats(const struct sink *sink);
 

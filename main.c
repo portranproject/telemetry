@@ -69,6 +69,7 @@
  *       --sock <socket_path>            탐지 엔진이 듣는 유닉스 소켓
  *       --record <file_path|->          보낸 줄을 그대로 남길 파일(- = stdout). 형식 확인용
  *       --node <node_id>                접속 인사의 node_id
+ *       --overhead-ms <ms>              자원 사용량 줄 하나가 덮는 구간 (기본 3000)
  *
  *     Ctrl+C 한 번이면 부착을 풀고 링 버퍼에 남은 레코드를 마저 처리한 뒤 마지막 미완 주기를
  *     닫음. 두 번이면 남은 처리를 건너뜀.
@@ -88,9 +89,25 @@
 #include <libsctp/sctp.h>
 #include <libobs/obs.h>
 #include <libtelemetry/tr.h>
+#include <libhost/host.h>
 #include <libsink/sink.h>
 
 #define MAX_INTERFACES 8        // 인터페이스 수 상한. CU 한 대의 F1/N2 NIC 는 보통 1~2 개임
+
+/* OVERHEAD_WINDOW_DEFAULT_MS: 자원 사용량 줄 하나가 덮는 구간의 기본값. --overhead-ms 로 바꿈.
+ *   3000 인 이유: 받는 쪽이 셀 지표를 3초 칸으로 묶어 보여 주므로, 같은 경계로 내보내면 한 시점의
+ *     '부하' 와 '지표' 가 같은 칸에 들어가 나란히 읽힘. 어긋나면 두 값이 다른 칸에 떨어져 대조가 안 됨.
+ *   주기 줄(기본 100 ms)보다 길게 두는 이유: CPU 와 메모리는 그보다 빨리 움직이지 않고, 짧게 두면
+ *     줄 수만 30배가 됨.
+ *   옵션으로 뺀 이유: 받는 쪽 칸 길이가 배치마다 다를 수 있고, 그때 이 값을 같이 맞춰야 위 정렬이
+ *     유지됨. 3000 의 약수(1000, 1500)를 쓰면 3초 경계가 전부 이 구간의 경계이기도 해서 정렬이 깨지지 않음 */
+#define OVERHEAD_WINDOW_DEFAULT_MS 3000
+
+/* OVERHEAD_WINDOW_MIN_MS: --overhead-ms 하한.
+ *   100 인 이유: CPU 시간은 커널이 틱 단위로 올리고 그 틱이 100 Hz(sysconf(_SC_CLK_TCK)) 라,
+ *     구간이 10 ms 라면 한 틱만 들어와도 코어 수가 1.0 으로 튐. 100 ms 면 틱 10개가 들어와
+ *     0.1 단위로 떨어지므로 양자화가 값을 지배하지 않음 */
+#define OVERHEAD_WINDOW_MIN_MS 100
 
 /* RECORD_MAX_BYTES: --record 로 남기는 파일의 상한. 디스크를 채우지 않으려고 둠 - 넘으면 출력 층이
  *   녹화만 멈추고 소켓 전송은 이어감(sink.h). 1 GiB 는 sink.h 가 적은 셀 하나 1시간 약 23 MB 기준으로
@@ -130,6 +147,21 @@ struct pipeline {
 	 *   로 보고됨. 실패하면 이 사본을 재사용해 단조성을 지킴 */
 	struct cap_stats last_cap_stats;
 	uint64_t cap_stats_error_count;  // cap_get_stats 실패 횟수. 0 이 아니면 커버리지가 불완전함
+
+	/* 자원 사용량 측정. host 는 procfs 를 열어 둔 핸들이고 아래 셋이 칸 경계를 관리함 */
+	struct host *host;
+	uint64_t overhead_window_ms;          // 칸 하나의 길이(--overhead-ms). 0 이면 나눗셈이 터지므로 조립에서 반드시 채움
+	uint64_t overhead_window_start_ms;    // 지금 쌓고 있는 칸의 시작(벽시계 ms, overhead_window_ms 의 배수)
+	/* 경계를 몇 번 넘었나. 2 보다 작은 동안은 줄을 내지 않음 - 프로그램이 칸 중간에 뜨면 첫 측정 구간이
+	 *   그 칸보다 짧은데 줄에는 칸 전체를 적게 되어 값이 조용히 틀림. 두 번 넘긴 뒤부터 측정 구간이
+	 *   칸 하나와 같아짐 */
+	uint64_t overhead_window_crossing_count;
+
+	/* 커널 와이어 계수기는 누적이라 칸 값은 직전 칸 끝과의 차이임. 그 기준점과 유효 여부.
+	 *   유효하지 않은 칸은 0 이 아니라 null 로 내보냄 - 0 은 '트래픽이 없었음' 과 같은 모양임 */
+	struct cap_link_stats link_stats_baseline[MAX_INTERFACES];
+	bool is_link_baseline_valid;
+	uint64_t link_stats_error_count;  // cap_get_link_stats 실패 횟수
 };
 
 static volatile sig_atomic_t stop_signal_count = 0;   // Ctrl+C 횟수. 1 = 정리하고 끝냄, 2 = 남은 처리도 건너뜀
@@ -183,6 +215,100 @@ static void feed_coverage(struct pipeline *pipeline)
 		          + sctp_stats->direction_evicted_count + sctp_stats->assoc_evicted_count
 		          + sctp_stats->bad_header_count + sctp_stats->vtag_mismatch_drop_count;
 	tr_set_obs_coverage(pipeline->tr, obs_internal_loss(pipeline->obs) + sctp_lost_count);
+}
+
+/* emit_overhead: 칸 하나의 자원 사용량을 출력 층으로 넘김.
+ *   이유: 측정 엔진이 CU 에서 얼마를 쓰는지, 그 CU 의 F1/N2 선로에 얼마가 흘렀는지를 지표와 같은
+ *     통로로 보내 같은 칸에서 나란히 읽히게 함. 따로 보내면 통로가 둘이 되어 한쪽만 끊겨도 모름.
+ *   부작용: 커널 PERCPU 맵을 합산해 읽고(cap_get_link_stats), 출력 층이 줄 하나를 보냄.
+ *   값이 없는 칸은 null 로 나감 - 못 읽은 것과 '한가했음' 이 같은 모양이 되지 않게. */
+static void emit_overhead(struct pipeline *pipeline, uint64_t window_start_ms, const struct host_window *host_window)
+{
+	struct sink_overhead_link links[MAX_INTERFACES];
+	memset(links, 0, sizeof(links));
+	int link_count = pipeline->declared_interface_count;
+	for (int i = 0; i < link_count; i++) {
+		links[i].interface_name  = pipeline->declared_interfaces[i].interface_name;
+		links[i].is_f1_declared  = pipeline->declared_interfaces[i].is_f1_declared;
+		links[i].is_n2_declared  = pipeline->declared_interfaces[i].is_n2_declared;
+	}
+
+	struct cap_link_stats link_stats[MAX_INTERFACES];
+	bool has_link = false;
+	int error = cap_get_link_stats(pipeline->cap, link_stats, MAX_INTERFACES);
+	if (error) {
+		pipeline->link_stats_error_count++;
+		if (pipeline->link_stats_error_count == 1)
+			fprintf(stderr, "cap_get_link_stats: %s - 선로 계수기를 읽지 못했습니다. "
+			                "그 칸의 link 은 null 로 나갑니다(종료 시 총 실패 횟수 보고)\n",
+			        strerror(-error));
+		pipeline->is_link_baseline_valid = false;   // 다음 칸도 null. 두 칸에 걸친 차이를 한 칸으로 내보내지 않음
+	} else if (pipeline->is_link_baseline_valid) {
+		has_link = true;
+		for (int i = 0; i < link_count; i++) {
+			const struct cap_link_stats *now = &link_stats[i];
+			const struct cap_link_stats *baseline = &pipeline->link_stats_baseline[i];
+			/* 누적값이 뒤로 갔으면 그 칸을 포기함. 생기지 않아야 하지만, 음수 차이를 부호 없는 수로
+			 *   바꾸면 18 엑사 단위의 수가 그럴듯한 측정값으로 나감 */
+			if (now->ingress.sctp_packet_count < baseline->ingress.sctp_packet_count
+			 || now->ingress.wire_byte_count   < baseline->ingress.wire_byte_count
+			 || now->egress.sctp_packet_count  < baseline->egress.sctp_packet_count
+			 || now->egress.wire_byte_count    < baseline->egress.wire_byte_count) {
+				has_link = false;
+				break;
+			}
+			links[i].ingress.sctp_packet_count = now->ingress.sctp_packet_count - baseline->ingress.sctp_packet_count;
+			links[i].ingress.wire_byte_count   = now->ingress.wire_byte_count   - baseline->ingress.wire_byte_count;
+			links[i].egress.sctp_packet_count  = now->egress.sctp_packet_count  - baseline->egress.sctp_packet_count;
+			links[i].egress.wire_byte_count    = now->egress.wire_byte_count    - baseline->egress.wire_byte_count;
+		}
+	}
+	if (!error) {
+		memcpy(pipeline->link_stats_baseline, link_stats, sizeof(link_stats));
+		pipeline->is_link_baseline_valid = true;
+	}
+
+	struct sink_overhead overhead = {
+		.t_start_ms               = window_start_ms,
+		.t_end_ms                 = window_start_ms + pipeline->overhead_window_ms,
+		.cpu_count                = host_window->cpu_count,
+		.has_node_cpu             = host_window->has_node_cpu,
+		.node_cpu_busy_cores      = host_window->node_cpu_busy_cores,
+		.has_process_cpu          = host_window->has_process_cpu,
+		.process_cpu_cores        = host_window->process_cpu_cores,
+		.has_node_memory          = host_window->has_node_memory,
+		.memory_total_bytes       = host_window->memory_total_bytes,
+		.memory_used_bytes        = host_window->memory_used_bytes,
+		.has_process_memory       = host_window->has_process_memory,
+		.process_memory_rss_bytes = host_window->process_memory_rss_bytes,
+		.has_link                 = has_link,
+		.links                    = links,
+		.link_count               = link_count,
+	};
+	sink_on_overhead(pipeline->sink, &overhead);
+}
+
+/* advance_overhead: 자원 사용량 칸의 경계를 넘었으면 직전 칸을 닫아 내보냄.
+ *
+ *     기동(칸 중간)      경계 1              경계 2              경계 3
+ *       |                  |                   |                   |
+ *       +-- 아무것도 ------+-- 기준점만 ------+-- 줄 1 -----------+-- 줄 2
+ *           없음              잡고 버림          [경계1, 경계2)      [경계2, 경계3)
+ *
+ *   첫 두 번을 버리는 이유: 측정 구간과 줄에 적는 구간이 같아야 함. 기동이 칸 중간이면 첫 구간은
+ *     그보다 짧은데 줄에는 칸 전체를 적게 되어 값이 조용히 작아짐.
+ *   폴링 간격(200 ms) 때문에 경계를 최대 그만큼 늦게 알아챔. 코어 수의 분모는 실제 경과 시간이라
+ *     값 자체는 맞고, t_start 와 t_end 는 그 칸의 이름임 */
+static void advance_overhead(struct pipeline *pipeline, uint64_t now_ms)
+{
+	uint64_t window_start_ms = (now_ms / pipeline->overhead_window_ms) * pipeline->overhead_window_ms;
+	if (window_start_ms == pipeline->overhead_window_start_ms)
+		return;
+	struct host_window host_window;
+	if (!host_window_close(pipeline->host, &host_window) && pipeline->overhead_window_crossing_count >= 2)
+		emit_overhead(pipeline, pipeline->overhead_window_start_ms, &host_window);
+	pipeline->overhead_window_start_ms = window_start_ms;
+	pipeline->overhead_window_crossing_count++;
 }
 
 /* on_obs: 관측 이벤트 하나를 집계 층으로 넘김.
@@ -340,6 +466,7 @@ static void usage(const char *program_name)
 	        "  --sock <socket_path>        탐지 엔진이 듣는 유닉스 소켓 (기본 " SINK_DEFAULT_SOCKET_PATH ")\n"
 	        "  --record <file_path|->      보낸 줄을 그대로 남길 파일 (- = stdout). 형식 확인용\n"
 	        "  --node <node_id>            hello 의 node_id\n"
+	        "  --overhead-ms <ms>          자원 사용량 줄 하나가 덮는 구간 ms (기본 3000)\n"
 	        "\n"
 	        "종료 코드: 0 = 정상, 측정 완전 / 1 = 운영 실패(탭, 통계, 스트림) / 2 = 커버리지 불완전\n",
 	        program_name);
@@ -349,6 +476,7 @@ int main(int argc, char **argv)
 {
 	const char *socket_path = NULL, *record_path = NULL, *node_id = NULL;
 	uint64_t gp_ms = 0;                      // 0 = libtelemetry 기본값(15분)
+	uint64_t overhead_window_ms = OVERHEAD_WINDOW_DEFAULT_MS;
 	struct declared_interface declared_interfaces[MAX_INTERFACES] = { 0 };
 	int declared_interface_count = 0;
 
@@ -373,6 +501,22 @@ int main(int argc, char **argv)
 		else if (!strcmp(argument, "--sock")   && has_value) socket_path = argv[++i];
 		else if (!strcmp(argument, "--record") && has_value) record_path = argv[++i];
 		else if (!strcmp(argument, "--node")   && has_value) node_id     = argv[++i];
+		else if (!strcmp(argument, "--overhead-ms") && has_value) {
+			/* 하한을 두는 이유는 위 OVERHEAD_WINDOW_MIN_MS 주석에 적음. 상한 86400000(= 1일)
+			 *   은 -g 와 같은 근거임. 0 을 막는 것이 특히 중요함 - 칸 경계를 나눗셈으로 구하므로
+			 *   0 이 들어오면 SIGFPE 로 죽음 */
+			const char *overhead_text = argv[++i];
+			char *parse_end;
+			errno = 0;
+			unsigned long long parsed_overhead_ms = strtoull(overhead_text, &parse_end, 10);
+			if (errno || *overhead_text == '\0' || *parse_end
+			 || parsed_overhead_ms < OVERHEAD_WINDOW_MIN_MS || parsed_overhead_ms > 86400000ULL) {
+				fprintf(stderr, "--overhead-ms 값이 잘못됐습니다: '%s' (%d~86400000 ms)\n",
+				        overhead_text, OVERHEAD_WINDOW_MIN_MS);
+				return 2;
+			}
+			overhead_window_ms = parsed_overhead_ms;
+		}
 		else if (argument[0] == '-') { usage(argv[0]); return 2; }
 		else {
 			/* 옵션이 아닌 인자는 `f1:<interface_name>` 또는 `n2:<interface_name>` 임.
@@ -445,6 +589,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "출력 어댑터 초기화 실패 (설정이 잘못됐거나 메모리 부족)\n");
 		return 1;
 	}
+	/* 자원 사용량 측정 핸들. procfs 를 못 열면 멈추지 않고 그 줄만 포기함 - 셀 지표는 그것과
+	 *   무관하게 나가야 하고, 측정 엔진이 자기 부하를 못 재는 것으로 관측을 멈추면 손해가 더 큼 */
+	pipeline.overhead_window_ms = overhead_window_ms;
+	pipeline.host = host_new();
+	if (!pipeline.host)
+		fprintf(stderr, "[host] procfs 를 열지 못해 자원 사용량 줄을 내지 않습니다\n");
+
 	struct tr_sink_ops sink_ops = {
 		.on_period   = on_period,
 		.on_ue_event = on_ue_event,
@@ -521,6 +672,8 @@ int main(int argc, char **argv)
 			break;   // 생존 워터마크를 올리지 않고 나감 - 이 뒤 주기는 '확인되지 않음' 임
 		}
 		advance_idle(&pipeline, TR_DEF_LATE_SLACK_MS);   // 트래픽이 없어도 주기는 닫혀 나가야 함
+		if (pipeline.host)
+			advance_overhead(&pipeline, wallclock_ns() / 1000000ull);
 	}
 
 	/* 종료 순서. 바꾸면 "넘긴 수 < captured_count" 가 되어 유실로 오해됨.
@@ -745,6 +898,15 @@ int main(int argc, char **argv)
 			coverage_incomplete = 1;
 	}
 
+	/* 자원 사용량 측정이 못 본 양. 종료 코드를 바꾸지 않는 이유: 이 수는 우리 부하에 대한 것이고
+	 *   셀 지표의 커버리지와는 다른 것임. 섞으면 '지표를 하한으로 읽어야 하는 실행' 과 '부하만
+	 *   못 잰 실행' 이 같은 종료 코드가 됨 */
+	uint64_t host_failure_count = host_get_failure_count(pipeline.host);
+	if (host_failure_count || pipeline.link_stats_error_count)
+		fprintf(stderr, "[host] procfs 읽기 실패 %llu 회, 선로 계수기 읽기 실패 %llu 회 "
+		                "-> 그만큼의 칸이 값 없이 나갔습니다\n",
+		        (unsigned long long)host_failure_count, (unsigned long long)pipeline.link_stats_error_count);
+
 	/* 커버리지가 불완전했으면 반드시 말함 - 조용히 넘기면 '깨끗한 측정' 과 구분이 안 됨 */
 	if (pipeline.cap_stats_error_count) {
 		fprintf(stderr, "[coverage] 경고: 커널 유실 카운터 읽기가 %llu 회 실패 -> 그만큼의 주기 커버리지가 불완전합니다\n",
@@ -883,6 +1045,7 @@ int main(int argc, char **argv)
 	}
 
 	cap_close(pipeline.cap);
+	host_free(pipeline.host);
 	sctp_free(pipeline.sctp);
 	obs_free(pipeline.obs);
 	tr_free(pipeline.tr);

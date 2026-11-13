@@ -77,6 +77,14 @@ struct {
 	__type(value, __u64);
 } stats SEC(".maps");
 
+// 인터페이스와 방향별 와이어 계수기. 칸 수는 로더가 interface_count x HOOK_COUNT 로 늘림(scratch 와 같은 방식)
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__uint(max_entries, HOOK_COUNT);
+	__type(key, __u32);
+	__type(value, struct link_counter);
+} link_stats SEC(".maps");
+
 // load : offset_bytes ~ +len 구간에 걸친 skb 조각(선형 헤더/frags[]/frag_list)를 순서대로 dst 로 복사
 //
 //     0       14      34                                      60000
@@ -99,6 +107,24 @@ static __always_inline void bump(__u32 stat_index) {
 	__u64 *counter = bpf_map_lookup_elem(&stats, &stat_index);
 	if (counter)
 		__sync_fetch_and_add(counter, 1);
+}
+
+// count_link: 이 패킷을 인터페이스와 방향별 계수기에 더함.
+// 	SCTP 필터를 통과한 뒤에만 부름. 그 앞에서 부르면 세는 단위가 L2 프레임이 되어 이름이 거짓이 되고,
+// 		SCTP 가 아닌 프레임(SSH, ARP)까지 맵 조회 비용을 지불함.
+// 	slot_get 보다 앞에서 부르는 이유: 칸이 모자라거나 링 버퍼가 차서 버린 패킷도 와이어에는 있었으므로
+// 		세어야 함. 뒤에 두면 과부하에서 측정값이 과소 계상됨
+static __always_inline void count_link(struct __sk_buff *skb, __u8 capture_hook, __u32 interface_index, __u32 frame_len) {
+	__u32 link_key = interface_index * HOOK_COUNT + capture_hook;
+	struct link_counter *counter = bpf_map_lookup_elem(&link_stats, &link_key);
+	// 칸이 없음 = 로더가 넣지 않은 인터페이스. 지어내지 않고 세지 않음
+	if (!counter)
+		return;
+	// gso_segs 0: GSO 로 묶이지 않은 보통 skb. wire_len 0: 이 훅에서 커널이 채우지 않은 경우
+	__u32 segment_count = skb->gso_segs ? skb->gso_segs : 1;
+	__u32 wire_len = skb->wire_len ? skb->wire_len : frame_len;
+	__sync_fetch_and_add(&counter->sctp_packet_count, segment_count);
+	__sync_fetch_and_add(&counter->wire_byte_count, wire_len);
 }
 
 // slot_get: 현재 CPU 및 훅(ingress/egress)의 빈 slot 반환
@@ -244,6 +270,8 @@ static __always_inline void tap(struct __sk_buff *skb, const __u8 capture_hook, 
 	}
 	if (packet_len < SCTP_COMMON_HEADER_BYTES)
 		return; 
+
+	count_link(skb, capture_hook, interface_index, frame_len);
 
 	__be16 ports[2];
 	if (load(skb, sctp_offset_bytes, ports, sizeof(ports))) {

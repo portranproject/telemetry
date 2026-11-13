@@ -271,6 +271,34 @@ static int on_ringbuf_record(void *ctx, void *ringbuf_record, size_t size_bytes)
 	return cap->poll.delivered_count >= CAP_POLL_MAX ? -EAGAIN : 0;
 }
 
+/* link_stats_init: 인터페이스 x 방향마다 0 으로 채운 칸을 미리 만듬.
+ *   이유: 커널의 count_link 는 칸이 없으면 세지 않고 돌아감(데이터 경로에서 칸을 만들지 않기 위함).
+ *     여기서 넣지 않으면 그 인터페이스의 계수기가 끝까지 0 이고, 그 0 은 '트래픽이 없었음' 과
+ *     같은 모양이라 읽는 쪽이 측정하지 못한 것을 알 수 없음.
+ *   반환: 0 성공, -ENOMEM 할당 실패, 그 밖 맵 쓰기 errno. 적재 뒤 부착 전에 부를 것. */
+static int link_stats_init(struct cap *cap) {
+	int cpu_count = libbpf_num_possible_cpus();
+	if (cpu_count <= 0)
+		return cpu_count < 0 ? cpu_count : -EIO;
+	// PERCPU 맵은 CPU 수만큼의 값을 한 번에 넘김. link_counter 는 16B 라 libbpf 가 요구하는 8B 정렬 간격과 같음
+	struct link_counter *zero_values = calloc((size_t)cpu_count, sizeof(*zero_values));
+	if (!zero_values)
+		return -ENOMEM;
+	int link_stats_map_fd = bpf_map__fd(cap->bpf_skeleton->maps.link_stats);
+	int error = 0;
+	for (int i = 0; i < cap->interface_count && !error; i++) {
+		for (__u32 capture_hook = 0; capture_hook < HOOK_COUNT; capture_hook++) {
+			__u32 link_key = cap->attached_interfaces[i].interface_index * HOOK_COUNT + capture_hook;
+			if (bpf_map_update_elem(link_stats_map_fd, &link_key, zero_values, BPF_NOEXIST)) {
+				error = negative_errno();
+				break;
+			}
+		}
+	}
+	free(zero_values);
+	return error;
+}
+
 /* cap_open: 인터페이스 목록을 받아 커널 탭을 올려 붙이고, 레코드를 꺼낼 핸들 하나를 만듬.
  * 	반환: 0 이면 성공(*cap_out 에 핸들)
  *      -EINVAL      cap_out / interfaces 가 NULL, interface_count <= 0, 이름이 NULL, role 이 F1/N2 가 아님
@@ -343,9 +371,15 @@ int cap_open(const struct cap_interface *interfaces, int interface_count, struct
 	error = bpf_map__set_max_entries(cap->bpf_skeleton->maps.scratch, (__u32)cpu_id_limit * HOOK_COUNT * slot_count);
 	if (error)
 		goto fail;
+	error = bpf_map__set_max_entries(cap->bpf_skeleton->maps.link_stats, (__u32)interface_count * HOOK_COUNT);
+	if (error)
+		goto fail;
 
 	// 4) 커널에 전달 -> verifier 검사
 	error = cap_bpf__load(cap->bpf_skeleton);
+	if (error)
+		goto fail;
+	error = link_stats_init(cap);
 	if (error)
 		goto fail;
 	// 5) 인터페이스마다 tcx에 부착
@@ -542,6 +576,53 @@ int cap_get_stats(const struct cap *cap, struct cap_stats *stats_out) {
 	free(values);
 	if (error)  
 		memset(stats_out, 0, sizeof(*stats_out));         
+	return error;
+}
+
+/* cap_get_link_stats: 인터페이스마다 방향별 와이어 계수기를 채움.
+ *   이유: link_stats 는 PERCPU_HASH. 커널이 CPU 간 경쟁 없이 세는 대신 읽는 쪽이 CPU 수만큼 더함.
+ *   stats_out[i] 는 cap_open 에 넘긴 interfaces[i] 와 같은 순서임.
+ *   반환: 0 이면 성공
+ *      -EINVAL  stats_out 이 NULL, stats_capacity 가 cap_open 의 interface_count 보다 작음, cap 이 NULL
+ *      -ENOMEM  CPU 수만큼의 읽기 버퍼 할당 실패
+ *      그 밖    맵 읽기 errno. 하나라도 못 읽으면 전체를 0 으로 비움 - 일부만 채운 값이
+ *               '측정했다' 로 읽히지 않게(cap_get_stats 와 같은 규칙) */
+int cap_get_link_stats(const struct cap *cap, struct cap_link_stats *stats_out, int stats_capacity) {
+	if (!stats_out || stats_capacity <= 0)
+		return -EINVAL;
+	memset(stats_out, 0, (size_t)stats_capacity * sizeof(*stats_out));
+	if (!cap || !cap->bpf_skeleton || stats_capacity < cap->interface_count)
+		return -EINVAL;
+
+	int cpu_count = libbpf_num_possible_cpus();
+	if (cpu_count <= 0)
+		return cpu_count < 0 ? cpu_count : -EIO;
+	struct link_counter *values = calloc((size_t)cpu_count, sizeof(*values));
+	if (!values)
+		return -ENOMEM;
+
+	int error = 0;
+	int link_stats_map_fd = bpf_map__fd(cap->bpf_skeleton->maps.link_stats);
+	for (int i = 0; i < cap->interface_count; i++) {
+		struct cap_link_direction_stats *direction_stats[HOOK_COUNT] = {
+			[HOOK_TC_INGRESS] = &stats_out[i].ingress,
+			[HOOK_TC_EGRESS]  = &stats_out[i].egress,
+		};
+		for (__u32 capture_hook = 0; capture_hook < HOOK_COUNT; capture_hook++) {
+			__u32 link_key = cap->attached_interfaces[i].interface_index * HOOK_COUNT + capture_hook;
+			if (bpf_map_lookup_elem(link_stats_map_fd, &link_key, values)) {
+				error = negative_errno();
+				continue;
+			}
+			for (int value_index = 0; value_index < cpu_count; value_index++) {
+				direction_stats[capture_hook]->sctp_packet_count += values[value_index].sctp_packet_count;
+				direction_stats[capture_hook]->wire_byte_count += values[value_index].wire_byte_count;
+			}
+		}
+	}
+	free(values);
+	if (error)
+		memset(stats_out, 0, (size_t)stats_capacity * sizeof(*stats_out));
 	return error;
 }
 
