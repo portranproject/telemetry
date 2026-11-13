@@ -37,6 +37,25 @@ _Static_assert((MAX_CAP_BYTES & (MAX_CAP_BYTES - 1)) == 0, "MAX_CAP_BYTES 는 2�
 #define ST_SLOT_USED_BASE 6
 #define ST_COUNT (ST_SLOT_USED_BASE + SLOT_MAX)   
 
+// link_stats map 칸 번호 = interface_index * HOOK_COUNT + capture_hook
+// 	ARRAY 가 아니라 HASH 인 이유: interface_index 는 커널이 정하는 번호라 0 부터 촘촘하지 않음.
+// 		ARRAY 로 두면 번호를 0..n-1 로 다시 매길 표가 필요하고, 그 표를 커널과 로더가 각각 들게 됨.
+// 	칸은 로더가 적재 직후 인터페이스 x 방향마다 하나씩 미리 만듬 - 데이터 경로에서 칸을 만들지 않기 위함
+//
+// 	interface_index:   3           |  7           |  ...
+// 	capture_hook:      in    eg    |  in    eg    |
+// 	key:                6     7    |  14    15    |
+struct link_counter {
+	// 와이어 SCTP 패킷 수. tcx egress 는 GSO 분할 전이고 ingress 는 GRO 병합 후라 skb 하나가
+	// 	와이어에서는 여러 패킷임. 그래서 1 이 아니라 gso_segs 만큼 더함
+	__u64 sctp_packet_count;
+	// 와이어 바이트. 이더넷 헤더 포함, FCS 제외. skb->len 이 아니라 wire_len 을 쓰는 이유는
+	// 	묶인 skb 에서 세그먼트마다 복제되는 L2/L3 헤더가 wire_len 에만 들어 있기 때문임
+	__u64 wire_byte_count;
+};
+
+_Static_assert(sizeof(struct link_counter) == 16, "link_counter 크기가 바뀜: PERCPU 값 간격(8B 정렬)도 함께 확인");
+
 struct cap_event_header {
 	// bpf_ktime_get_tai_ns
 	__u64 capture_tai_ns;   
