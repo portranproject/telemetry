@@ -1,0 +1,40 @@
+# 03-skeleton-sequence-extension-leak.patch
+#
+# 대상 : asn1c 런타임 (skeletons/constr_SEQUENCE_aper.c)
+#
+# 증상 : 확장이 있는 SEQUENCE 를 풀다가 입력이 모자라면, 확장 존재 비트맵용으로 잡은 메모리(epres)를
+#   해제하지 않고 실패로 돌아간다. 잘린 PDU 를 받을 때마다 그만큼 샌다.
+#
+# 해결 : 실패로 돌아가기 전에 해제한다(2곳). 포크 커밋 350c48f1(2026-06-12)에 같은 수정이 있다.
+#
+# 경위 : 전에는 이 패치가 OPEN_TYPE_aper.c·OPEN_TYPE_uper.c 도 고쳤다(모르는 open type 이면 실패 대신 건너뜀).
+#   그 분기는 우리 문법에서 실행되지 않아 뺐다. APER 는 constr_SEQUENCE_aper.c 가 모르는 open type 을
+#   먼저 걸러 버리고(패치 05·07 이 그 자리를 고친다), UPER 를 쓰는 RRC 에는 open type 이 없다.
+#   뺀 뒤에도 시험 결과와 디코드 출력이 같다(asn1/README.md §6).
+
+--- a/skeletons/constr_SEQUENCE_aper.c
++++ b/skeletons/constr_SEQUENCE_aper.c
+@@ -169,8 +169,10 @@
+         if(!epres) ASN__DECODE_STARVED;
+ 
+         /* Get the extensions map */
+-        if(per_get_many_bits(pd, epres, 0, bmlength))
++        if(per_get_many_bits(pd, epres, 0, bmlength)) {
++            FREEMEM(epres);
+             ASN__DECODE_STARVED;
++        }
+ 
+         memset(&epmd, 0, sizeof(epmd));
+         epmd.buffer = epres;
+@@ -179,8 +181,10 @@
+                   td->name, bmlength, *epres);
+ 
+         /* Deal with padding */
+-        if (aper_get_align(pd) < 0)
++        if (aper_get_align(pd) < 0) {
++            FREEMEM(epres);
+             ASN__DECODE_STARVED;
++        }
+ 
+         /* Go over extensions and read them in */
+         for(edx = specs->first_extension; edx < td->elements_count; edx++) {

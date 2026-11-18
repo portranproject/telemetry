@@ -1,0 +1,50 @@
+# 11-skeleton-choice-unknown-extension-alternative.patch
+#
+# 대상 : asn1c 런타임 (skeletons/constr_CHOICE_aper.c)
+#
+# 증상 : 확장 가능한 CHOICE(`...` 가 있고 그 뒤 선택지는 없음 — NGAP-PDU·F1AP-PDU 가 그렇다)에 확장 선택지가 오면
+#   (확장 비트 1 + 순번 + open type, X.691 23.8) 순번을 읽지 않고 확장 비트 값(1)을 선택지 번호로 써서
+#   두 번째 루트 선택지(successfulOutcome)로 풀고, open type 의 길이 바이트부터 그 본체로 해석한다.
+#   실측: `80 12 0e 00 0f 00 00 02 00 0a 40 02 00 01 00 55 40 02 00 00`(확장 선택지 0, 길이 18) 이
+#   rc=0, InitialContextSetupResponse, AMF-UE-NGAP-ID 1 로 나온다 — 조작 입력이 '확신 있는 오값' 이 된다.
+#
+# 해결 : 그 분기에서 순번(nsnnwn)을 읽고 open type 을 버린 뒤 선택지 없음(presence 0)으로 돌려준다.
+#   버린 사실은 패치 07 과 같은 계수기 asn_portran_opentype_skipped_count 에 1 로 남긴다.
+#   소비자(src/libap)는 presence 0 을 'CHOICE 선택 없음' 으로 읽어 msg_name=NULL(본체 미해석)로 보고한다.
+
+--- a/skeletons/constr_CHOICE_aper.c
++++ b/skeletons/constr_CHOICE_aper.c
+@@ -6,6 +6,10 @@
+ #include <asn_internal.h>
+ #include <constr_CHOICE.h>
+ #include <aper_opentype.h>
++#include <OPEN_TYPE.h>
++
++/* Defined in asn1/asn1_glue.c (count of discarded unknown open types). */
++extern unsigned long asn_portran_opentype_skipped_count;
+ 
+ asn_dec_rval_t
+ CHOICE_decode_aper(const asn_codec_ctx_t *opt_codec_ctx,
+@@ -61,6 +65,22 @@
+             value += specs->ext_start;
+             if((unsigned)value >= td->elements_count)
+                 ASN__DECODE_FAILED;
++        } else {
++            /* X.691 23.8: an extension alternative is encoded as the extension
++             * bit (1), a normally small non-negative whole number (its index)
++             * and the alternative as an open type. This grammar defines no
++             * extension alternatives for this CHOICE, so the index cannot be
++             * named: read it, discard the open type, and leave the CHOICE with
++             * no alternative selected (presence 0). Without this branch `value`
++             * keeps the extension bit (1) and the second root alternative is
++             * reported as present and decoded from the open type's length byte. */
++            value = aper_get_nsnnwn(pd);
++            if(value < 0) ASN__DECODE_STARVED;
++            rv = OPEN_TYPE_aper_unknown_type_discard_bytes(pd);
++            if(rv.code != RC_OK) ASN__DECODE_FAILED;
++            asn_portran_opentype_skipped_count++;
++            _set_present_idx(st, specs->pres_offset, specs->pres_size, 0);
++            return rv;
+         }
+     }
+ 

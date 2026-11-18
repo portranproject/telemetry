@@ -1,0 +1,104 @@
+# 01-asn1c-root-range.patch
+#
+# 대상 : asn1c 컴파일러 (libasn1fix/asn1fix_crange.{c,h}, libasn1compiler/asn1c_C.c)
+#
+# 증상 : INTEGER (0..3, ..., 4 | 5) 처럼 확장 표식 "..." 뒤에 값이 더 적혀 있으면, 940dd5fa 는 그 값까지 합쳐
+#   PER 제약 표를 만든다. F1AP 의 SRBID 가 { 3비트, 0..5 } 로 생성돼 와이어의 SRB1·2·3 을 2·4·6 으로 읽는다.
+#
+# 근거 : X.691(02/2021) 13.1 — 확장 표식이 있는 INTEGER 는 값이 확장 루트("..." 앞의 범위) 안이면
+#   "확장 표식이 없는 것처럼" 부호화한다. 즉 비트 수는 루트 범위(0..3)만으로 정해진다. 루트 밖 값은 확장 비트를
+#   켠 뒤 길이를 붙여 따로 부호화하므로 "..." 뒤에 무엇이 적혀 있는지와 무관하다.
+#   SIZE 제약도 같다(16.6: BIT STRING (SIZE(8, ..., 16)) 의 길이는 루트 8 로 판정).
+#
+# 출처 : mouse07410/asn1c 커밋 03364659 (2026-07-14) 에서 이 부분만 옮겼다. 그 커밋은 여러 수정을 묶은 것이고
+#   (ENUMERATED 값 표의 정렬, BIT STRING 의 끝 0비트 처리 등), 여기에는 루트 범위 계산만 가져왔다. 원본과 다른 점 3개:
+#   플래그 값이 0x08 이다(940dd5fa 에서 0x04 가 이미 쓰인다. 원본은 0x10),
+#   940dd5fa 에 없는 JER 관련 줄은 옮기지 않았다,
+#   코드에 넣은 주석을 짧게 다시 썼다.
+#
+# 효과 : 생성되는 제약 표에서 "..." 뒤 값이 빠진다. 03364659 이후 판(v1.5.2 등)이 생성하는 값과 같다.
+
+--- a/libasn1compiler/asn1c_C.c
++++ b/libasn1compiler/asn1c_C.c
+@@ -2292,7 +2292,7 @@
+ 	} else if(etype & ASN_STRING_KM_MASK) {
+ 		range = asn1constraint_compute_PER_range(expr->Identifier, etype,
+ 				expr->combined_constraints, ACT_CT_FROM,
+-				0, 0, 0);
++				0, 0, CPR_ignore_extension_additions);
+ 		DEBUG("Emitting FROM constraint for %s", expr->Identifier);
+ 
+ 		if((range->left.type == ARE_MIN && range->right.type == ARE_MAX)
+@@ -2322,7 +2322,7 @@
+ 	} else {
+ 		range = asn1constraint_compute_PER_range(expr->Identifier, etype,
+ 				expr->combined_constraints, ACT_EL_RANGE,
+-				0, 0, 0);
++				0, 0, CPR_ignore_extension_additions);
+ 		if(emit_single_member_PER_constraint(arg, range, 0, 0))
+ 			return -1;
+ 		asn1constraint_range_free(range);
+@@ -2330,7 +2330,8 @@
+ 	OUT(",\n");
+ 
+ 	range = asn1constraint_compute_PER_range(expr->Identifier, etype,
+-			expr->combined_constraints, ACT_CT_SIZE, 0, 0, 0);
++			expr->combined_constraints, ACT_CT_SIZE, 0, 0,
++			CPR_ignore_extension_additions);
+ 	if(emit_single_member_PER_constraint(arg, range, 0, "SIZE"))
+ 		return -1;
+ 	asn1constraint_range_free(range);
+--- a/libasn1fix/asn1fix_crange.c
++++ b/libasn1fix/asn1fix_crange.c
+@@ -963,6 +963,7 @@
+ 	int expectation_met;
+ 	unsigned int i;
+ 	int ret;
++	int past_ext = 0;	/* Seen the "..." extension marker in this list */
+ 
+ 	if(!exmet) {
+ 		exmet = &expectation_met;
+@@ -1180,6 +1181,7 @@
+ 				if(errno == ERANGE) {
+ 					range->extensible = 1;
+ 					range->not_OER_visible = 1;
++					past_ext = 1;
+ 					continue;
+ 				} else {
+ 					_range_free(range);
+@@ -1215,6 +1217,7 @@
+ 				if(errno == ERANGE) {
+ 					range->extensible = 1;
+ 					range->not_OER_visible = 1;
++					past_ext = 1;
+ 					continue;
+ 				} else {
+ 					_range_free(range);
+@@ -1238,6 +1241,17 @@
+ 				_range_free(tmp);
+ 				continue;
+ 			}
++
++			if(past_ext && (cpr_flags & CPR_ignore_extension_additions)) {
++				/*
++				 * Backport of mouse07410/asn1c 03364659 (X.691 root range):
++				 * elements following the "..." marker are extension additions
++				 * and must not widen the PER-visible root range.
++				 */
++				range->extensible = 1;
++				_range_free(tmp);
++				continue;
++			}
+ 
+ 			_range_merge_in(range, tmp);
+ 		}
+--- a/libasn1fix/asn1fix_crange.h
++++ b/libasn1fix/asn1fix_crange.h
+@@ -51,6 +51,7 @@
+ 	CPR_strict_OER_visibility	= 0x01,
+ 	CPR_strict_PER_visibility	= 0x02,
+ 	CPR_simulate_fbless_SIZE	= 0x04,
++	CPR_ignore_extension_additions	= 0x08,
+ };
+ asn1cnst_range_t *asn1constraint_compute_OER_range(const char *dbg_name,
+ 	asn1p_expr_type_e expr_type,

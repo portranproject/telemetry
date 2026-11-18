@@ -1,0 +1,30 @@
+# 07-skeleton-opentype-count-discarded.patch
+#
+# 대상 : asn1c 런타임 (skeletons/constr_SEQUENCE_aper.c)
+#
+# 증상 : APER 에서 문법이 모르는 IE 는 asn1c 가 스스로 버린다(OPEN_TYPE_aper_is_unknown_type →
+#   OPEN_TYPE_aper_unknown_type_discard_bytes). 버렸다는 사실이 어디에도 남지 않는다.
+#
+# 해결 : 버리기에 성공하면 asn_portran_opentype_skipped_count 를 1 올린다(정의는 asn1/asn1_glue.c).
+#   디코드 결과는 바뀌지 않고 버린 개수만 보이게 된다.
+
+--- a/skeletons/constr_SEQUENCE_aper.c
++++ b/skeletons/constr_SEQUENCE_aper.c
+@@ -8,6 +8,9 @@
+ #include <OPEN_TYPE.h>
+ #include <aper_opentype.h>
+ 
++/* Defined in asn1/asn1_glue.c (count of discarded unknown open types). */
++extern unsigned long asn_portran_opentype_skipped_count;
++
+ /*
+  * Check whether we are inside the extensions group.
+  */
+@@ -132,6 +135,7 @@
+         if(elm->flags & ATF_OPEN_TYPE) {
+             if (OPEN_TYPE_aper_is_unknown_type(td, st, elm)) {
+                 rv = OPEN_TYPE_aper_unknown_type_discard_bytes(pd);
++                if(rv.code == RC_OK) asn_portran_opentype_skipped_count++;
+                 FREEMEM(opres);
+                 return rv;
+             }
